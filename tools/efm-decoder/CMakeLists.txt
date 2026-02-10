@@ -3,9 +3,15 @@ cmake_minimum_required(VERSION 3.10)
 # Set the project name
 project(efm-tools)
 
-# Handle Qt version selection - default to Qt5 for backward compatibility
-if(NOT DEFINED USE_QT_VERSION)
-    set(USE_QT_VERSION 5)
+# Handle Qt version selection.
+# Prefer the caller-provided USE_QT_VERSION, otherwise inherit QT_VERSION_MAJOR
+# from the top-level project if available, then fall back to Qt5.
+if(NOT DEFINED USE_QT_VERSION OR "${USE_QT_VERSION}" STREQUAL "")
+    if(DEFINED QT_VERSION_MAJOR AND NOT "${QT_VERSION_MAJOR}" STREQUAL "")
+        set(USE_QT_VERSION ${QT_VERSION_MAJOR})
+    else()
+        set(USE_QT_VERSION 5)
+    endif()
 endif()
 
 # Find Qt components based on version
