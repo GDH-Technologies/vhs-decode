@@ -349,6 +349,20 @@ def main(args=None, use_gui=False):
         default=False,
         help="export a raw TBC without deemphasis applied for filter tuning",
     )
+    debug_group.add_argument(
+        "--use-gpu",
+        dest="use_gpu",
+        action="store_true",
+        default=False,
+        help="Enable CUDA acceleration when supported.",
+    )
+    debug_group.add_argument(
+        "--force-cpu",
+        dest="force_cpu",
+        action="store_true",
+        default=False,
+        help="Force CPU backend even when CUDA is available.",
+    )
     dodgroup = parser.add_argument_group("Dropout detection options")
     dodgroup.add_argument(
         "--noDOD",
@@ -496,6 +510,8 @@ def main(args=None, use_gui=False):
     rf_options["tape_speed"] = args.tape_speed
     rf_options["ire0_adjust"] = args.ire0_adjust
     rf_options["gnrc_afe"] = args.gnrc_afe
+    rf_options["use_gpu"] = args.use_gpu
+    rf_options["force_cpu"] = args.force_cpu
 
     extra_options = get_extra_options(args, not use_gui)
     extra_options["params_file"] = args.params_file
@@ -535,6 +551,12 @@ def main(args=None, use_gui=False):
         debug_plot=debug_plot,
         field_order_action=args.field_order_action
     )
+    backend = vhsd.rf.gpu_backend
+    if backend.active:
+        gpu_desc = f" ({backend.gpu_name})" if backend.gpu_name else ""
+        logger.info("Using GPU backend: %s%s", backend.name, gpu_desc)
+    else:
+        logger.info("Using CPU backend: %s (%s)", backend.name, backend.reason)
 
     if check_debug():
         logger.warning(
