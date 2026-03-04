@@ -51,6 +51,16 @@ def create_backend(use_gpu: bool = False, force_cpu: bool = False) -> BackendCon
         if isinstance(gpu_name, bytes):
             gpu_name = gpu_name.decode("utf-8", errors="replace")
 
+        try:
+            cp.fft.fft(cp.asarray([0.0], dtype=cp.float32))
+        except Exception as fft_exc:
+            return BackendContext(
+                active=False,
+                name="numpy",
+                xp=np,
+                reason=f"CuPy FFT unavailable: {fft_exc}",
+            )
+
         return BackendContext(
             active=True,
             name="cupy",

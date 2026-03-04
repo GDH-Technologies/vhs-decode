@@ -1,5 +1,19 @@
-from vhsd_rust import sosfiltfilt, sosfiltfilt_f32
 import numpy as np
+import scipy.signal as sps
+
+try:
+    from vhsd_rust import sosfiltfilt, sosfiltfilt_f32
+    _USE_RUST_BACKEND = True
+except Exception:
+    _USE_RUST_BACKEND = False
+
+    def sosfiltfilt(order, sos_filter, input_array):
+        sos = np.asarray(sos_filter).reshape((order, 6))
+        return sps.sosfiltfilt(sos, input_array).astype(np.float64, copy=False)
+
+    def sosfiltfilt_f32(order, sos_filter, input_array):
+        sos = np.asarray(sos_filter).reshape((order, 6))
+        return sps.sosfiltfilt(sos, input_array).astype(np.float32, copy=False)
 
 def sos_filter_as_array_and_order(filter):
     """Convert the sos filter to a array derive the filter order for use inside

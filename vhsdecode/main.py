@@ -30,7 +30,12 @@ from vhsdecode.cmdcommons import (
     test_output_file,
 )
 from vhsdecode.formats import TAPE_SPEEDS
-from vhsd_rust import check_debug
+
+try:
+    from vhsd_rust import check_debug
+except Exception:
+    def check_debug():
+        return False
 
 supported_tape_formats = {
     "VHS",
