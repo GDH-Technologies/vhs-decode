@@ -22,10 +22,10 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 intel = [ "intel-cmplr-lib-rt", "icc_rt" ]
-hifi_gui = [ "PyQt5>=5.14.1" ]
+hifi_gui_qt5 = [ "PyQt5>=5.14.1" ]
 hifi_gui_qt6 = [ "PyQt6>=6.4.2" ]
-cuda13 = [ "cupy-cuda13x>=13.0.0", "nvidia-cuda-nvrtc>=13.1.115", "nvidia-cufft>=12.1.0.78" ]
-cuda12 = [ "cupy-cuda12x>=12.0.0", "nvidia-cuda-nvrtc-cu12", "nvidia-cufft-cu12" ]
+cuda13 = [ "cupy-cuda13x", "nvidia-cuda-nvrtc", "nvidia-cufft" ]
+cuda12 = [ "cupy-cuda12x", "nvidia-cuda-nvrtc-cu12", "nvidia-cufft-cu12" ]
 cuda11 = [ "cupy-cuda11x", "nvidia-cuda-nvrtc-cu11", "nvidia-cufft-cu11" ]
 # Can probably be depcretaded now since it's also an option in vhs-decode to use it.
 hifi_gnuradio = [ "pyzmq" ]
