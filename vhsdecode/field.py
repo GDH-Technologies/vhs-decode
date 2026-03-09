@@ -12,7 +12,6 @@ from vhsdecode.addons.resync import Pulse
 from vhsdecode.chroma import (
     decode_chroma_simple,
     decode_chroma,
-    get_field_phase_id,
     try_detect_track_vhs_pal,
     try_detect_track_ntsc,
     try_detect_track_betamax_pal,
@@ -1853,7 +1852,7 @@ class FieldPALVHS(FieldPALShared):
         dsout, dsaudio, dsefm = super(FieldPALVHS, self).downscale(
             final=final, *args, **kwargs
         )
-        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"])
+        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"], detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -1895,7 +1894,7 @@ class FieldPALBetamax(FieldPALShared):
         )
 
         dschroma = decode_chroma(
-            self, chroma_rotation=self.rf.DecoderParams["chroma_rotation"]
+            self, chroma_rotation=self.rf.DecoderParams["chroma_rotation"], detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase
         )
 
         return (dsout, dschroma), dsaudio, dsefm
@@ -1918,6 +1917,7 @@ class FieldPALVideo8(FieldPALShared):
             self,
             chroma_rotation=self.rf.DecoderParams["chroma_rotation"],
             do_chroma_deemphasis=True,
+            detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase
         )
 
         return (dsout, dschroma), dsaudio, dsefm
@@ -1948,9 +1948,7 @@ class FieldNTSCVHS(FieldNTSCShared):
             final=final, *args, **kwargs
         )
 
-        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"])
-
-        self.fieldPhaseID = get_field_phase_id(self)
+        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"], detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -1974,7 +1972,7 @@ class FieldNTSCBetamax(FieldNTSCShared):
             final=final, *args, **kwargs
         )
 
-        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"])
+        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"], detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -1997,8 +1995,6 @@ class FieldNTSCUMatic(FieldNTSCShared):
         )
         dschroma = decode_chroma_simple(self)
 
-        self.fieldPhaseID = get_field_phase_id(self)
-
         return (dsout, dschroma), dsaudio, dsefm
 
 
@@ -2011,7 +2007,7 @@ class FieldNTSCTypeC(FieldShared, ldd.FieldNTSC):
             final=final, *args, **kwargs
         )
 
-        # self.fieldPhaseID = get_field_phase_id(self)
+        self.fieldPhaseID = 0
 
         return (dsout, None), dsaudio, dsefm
 
@@ -2030,10 +2026,8 @@ class FieldNTSCVideo8(FieldNTSCShared):
         )
 
         dschroma = decode_chroma(
-            self, self.rf.DecoderParams["chroma_rotation"], do_chroma_deemphasis=True
+            self, self.rf.DecoderParams["chroma_rotation"], do_chroma_deemphasis=True, detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase
         )
-
-        self.fieldPhaseID = get_field_phase_id(self)
 
         return (dsout, dschroma), dsaudio, dsefm
 

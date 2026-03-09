@@ -37,6 +37,7 @@ vhs-decode = "vhsdecode.main:main"
 cvbs-decode = "cvbsdecode.main:main"
 hifi-decode = "vhsdecode.hifi.main:main"
 filter-tune = "filter_tune.filter_tune:main"
+decode-launcher = "vhsdecode.decode_launcher:main"
 
 #[console_scripts]
 # TODO: These should maybe be made modules too
@@ -50,6 +51,9 @@ Homepage = "https://www.domesday86.com"
 [tool.setuptools_scm]
 write_to = "vhsdecode/_version.py"
 local_scheme = "no-local-version"
+# Restrict git describe/version parsing to real version tags (avoid tags like "rev4.0" breaking builds)
+git_describe_command = "git describe --dirty --tags --long --match [0-9]* --match v[0-9]*"
+tag_regex = '^(?:v)?(?P<version>\d+(?:\.\d+)*(?:rc\d+)?)$'
 
 [tool.setuptools.package-data]
 vhs_decode = ["*.txt"]

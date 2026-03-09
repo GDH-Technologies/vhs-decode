@@ -474,7 +474,7 @@ class RFDecode:
         DP = self.DecoderParams
 
         # This high pass filter is intended to detect RF dropouts
-        Frfhpf = sps.butter(1, [10 / self.freq_half], btype="highpass")
+        Frfhpf = sps.butter(1, 10 / self.freq_half, btype="highpass")
         self.Filters["Frfhpf"] = filtfft(Frfhpf, self.blocklen)
 
         # First phase FFT filtering
@@ -1459,7 +1459,8 @@ class Field:
         initphase=False,
         fields_written=0,
         readloc=0,
-        use_threads=True
+        use_threads=True,
+        level_smoothing_lines=0
     ):
         self.rawdata = decode["input"]
         self.data = decode
@@ -1493,6 +1494,8 @@ class Field:
         self.linecount = None
 
         self.use_threads = use_threads
+
+        self.level_smoothing_lines = level_smoothing_lines
 
     @profile
     def process(self):
@@ -2559,6 +2562,7 @@ class Field:
             wowfactors,
             self.lineoffset,
             outwidth,
+            level_smoothing_lines=self.level_smoothing_lines
         )
 
         if self.rf.decode_digital_audio:
@@ -3692,6 +3696,7 @@ class LDdecode:
             initphase=initphase,
             fields_written=self.fields_written,
             readloc=rawdecode["startloc"],
+            level_smoothing_lines=self.level_smoothing_lines
         )
 
         # set an object-level variable to make notebook debugging easier

@@ -133,6 +133,17 @@ def main(args=None, use_gui=False):
         ),
     )
     luma_group.add_argument(
+        "--wow_adjust_smoothing_lines",
+        type=float,
+        default=None,
+        help=(
+            "Adjusts the amount of smoothing in lines that is performed when compensating for brightness variations caused by wow. "
+            "\nWow calculation is based on position of hsync pulses which is affected by the accuracy of the TBC. "
+            "\nDefault is (video system lines / 2) i.e. NTSC=525/2, PAL=625/2, etc."
+            "\nSet to `0` to disable smoothing (only recommended for low noise video)"
+        )
+    )
+    luma_group.add_argument(
         "--nodd",
         "--no_diff_demod",
         dest="disable_diff_demod",
@@ -222,6 +233,14 @@ def main(args=None, use_gui=False):
         type=int,
         default=None,
         help="If set to 0 or 1, force use of video track phase. (No effect on U-matic)",
+    )
+    chroma_group.add_argument(
+        "-dctp",
+        "--detect_chroma_track_phase",
+        dest="detect_chroma_track_phase",
+        action="store_true",
+        default=False,
+        help="Detect and correct chroma phase consistency for each track / field. Corrects chroma artifacts around head-switching area for VHS. (Experimental feature)",
     )
     chroma_group.add_argument(
         "--recheck_phase",
@@ -514,6 +533,7 @@ def main(args=None, use_gui=False):
     rf_options["export_raw_tbc"] = args.export_raw_tbc
     rf_options["tape_speed"] = args.tape_speed
     rf_options["ire0_adjust"] = args.ire0_adjust
+    rf_options["detect_chroma_track_phase"] = args.detect_chroma_track_phase
     rf_options["gnrc_afe"] = args.gnrc_afe
     rf_options["use_gpu"] = args.use_gpu
     rf_options["force_cpu"] = args.force_cpu
@@ -554,7 +574,8 @@ def main(args=None, use_gui=False):
         rf_options=rf_options,
         extra_options=extra_options,
         debug_plot=debug_plot,
-        field_order_action=args.field_order_action
+        field_order_action=args.field_order_action,
+        level_smoothing_lines=args.wow_adjust_smoothing_lines
     )
     backend = vhsd.rf.gpu_backend
     if backend.active:

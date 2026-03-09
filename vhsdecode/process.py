@@ -96,6 +96,7 @@ class VHSDecode(ldd.LDdecode):
         extra_options={},
         debug_plot=None,
         field_order_action="detect",
+        level_smoothing_lines=None,
     ):
 
         # monkey patch init with a dummy to prevent calling set_start_method twice on macos
@@ -175,6 +176,8 @@ class VHSDecode(ldd.LDdecode):
             # Since typec usually lacks vsync set this to none to avoid dropping fields.
             self.field_order_action = "none"
         self.duplicate_prev_field = True
+
+        self.level_smoothing_lines = level_smoothing_lines if level_smoothing_lines is not None else self.rf.SysParams["frame_lines"] / 2
 
         # Needs to be overridden since this is overwritten for 405-line.
         # self.output_lines = (self.rf.SysParams["frame_lines"] // 2) + 1
@@ -703,6 +706,7 @@ class VHSRFDecode(ldd.RFDecode):
                 "ire0_adjust",
                 "gnrc_afe",
                 "relaxed_line0",
+                "detect_chroma_track_phase"
             ],
         )(
             self.iretohz(100) * 2,
@@ -738,6 +742,7 @@ class VHSRFDecode(ldd.RFDecode):
             ire0_adjust,
             rf_options.get("gnrc_afe", False),
             rf_options.get("relaxed_line0", False),
+            rf_options.get("detect_chroma_track_phase", False)
         )
 
         # As agc can alter these sysParams values, store a copy to then
@@ -1004,11 +1009,10 @@ class VHSRFDecode(ldd.RFDecode):
             def sosfiltfft(filter_value, block_len):
                 return sps.sosfreqz(filter_value, block_len, whole=True)[1]
 
-            _lpf_norm = DP["video_lpf_extra"] / self.freq_hz_half
             y_fm_lowpass = sosfiltfft(
                 sps.butter(
                     DP["video_lpf_extra_order"],
-                    _lpf_norm,
+                    DP["video_lpf_extra"] / self.freq_hz_half,
                     btype="lowpass",
                     output="sos",
                 ),
@@ -1154,9 +1158,7 @@ class VHSRFDecode(ldd.RFDecode):
 
         # SF["YNRHighPass"] = sps.butter(
         #     1,
-        #     [
-        #         (0.5e6) / self.freq_hz_half,
-        #     ],
+        #     (0.5e6) / self.freq_hz_half,
         #     btype="highpass",
         #     output="sos",
         # )
