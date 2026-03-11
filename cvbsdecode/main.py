@@ -152,7 +152,7 @@ def main(args=None):
     # allowing SIGINT/control-C's to be handled cleanly
     original_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    logger = init_logging(outname + ".log")
+    logger = init_logging(outname + ".log", debug=args.debug)
 
     # Initialize CVBS decoder
     # Note, we pass 40 as sample frequency, as any other will be resampled by the

@@ -545,7 +545,7 @@ def main(args=None, use_gui=False):
     # allowing SIGINT/control-C's to be handled cleanly
     original_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    logger = init_logging(outname + ".log")
+    logger = init_logging(outname + ".log", debug=args.debug)
 
     tape_format = args.tape_format.upper()
     if tape_format not in supported_tape_formats:
