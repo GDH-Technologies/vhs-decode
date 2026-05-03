@@ -15,7 +15,7 @@ import warnings
 
 import threading
 from queue import Queue
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 from numba import jit, njit
 import numba
@@ -145,8 +145,11 @@ kaiser_beta = 5
 sinc_tap_count = 16 # must be multiple of 2
 sinc_phase_count = 2**16
 
-# compute sinc table in a process to so it doesn't block other startup tasks
-sinc_lut_future = ProcessPoolExecutor().submit(
+# Build sinc LUT in a background thread so import does not block.
+# ProcessPoolExecutor at import time breaks under Python 3.14+ (forkserver/spawn
+# re-imports the CLI entrypoint; see "Safe importing of main module").
+_sinc_lut_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lddecode_kaiser")
+sinc_lut_future = _sinc_lut_executor.submit(
     build_kaiser_lut, kaiser_beta, sinc_tap_count, sinc_phase_count
 )
 
