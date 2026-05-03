@@ -10,21 +10,26 @@ This version has been modified to work with the differences found in [FM RF sign
 
 ------
 
+[Download Decode](https://github.com/oyvindln/vhs-decode/releases) (Windows / MacOS / Linux)
+
+<img src="assets/images/decode-launcher-Rev2.0-windows-2026.png" width="600" height="">
+
+
 > [!CAUTION]
 > FM RF Archival captures and capturing is not to be confused with the TV Modulator/Demodulator pack's signals, i.e the **"antenna connectors"** on the back of a VCR!
 
 
 <img src="assets/images/ld-analyse-vhs-decode-svhs-&-scopes.png" width="" height="">
 
-> EBU Colourbars (4:3) on SVHS decoded signal frame (1112 x 624), with scanline oscilloscope and vectorscope enabled in frame view mode.
+> EBU Colourbars (4:3) on SVHS decoded signal frame (1112 x 624), with scanline oscilloscope and vectorscope enabled in frame view mode on tbc-tools (v3.0.1).
 
 
 # [Supported Tape Formats](https://github.com/oyvindln/vhs-decode/wiki/Tape-Support-List)
 
 
-**VHS** 625-line and 525-line - NTSC, NTSC-J, PAL and PAL-M. **Generally well supported**
+**VHS** 625-line and 525-line - NTSC, NTSC-J, PAL and PAL-M. **Generally well supported** (Video & HiFi)
 
-**SVHS** 625-line and 525-line - NTSC, NTSC-J, PAL and PAL-M. **Basic support**
+**SVHS** 625-line and 525-line - NTSC, NTSC-J, PAL and PAL-M. **Supported**
 
 **U-Matic Low Band** 625-line and 525-line - PAL and NTSC. **Supported**
 
@@ -34,7 +39,7 @@ This version has been modified to work with the differences found in [FM RF sign
 
 **SuperBeta** 525-line - NTSC. **Preliminary support** (PAL samples needed)
 
-**Video8 & Hi8** 625-line and 525-line - PAL & NTSC. **Basic support**
+**Video8 & Hi8** 625-line and 525-line - PAL & NTSC. **Supported** (Video & HiFi)
 
 **1" Type C (SMPTE Type C)** 625-line and 525-line - PAL & NTSC. **Basic support** (More Samples Required!) 
 
@@ -136,7 +141,7 @@ These cards combined with a [dedicated amplifier](https://github.com/oyvindln/vh
 
 Capture is done using an intuitive GUI application.
 
-[Linux / Windows / MacOS](https://github.com/simoninns/DomesdayDuplicator/wiki)
+[Linux / Windows / MacOS](https://github.com/harrypm/DomesdayDuplicator/releases)
 
 > [!WARNING]  
 > This is a single channel capture device! not a multi-channel one which is the ideal minimum for VHS etc.
@@ -148,7 +153,7 @@ It consists of a custom analogue to digital board with an amplifier and DIP swit
 > [!WARNING]  
 > Don't use USB storage or video devices on the same USB bus as the DdD, it will crash the capture!
 
-[Where to Buy? & More Info](https://github.com/happycube/ld-decode/wiki/Domesday-Duplicator)
+[Where to Buy? & More Info](https://github.com/harrypm/DomesdayDuplicator/wiki)
 
 
 # Dependencies & Installation - Hardware
@@ -206,15 +211,12 @@ Decks follow this naming or close to it not every possible name is covered.
 
 * 50 Ohm BNC connectors, normally a [pre made bulkhead](https://s.click.aliexpress.com/e/_DCynGRN), or [solderable thread mounted](https://s.click.aliexpress.com/e/_Dd6dn0b).
 * 50-100 cm (20-40 inch) of [RG316](https://s.click.aliexpress.com/e/_DEjGLGT) or [RG178](https://s.click.aliexpress.com/e/_DBLPVc3) 50 Ohm coaxial cable.
-* 10 uF Capacitors [standard ceramic assortment](https://s.click.aliexpress.com/e/_DlOEdSJ) or audio grade like Nichicon if you like.
+* an [ADA4857 Amplifier](https://github.com/oyvindln/vhs-decode/wiki/Amplifier-Setup-Guide)
 
 Connection Cables
 
 * [Direct BNC to BNC](https://s.click.aliexpress.com/e/_DdCYb1l) 
 * [50Ohm BNC to BNC Cable](https://s.click.aliexpress.com/e/_DdPzXh5)
-
-On [CX White Cards](https://github.com/oyvindln/vhs-decode/wiki/CX-Cards) you use the RCA (Vmux 1) for the RF input with C31 capacitor removed, but a BNC can be easily added.
-
 
 </details>
 
@@ -226,7 +228,13 @@ On [CX White Cards](https://github.com/oyvindln/vhs-decode/wiki/CX-Cards) you us
 > [!TIP]  
 > The [Hardware Installation Guide](https://github.com/oyvindln/vhs-decode/wiki/Hardware-Installation-Guide) visually goes over all the installation steps for tape decks to Sony 8mm camcorders.
 
+There is 2 ways to deploly an RF tap in todays workflow, an basic tap which uses an Ceramic capacostor on the test point before cabling to a bulkhead, and sending that signal to an capture device. 
+
+Then the current standard and more recommended workflow of using an [ADA4857 amplifier](https://github.com/oyvindln/vhs-decode/wiki/Amplifier-Setup-Guide) which both limits the signal draw load on the deck being tapped and allows for a controlled fixed gain level ideal for CX Cards and outher ADC solutions like the MISRC. 
+
 Adding a 10 uF (0.1 uF to 100 uF range) capacitor to the test point or amplifier is recommended. It can help improve signal integrity. (A handful of VCRs have this on the test point already.)
+
+- 10 uF Capacitors [standard ceramic assortment](https://s.click.aliexpress.com/e/_DlOEdSJ).
 
 Center is Signal, Outer is Ground, this goes for jacks and for coaxial cable in general.
 
@@ -254,13 +262,13 @@ While type and voltage does not matter drastically it's best to use new/tested c
 # Dependencies & Installation - Software
 
 
-VHS-Decode, as with LD-Decode, has been developed and tested on machines running the latest versions of Ubuntu, Debian, Linux Mint & Windows 10/11, and has user testing on current versions of MacOS.
+VHS-Decode, has been developed and tested on machines running the latest versions of Ubuntu, Debian, Linux Mint & Windows 10, MacOS 15 x86 & Arm.
 
-The tools should however be able to be built on other distributions too, provided they have access to somewhat recent versions of the needed dependencies, including at least Python 3.8.
+The tools should however be able to be built on other distributions too, provided they have access to somewhat recent versions of the needed dependencies, including at least Python 3.11.
 
 There is a [Linux compatibility doc](https://docs.google.com/document/d/132ycIMMNvdKvrNZSzbckXVEPQVLTnH_YX0Oh3lqtkkQ) for various tested distributions of Linux.
 
-Other dependencies include Python 3.8+, NumPy, SciPy, Cython, Numba, Pandas, Qt5, Qwt, Cmake, and FFmpeg.
+Other dependencies include Python 3.11+, NumPy, SciPy, Cython, Numba, Pandas, Qt5, Qwt, Cmake, and FFmpeg.
 
 </details>
 
@@ -271,11 +279,7 @@ Other dependencies include Python 3.8+, NumPy, SciPy, Cython, Numba, Pandas, Qt5
 
 [Windows Setup & Usage Docs](https://github.com/oyvindln/vhs-decode/wiki/Windows-Build)
 
-The ld-tools suite, tbc-video-export and combined EXE version of `ld-decode` / `vhs-decode` / `cvbs-decode` / `hifi-decode` which is simply `decode.exe` exists for Windows and is entirely self-contained or portable. 
-
-This allows the use of ld-analyse's GUI to view TBC files, ld-lds-converter to convert and compress DdD captures inside Windows with drag and drop bat scripts.
-
-The decode suite can also be built & ran natively on Windows 10/11 or built inside [WSL2](https://github.com/oyvindln/vhs-decode/wiki/WSL2-Setup) 22.04.1 LTS (Windows Subsystem for Linux) however issues with larger captures i.g 180gb+ may require expanding the default [virtual disk size](https://docs.microsoft.com/en-us/windows/wsl/vhd-size).
+The tbc-tools suite, and combined EXE version of `ld-decode` / `vhs-decode` / `cvbs-decode` / `hifi-decode` which is simply `decode.exe` exists for Windows, Linux and MacOS and is entirely self-contained or "portable" binarys meaning they will work without hard system wide installation allowing you to use new or old versions from local or published archives easily. 
 
 
 </details>
@@ -287,8 +291,9 @@ The decode suite can also be built & ran natively on Windows 10/11 or built insi
 
 [MacOS Setup & Usage Docs](https://github.com/oyvindln/vhs-decode/wiki/MacOS-Build)
 
-Currently, MacOS builds, while supported and deployable, are not directly verified and tested by the developers of ld-decode or vhs-decode due to lack of owning an Apple M1 or newer hardware.
+For MacOS users vhs-decode.app and tbc-tools.app which launches decode launcher and analyse respectivly, and can call all tools via direct CLI, this services the workflow end to end, as for capture hardware the MISRC and DdD are both GUI platforms so you have 3 `.apps` for your entire workflow for most capture to end decoded file ready for post processing.
 
+Please note you will have to manually approve the apps to run one time, and every time for capture tools as MacOS is highly restrictive with 3rd party hardware and software tools.
 
 </details>
 
@@ -299,139 +304,39 @@ Currently, MacOS builds, while supported and deployable, are not directly verifi
     
 [Linux Setup & Usage Docs](https://github.com/oyvindln/vhs-decode/wiki/Linux-Build)
 
-Decoders & TBC Video Export has a mainly self-contained binary appimage package for use on most distributions, this can be used fully or as a fallback if direct building is broken on your OS install.
+Decoders & tools have a self-contained binary appimage package for use on most distributions, this is the prefured way of using vhs-decode for end users and support, with direct building being more focused on development and testing. 
 
-
-</details>
-
-
-<details closed>
-<summary>Build from Source Linux (Ubuntu/Debian-based)</summary>
-<br>
-
-
-Install all dependencies required by the decode suite.
-
-> [!TIP]
-> If you are having installation problems or want automated installation assistance, use Agent mode with [Warp terminal](https://app.warp.dev/referral/WDW45K). If it manages to solve an installation issue please make an issue ticket, and post your entire start to finish process dialogue on the terminal, this allows documentation to be updated.
-
-Install all dependencies required by LD-Decode and VHS-Decode:
-
-    sudo apt install git qtbase5-dev libqwt-qt5-dev libfftw3-dev libavformat-dev libavcodec-dev libavutil-dev ffmpeg pv pkg-config make cmake sox pipx g++ python3-dev
-
-Install [Rust Compiler](https://www.rust-lang.org/tools/install) (required for decode v0.3.5 onwards)
-
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-Verify Rust Compiler 
-
-    source "$HOME/.cargo/env" && echo "Rust version: $(rustc --version)" && echo "Cargo version: $(cargo --version)"
-
-Ubuntu 22.04/Linux Mint 21/Debian may also need this library installed if one wants to use the GUI version of hifi-decode:
-
-    sudo apt install libxcb-cursor0
-
-For Arch Linux
-
-    pacman -S base-devel git qt5-base qwt fftw ffmpeg pv cmake sox python python-pipx
-
-Set up pipx
-
-    pipx ensurepath
-
-Install TBC-Video-Export
-
-    pipx install tbc-video-export
-
-(There is also [self-contained builds](https://github.com/JuniorIsAJitterbug/tbc-video-export/releases) if install issues arise)
-
-Optional dependencies for GPU (Nvidia Cards) FLAC compression support:
-
-    sudo apt install make ocl-icd-opencl-dev mono-runtime
-
-Also Requires FlaLDF [Download & Install via .deb for Linux](https://github.com/TokugawaHeavyIndustries/FlaLDF/releases/tag/v0.1b)
-
-
-### NOTES!!
-
-
-NixOS Linux has pre-made [nur-packages](https://github.com/JuniorIsAJitterbug/nur-packages) for vhs-decode, cxadc and outer tools within the projects.
-
-HiFi-Decode preview function - the python library sounddevice requires portaudio (libportaudio2 on Ubuntu). This is not included in the self-contained binaries and has to be installed locally if not already installed. (Included with most desktop environments.)
-
-Debian/Ubuntu does not have a qt6 version of qwt in repositories as of yet so you have to inform the build script to use Qt5 if both qt5 and qt6 are installed with `-DUSE_QT_VERSION=5` as it might otherwise try to compile with qt6 instead and failing to locate qwt. The option is otherwise not needed.
-
-
-## Build VHS-Decode & LD-Tools Suite
-
-
-The vhs-decode repository also has hifi-decode, cvbs-decode, ld-decode included.
-
-Download VHS-Decode:
-
-    git clone https://github.com/oyvindln/vhs-decode.git vhs-decode
-
-Install VHS-Decode:
-
-    cd vhs-decode
-
-Build and install vhs-decode via pipx, using **one** of the below scripts.
-
-### Base installation
-
-    pipx install .
-
-### With hifi-decode gui
-
-    pipx install .[hifi_gui_qt6]
-
-### With Intel specific cpu optimizations
-
-    pipx install .[intel]
-
-### If updating or reinstalling, you may need to add the `--force` flag to overwrite/update the previous installation.
-
-    pipx install .[intel,hifi_gui_qt6] --force
-
-Compile and Install ld-tools suite: (Required)
-
-    mkdir build2
-    cd build2
-    CXXFLAGS="-march=native" CFLAGS="-march=native" cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_QT_VERSION=5
-    make -j4
-    sudo make install
-
-Go back to the main directory with 
-
-    cd .. 
-
-
-## How to Update
-
-
-To update your local repository enter `git pull` into the terminal while inside the vhs-decode directory, and then do `pipx install .[hifi_gui_qt6] --force`  - it will overwrite your previous installation and deploy the current version of the decoders.
-
-To update the tools to the latest versions, the steps under "Compile and Install ld-tools suite: (Required)" has to be re-ran after a `git pull`. The tools are not updated very often.
+You can also build from source via the [BUILD.MD](https://github.com/oyvindln/vhs-decode/blob/vhs_decode/BUILD.md) 
 
 
 # Usage
 
 
 Note with WSL2 & Ubuntu, `./` in front of applications and scripts may be needed to run them or to run scripts within the folder.
-### Decode Launcher (Qt6)
+
+
+### Decode Launcher GUI
+
+
+Run via opning the the app/.exe/.appimage binary builds directly.  
 
 For a basic click-to-open launcher that lets you select common tools and open them in a terminal (or start native GUI tools), use:
 
     decode-launcher
 
-or from source checkout:
+or if you built from source :
 
     ./decode-launcher
 
+You can drag and drop RF input files onto the launcher window or input field, and drop `.json` files to auto-fill the params JSON field.
+
 Current native GUI launch targets include:
 
-* `hifi-decode --gui`
-* `filter-tune`
+- `hifi-decode --gui`
+- `filter-tune`
+
+## CLI 
+
 
 Use `cd vhs-decode` to enter into the directory to run commands, `cd ..` to go back a directory.
 
@@ -467,6 +372,11 @@ You don't actually type `<` and `>` on your input & output files.
 
 </details>
 
+## Install tbc-tools
+
+You can [install manually](https://github.com/harrypm/tbc-tools#linux-dependencies-and-installation-multi-distro) or use the self-contained binary packages [found here](https://github.com/harrypm/tbc-tools/releases/).
+
+
 
 # FM RF Capture 
 
@@ -493,7 +403,7 @@ Connect Card to RF Tap
 * Capture RF Data
 * FLAC Compress RF Data (Archive)
 
-[CXADC Readme](https://github.com/happycube/cxadc-linux3#readme) for information on how to install & configure the driver, this also goes into depth on modes.
+[CXADC README](https://github.com/happycube/cxadc-linux3#readme) for information on how to install & configure the driver, this also goes into depth on modes.
 
 [Commands for real-time FLAC capture on CX Cards](https://github.com/happycube/cxadc-linux3/wiki/FLAC-Compression-Guide)
 
@@ -611,7 +521,7 @@ Decode your captured tape to `.tbc` by using:
 
 Full Usage Example:
 
-    vhs-decode --debug --ire0_adjust --recheck_phase --frequency 28.6 --pal --threads 8 --tape_format VHS CX-White-2022.10.25.u8 my-first-decode-2022.10.25
+    vhs-decode --debug --ire0_adjust --frequency 28.6 --pal --threads 8 --tape_format VHS CX-White-2022.10.25.flac my-first-decode-2022.10.25
 
 Use the analyse tool during or after decoding to inspect & adjust  decoded data:
 
@@ -640,9 +550,13 @@ These `tbc` files store 16-bit `GREY16` headerless data separated into chroma/lu
 > [!IMPORTANT]  
 > [Read the full export guide here!](https://github.com/oyvindln/vhs-decode/wiki/TBC-to-Video-Export-Guide)
 
-Linux, MacOS & Windows
+This is easily done inside the export tab of tbc-tools analyse, or manually via tbc-video-export in command-line.
 
-    tbc-video-export Input-Media.tbc
+<img src="assets/images/Export-Page-Rev-3.0-tbc-tools.PNG" width="600" height="">
+
+Manual tbc-tools-input Linux, MacOS & Windows
+
+    tbc-video-export Input-Media.tbc --audio-track aligned_input_audio.flac
 
 This will create an FFV1 10-bit 4:2:2 MKV File ready for playback or post-processing. 
 
@@ -682,18 +596,18 @@ Define your profile with for example: `--profile ffv1_8bit_pcm`
 <summary>Encoding Profile List</summary>
 <br>
 
-| Profile Name  | Codec         | Compression Type     | Bit-Depth | Chroma Sub-Sampling | Audio Format | Container | File Extension | Bitrate    |
-|---------------|---------------|----------------------|-----------|---------------------|--------------|-----------|----------------|------------|
-| ffv1          | FFV1          | Lossless Compressed  | 10-bit    | 4:2:2               | FLAC Audio   | Matroska  | .mkv           | 70-100mbps |
-| ffv1_8bit     | FFV1          | Lossless Compressed  | 8-bit     | 4:2:2               | FLAC Audio   | Matroska  | .mkv           | 40-60mbps  |
-| ffv1_pcm      | FFV1          | Lossless Compressed  | 10-bit    | 4:2:2               | PCM Audio    | Matroska  | .mkv           | 70-100mbps |
-| ffv1_8bit_pcm | FFV1          | Lossless Compressed  | 8-bit     | 4:2:2               | PCM Audio    | Matroska  | .mkv           | 40-60mbps  |
-| prores_hq_422 | ProRes HQ     | Compressed           | 10-bit    | 4:2:2               | PCM Audio    | QuickTime | .mov           | 55-70mbps  |
-| prores_4444xq | ProRes 4444XQ | Compressed           | 10-bit    | 4:4:4               | PCM Audio    | QuickTime | .mov           | 80-110mbps |
-| v210          | V210          | Uncompressed         | 10-bit    | 4:2:2               | PCM Audio    | QuickTime | .mov           | 200mbps    |
-| v410          | V410          | Uncompressed         | 10-bit    | 4:4:4               | PCM Audio    | QuickTime | .mov           | 400mbps    |
-| x264_web      | AVC/H.264     | Lossy                | 8-bit     | 4:2:0               | AAC Audio    | MPEG-4    | .mp4           | 8mbps      |
-| x265_web      | HEVC/H.265    | Lossy                | 8-bit     | 4:2:0               | AAC Audio    | MPEG-4    | .mp4           | 8mbps      |
+| Profile Name  | Codec         | Compression Type    | Bit-Depth | Chroma Sub-Sampling | Audio Format | Container | File Extension | Bitrate    |
+| ------------- | ------------- | ------------------- | --------- | ------------------- | ------------ | --------- | -------------- | ---------- |
+| ffv1          | FFV1          | Lossless Compressed | 10-bit    | 4:2:2               | FLAC Audio   | Matroska  | .mkv           | 70-100mbps |
+| ffv1_8bit     | FFV1          | Lossless Compressed | 8-bit     | 4:2:2               | FLAC Audio   | Matroska  | .mkv           | 40-60mbps  |
+| ffv1_pcm      | FFV1          | Lossless Compressed | 10-bit    | 4:2:2               | PCM Audio    | Matroska  | .mkv           | 70-100mbps |
+| ffv1_8bit_pcm | FFV1          | Lossless Compressed | 8-bit     | 4:2:2               | PCM Audio    | Matroska  | .mkv           | 40-60mbps  |
+| prores_hq_422 | ProRes HQ     | Compressed          | 10-bit    | 4:2:2               | PCM Audio    | QuickTime | .mov           | 55-70mbps  |
+| prores_4444xq | ProRes 4444XQ | Compressed          | 10-bit    | 4:4:4               | PCM Audio    | QuickTime | .mov           | 80-110mbps |
+| v210          | V210          | Uncompressed        | 10-bit    | 4:2:2               | PCM Audio    | QuickTime | .mov           | 200mbps    |
+| v410          | V410          | Uncompressed        | 10-bit    | 4:4:4               | PCM Audio    | QuickTime | .mov           | 400mbps    |
+| x264_web      | AVC/H.264     | Lossy               | 8-bit     | 4:2:0               | AAC Audio    | MPEG-4    | .mp4           | 8mbps      |
+| x265_web      | HEVC/H.265    | Lossy               | 8-bit     | 4:2:0               | AAC Audio    | MPEG-4    | .mp4           | 8mbps      |
 
 </details>
 
@@ -848,8 +762,6 @@ Useful to recover decoding after a crash, or for limiting processing time by pro
 `--ire0_adjust` Automatically adjust the black/video level on a per-field basis, using the back porch level. Unlike `--clamp` this is done after time base correction. Therefore it can fix the per-field variations caused by the slight carrier shift of VHS-HQ and S-VHS. [more info](https://github.com/oyvindln/vhs-decode/pull/163).
 
 `--ct` enables a *chroma trap*, a filter intended to reduce chroma interference on the main luma signal. Use if seeing banding or checkerboarding on the main luma .tbc in ld-analyse.
-
-`--recheck_phase` re-check chroma phase on every field, fixes most colour issues. (No effect on Umatic.)
 
 `--sl` defines the output *sharpness level*, as an integer from 0-100, the default being 0. Higher values are better suited for plain, flat images i.e. cartoons and animated material, as strong ghosting can occur. (Akin to cranking up the sharpness on any regular TV set.)
 

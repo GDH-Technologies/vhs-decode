@@ -1,4 +1,5 @@
 import numpy as np
+from numba import njit
 
 import lddecode.core as ldd
 import lddecode.utils as lddu
@@ -10,11 +11,8 @@ import vhsdecode.formats as formats
 from vhsdecode.doc import detect_dropouts_rf
 from vhsdecode.addons.resync import Pulse
 from vhsdecode.chroma import (
-    decode_chroma_simple,
     decode_chroma,
-    try_detect_track_vhs_pal,
-    try_detect_track_ntsc,
-    try_detect_track_betamax_pal,
+    decode_chroma_phase_rotation
 )
 
 from vhsdecode.debug_plot import plot_data_and_pulses
@@ -85,7 +83,7 @@ def field_class_from_formats(system: str, tape_format: str):
     elif system == "NTSC":
         if tape_format == "UMATIC":
             field_class = FieldNTSCUMatic
-        elif tape_format == "TYPEC" or tape_format == "TYPEB":
+        elif tape_format == "TYPEC" or tape_format == "TYPEB" or tape_format == "VHD":
             field_class = FieldNTSCTypeC
         elif tape_format == "SVHS" or tape_format == "SVHS_ET":
             field_class = FieldNTSCSVHS
@@ -103,8 +101,8 @@ def field_class_from_formats(system: str, tape_format: str):
                     "Tape format unimplemented for NTSC, using VHS field class."
                 )
             field_class = FieldNTSCVHS
-    elif (system == "MPAL" or system == "NLINHA") and tape_format == "VHS":
-        field_class = FieldMPALVHS
+    elif (system == "PAL_M" or system == "NLINHA") and tape_format == "VHS":
+        field_class = FieldPALMVHS
     elif system == "MESECAM" and tape_format == "VHS":
         field_class = FieldMESECAMVHS
     elif system == "405":
@@ -1095,28 +1093,27 @@ class FieldShared:
                     self.rf.options.ire0_adjust
                     and input.size == self.outlinecount * self.outlinelen
                 ):
-                    blank_levels = np.empty(self.outlinecount)
-                    for i in range(0, self.outlinecount):
-                        blank_levels[i] = np.median(
-                            input[
-                                i * self.outlinelen
-                                + self.ire0_backporch[0] : i * self.outlinelen
-                                + self.ire0_backporch[1]
-                            ]
-                        )
-                    blank_levels = np.sort(blank_levels)
-                    ire0 = np.mean(
-                        blank_levels[
-                            int(self.outlinecount / 3) : int(self.outlinecount * 2 / 3)
-                        ]
-                    )
+                    hsync_start, hsync_end = self.ire0_backporch
+
+                    ire0_adjust_padding = 4 # 4fsc, prevents noise around the hsync transition from interfering with this measurement
+                    hsync_start += ire0_adjust_padding
+                    hsync_end -= ire0_adjust_padding
+
+                    blank_levels = np.sort([
+                        np.median(input[i * self.outlinelen + hsync_start :
+                                        i * self.outlinelen + hsync_end])
+                        for i in range(0, self.outlinecount)
+                    ])
+                    ire0 = np.mean(blank_levels[self.outlinecount // 3 : (self.outlinecount * 2) // 3])
+
                     ldd.logger.debug("calculated ire0: %.02f", ire0)
+
+                if self.rf.track_phase is not None:
+                    ire0 += self.rf.DecoderParams["track_ire0_offset"][self.rf.track_phase ^ (self.field_number % 2)]
+
                 return hz_to_output_array(
                     input,
-                    ire0
-                    + self.rf.DecoderParams["track_ire0_offset"][
-                        self.rf.track_phase ^ (self.field_number % 2)
-                    ],
+                    ire0,
                     self.rf.DecoderParams["hz_ire"],
                     self.rf.SysParams["outputZero"],
                     self.rf.DecoderParams["vsync_ire"],
@@ -1140,6 +1137,16 @@ class FieldShared:
             )
             + 0.5
         )
+
+    def lock_to_burst(self, linelocs):
+        self.chroma_tbc_buffer = None
+        self.rf.track_phase, self.phase_sequence, self.burst_detected_line, self.burst_magnitude_avg, self.burst_phase_avg, self.even_burst_phase_avg, self.odd_burst_phase_avg = decode_chroma_phase_rotation(
+            self,
+            linelocs,
+            chroma_rotation=self.rf.DecoderParams.get("chroma_rotation", None),
+            detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase
+        )
+        self.track_phase_set = True
 
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldShared, self).downscale(
@@ -1806,16 +1813,61 @@ class FieldShared:
 class FieldPALShared(FieldShared, ldd.FieldPAL):
     def __init__(self, *args, **kwargs):
         super(FieldPALShared, self).__init__(*args, **kwargs)
+        self.track_phase_set = False
         self.ire0_backporch = (96, 160)
+        self.burst_detected_line = 0
+        self.fsc_ratio = self.rf.SysParams["outfreq"] / self.rf.SysParams["fsc_mhz"]
+    
+    @staticmethod
+    def _sync_to_burst(
+        linelocs,
+        outlinelen,
+        fsc_ratio,
+        even_burst_avg_phase,
+        odd_burst_avg_phase,
+        phase_sequence,
+        burst_detected_line
+    ):
+        burst_tbc_start = max(9, burst_detected_line)
+
+        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[burst_tbc_start:]:
+            target_phase = odd_burst_avg_phase if line_number % 2 else even_burst_avg_phase
+
+            phase_delta = (target_phase - burst_phase + burst_phase_offset + 180) % 360 - 180
+
+            # scale up burst fsc for each line
+            line_start = linelocs[line_number]
+            line_end = linelocs[line_number + 1]
+            line_length = line_end - line_start
+            scale = line_length / outlinelen
+
+            line_adjust = phase_delta / 360.0 * fsc_ratio
+            linelocs[line_number] += line_adjust * scale # 4fsc, then scaled up to the input line length
 
     def refine_linelocs_pilot(self, linelocs=None):
-        """Override this as most regular band tape formats does not use have a pilot burst.
-        Tape formats that do have it will need separate logic for it anyhow.
-        """
         if linelocs is None:
             linelocs = self.linelocs2.copy()
         else:
             linelocs = linelocs.copy()
+
+        if not self.track_phase_set and self.rf.options.write_chroma:
+            # only do this once, since this does not affect hsync currently
+            self.lock_to_burst(linelocs)
+
+            if (
+                not self.rf.options.disable_burst_hsync
+                and self.phase_sequence is not None
+                and self.burst_detected_line != -1 # color killer not active for entire field
+            ):
+                FieldPALShared._sync_to_burst(
+                    linelocs,
+                    self.outlinelen,
+                    self.fsc_ratio,
+                    self.even_burst_phase_avg,
+                    self.odd_burst_phase_avg,
+                    self.phase_sequence,
+                    self.burst_detected_line
+                )
 
         return linelocs
 
@@ -1828,18 +1880,70 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
 class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
     def __init__(self, *args, **kwargs):
         super(FieldNTSCShared, self).__init__(*args, **kwargs)
-        self.fieldPhaseID = 0
+        self.track_phase_set = False
+        self.fieldPhaseID = None
         self.ire0_backporch = (74, 124)
+        self.burst_detected_line = 0
+        self.fsc_ratio = self.rf.SysParams["outfreq"] / self.rf.SysParams["fsc_mhz"]
+
+    @staticmethod
+    def _sync_to_burst(
+        linelocs,
+        outlinelen,
+        fsc_ratio,
+        burst_avg_phase,
+        phase_sequence,
+        burst_detected_line
+    ):
+        burst_tbc_start = max(9, burst_detected_line)
+
+        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[burst_tbc_start:]:
+            phase_delta = (burst_avg_phase - burst_phase + burst_phase_offset + 180) % 360 - 180
+
+            # scale up burst fsc for each line
+            line_start = linelocs[line_number]
+            line_end = linelocs[line_number + 1]
+            line_length = line_end - line_start
+            scale = line_length / outlinelen
+
+            line_adjust = phase_delta / 360.0 * fsc_ratio
+            linelocs[line_number] += line_adjust * scale # 4fsc, then scaled up to the input line length
 
     def refine_linelocs_burst(self, linelocs=None):
-        """Override this as it's LD specific
-        At some point in the future we could maybe use the burst location to improve hsync accuracy,
-        but ignore it for now.
-        """
         if linelocs is None:
-            linelocs = self.linelocs2
+            linelocs = self.linelocs2.copy()
         else:
             linelocs = linelocs.copy()
+
+        # populates color burst info for hsync refinement the step below
+        if self.rf.options.write_chroma:
+            self.lock_to_burst(linelocs)
+
+            if (
+                not self.rf.options.disable_burst_hsync
+                and self.phase_sequence is not None
+                and self.burst_detected_line != -1 # color killer not active for entire field
+            ):
+                if self.rf.color_system == "NTSC":
+                    FieldNTSCShared._sync_to_burst(
+                        linelocs,
+                        self.outlinelen,
+                        self.fsc_ratio,
+                        self.burst_phase_avg,
+                        self.phase_sequence,
+                        self.burst_detected_line
+                    )
+                elif self.rf.color_system == "NLINHA":
+                    # NLINHA uses pal
+                    FieldPALShared._sync_to_burst(
+                        linelocs,
+                        self.outlinelen,
+                        self.fsc_ratio,
+                        self.even_burst_phase_avg,
+                        self.odd_burst_phase_avg,
+                        self.phase_sequence,
+                        self.burst_detected_line
+                    )
 
         return linelocs
 
@@ -1852,12 +1956,9 @@ class FieldPALVHS(FieldPALShared):
         dsout, dsaudio, dsefm = super(FieldPALVHS, self).downscale(
             final=final, *args, **kwargs
         )
-        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"], detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase)
+        dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
-
-    def try_detect_track(self):
-        return try_detect_track_vhs_pal(self, self.rf.DecoderParams["chroma_rotation"])
 
 
 class FieldPALSVHS(FieldPALVHS):
@@ -1875,7 +1976,7 @@ class FieldPALUMatic(FieldPALShared):
         dsout, dsaudio, dsefm = super(FieldPALUMatic, self).downscale(
             final=final, *args, **kwargs
         )
-        dschroma = decode_chroma_simple(self)
+        dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -1884,18 +1985,12 @@ class FieldPALBetamax(FieldPALShared):
     def __init__(self, *args, **kwargs):
         super(FieldPALBetamax, self).__init__(*args, **kwargs)
 
-    def try_detect_track(self):
-        _ = try_detect_track_betamax_pal(self)
-        return 0, False
-
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldPALBetamax, self).downscale(
             final=final, *args, **kwargs
         )
 
-        dschroma = decode_chroma(
-            self, chroma_rotation=self.rf.DecoderParams["chroma_rotation"], detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase
-        )
+        dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -1904,10 +1999,6 @@ class FieldPALVideo8(FieldPALShared):
     def __init__(self, *args, **kwargs):
         super(FieldPALVideo8, self).__init__(*args, **kwargs)
 
-    def try_detect_track(self):
-        # PAL Video8 uses the same chroma phase rotation setup as PAL VHS.
-        return try_detect_track_vhs_pal(self, self.rf.DecoderParams["chroma_rotation"])
-
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldPALVideo8, self).downscale(
             final=final, *args, **kwargs
@@ -1915,9 +2006,7 @@ class FieldPALVideo8(FieldPALShared):
 
         dschroma = decode_chroma(
             self,
-            chroma_rotation=self.rf.DecoderParams["chroma_rotation"],
-            do_chroma_deemphasis=True,
-            detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase
+            do_chroma_deemphasis=True
         )
 
         return (dsout, dschroma), dsaudio, dsefm
@@ -1939,16 +2028,13 @@ class FieldNTSCVHS(FieldNTSCShared):
     def __init__(self, *args, **kwargs):
         super(FieldNTSCVHS, self).__init__(*args, **kwargs)
 
-    def try_detect_track(self):
-        return try_detect_track_ntsc(self, self.rf.DecoderParams["chroma_rotation"])
-
     def downscale(self, final=False, *args, **kwargs):
         """Downscale the channels and upconvert chroma to standard color carrier frequency."""
         dsout, dsaudio, dsefm = super(FieldNTSCVHS, self).downscale(
             final=final, *args, **kwargs
         )
 
-        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"], detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase)
+        dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -1964,25 +2050,19 @@ class FieldNTSCBetamax(FieldNTSCShared):
     def __init__(self, *args, **kwargs):
         super(FieldNTSCBetamax, self).__init__(*args, **kwargs)
 
-    def try_detect_track(self):
-        return try_detect_track_ntsc(self, self.rf.DecoderParams["chroma_rotation"])
-
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldNTSCBetamax, self).downscale(
             final=final, *args, **kwargs
         )
 
-        dschroma = decode_chroma(self, self.rf.DecoderParams["chroma_rotation"], detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase)
+        dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
 
 
-class FieldMPALVHS(FieldNTSCVHS):
+class FieldPALMVHS(FieldNTSCVHS):
     def __init__(self, *args, **kwargs):
-        super(FieldMPALVHS, self).__init__(*args, **kwargs)
-
-    def try_detect_track(self):
-        return try_detect_track_vhs_pal(self, self.rf.DecoderParams["chroma_rotation"])
+        super(FieldPALMVHS, self).__init__(*args, **kwargs)
 
 
 class FieldNTSCUMatic(FieldNTSCShared):
@@ -1993,7 +2073,7 @@ class FieldNTSCUMatic(FieldNTSCShared):
         dsout, dsaudio, dsefm = super(FieldNTSCUMatic, self).downscale(
             final=final, *args, **kwargs
         )
-        dschroma = decode_chroma_simple(self)
+        dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -2007,17 +2087,12 @@ class FieldNTSCTypeC(FieldShared, ldd.FieldNTSC):
             final=final, *args, **kwargs
         )
 
-        self.fieldPhaseID = 0
-
         return (dsout, None), dsaudio, dsefm
 
 
 class FieldNTSCVideo8(FieldNTSCShared):
     def __init__(self, *args, **kwargs):
         super(FieldNTSCVideo8, self).__init__(*args, **kwargs)
-
-    def try_detect_track(self):
-        return try_detect_track_ntsc(self, self.rf.DecoderParams["chroma_rotation"])
 
     def downscale(self, final=False, *args, **kwargs):
         """Downscale the channels and upconvert chroma to standard color carrier frequency."""
@@ -2026,7 +2101,7 @@ class FieldNTSCVideo8(FieldNTSCShared):
         )
 
         dschroma = decode_chroma(
-            self, self.rf.DecoderParams["chroma_rotation"], do_chroma_deemphasis=True, detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase
+            self, do_chroma_deemphasis=True
         )
 
         return (dsout, dschroma), dsaudio, dsefm
@@ -2036,13 +2111,10 @@ class FieldMESECAMVHS(FieldPALShared):
     def __init__(self, *args, **kwargs):
         super(FieldMESECAMVHS, self).__init__(*args, **kwargs)
 
-    def try_detect_track(self):
-        return 0, False
-
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldMESECAMVHS, self).downscale(
             final=final, *args, **kwargs
         )
-        dschroma = decode_chroma_simple(self)
+        dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm

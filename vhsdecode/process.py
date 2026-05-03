@@ -5,6 +5,7 @@ import traceback
 import scipy.signal as sps
 import threading
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 
 import lddecode.core as ldd
 
@@ -52,6 +53,7 @@ from vhsdecode.gpu_backend import (
     to_backend_array,
     to_numpy_if_needed,
 )
+from vhsdecode.dbwriter import DBWriter
 
 
 def is_secam(system: str):
@@ -96,7 +98,6 @@ class VHSDecode(ldd.LDdecode):
         extra_options={},
         debug_plot=None,
         field_order_action="detect",
-        level_smoothing_lines=None,
     ):
 
         # monkey patch init with a dummy to prevent calling set_start_method twice on macos
@@ -104,6 +105,7 @@ class VHSDecode(ldd.LDdecode):
         # This is kinda hacky and should be sorted in a better way ideally.
         temp_init = ldd.DemodCache.__init__
         ldd.DemodCache.__init__ = _demodcache_dummy
+        self._processing_thread_pool = ThreadPoolExecutor(max_workers=threads + 1)
 
         if system == "405":
             sys_params_pal_temp = ldd.SysParams_PAL.copy()
@@ -138,6 +140,7 @@ class VHSDecode(ldd.LDdecode):
         self.level_adjust = level_adjust
         # Overwrite the rf  with the VHS-altered one
         self.rf = VHSRFDecode(
+            processing_thread_pool=self._processing_thread_pool,
             system=system,
             tape_format=tape_format,
             inputfreq=inputfreq,
@@ -147,7 +150,8 @@ class VHSDecode(ldd.LDdecode):
         )
 
         if system == "405":
-            SysParams_PAL = sys_params_pal_temp
+            # TODO: oln 18/03/2026 This wasn't reset correctly, not sure if it's relevant or not.
+            ldd.SysParams_PAL = sys_params_pal_temp
 
         # Store reference to ourself in the rf decoder - needed to access data location for track
         # phase, may want to do this in a better way later.
@@ -165,8 +169,26 @@ class VHSDecode(ldd.LDdecode):
             num_worker_threads=self.numthreads,
         )
 
+        self._db_writer = DBWriter() if extra_options.get("write_db") else None
+        # disconnect and nuke db file to prevent issue when loading with orc
+        # TODO: add option to prevent creating db in the first place..
+        if not self._db_writer and extra_options.get("orc"):
+            self.dbconn.close()
+            if os.path.exists(fname_out + ".tbc.db"):
+                os.unlink(fname_out + ".tbc.db")
+        # self._io_thread_pool = ThreadPoolExecutor(2)
+
         if fname_out is not None and self.rf.options.write_chroma:
-            self.outfile_chroma = open(fname_out + "_chroma.tbc", "wb")
+            extension = "_chroma.tbc"
+            if extra_options.get("orc"):
+                extension = ".tbcc"
+                self.outfile_video.close()
+                # Delete empty .tbc File
+                # TODO: Fix this upstream so we don't
+                # have to do this...
+                os.unlink(fname_out + ".tbc")
+                self.outfile_video = open(fname_out + ".tbcy", "wb")
+            self.outfile_chroma = open(fname_out + extension, "wb")
         else:
             self.outfile_chroma = None
 
@@ -177,7 +199,10 @@ class VHSDecode(ldd.LDdecode):
             self.field_order_action = "none"
         self.duplicate_prev_field = True
 
-        self.level_smoothing_lines = level_smoothing_lines if level_smoothing_lines is not None else self.rf.SysParams["frame_lines"] / 2
+        # For tape, it is recommended to use `--ire0_adjust` to fix brightness variations between lines
+        # This method usually gives false positives for noisy signals, so smooth the correction out by an entire field to avoid banding
+        if self.wow_level_adjust_smoothing is None:
+            self.wow_level_adjust_smoothing = self.rf.SysParams["frame_lines"] / 2
 
         # Needs to be overridden since this is overwritten for 405-line.
         # self.output_lines = (self.rf.SysParams["frame_lines"] // 2) + 1
@@ -214,12 +239,27 @@ class VHSDecode(ldd.LDdecode):
             "isFirstField": True if f.isFirstField else False,
             "detectedFirstField": True if f.isFirstField else False,
             "isDuplicateField": False,
+            # burstStartLine description:
+            # -1                    -> Color killer is active, no color for entire field
+            #  0                    -> Color killer is inactive, color for the entire field
+            #  1 to num_field_lines -> Color killer is active until this line, then it is deactivated and color is returned for this and all following lines
+            "burstStartLine": f.burst_detected_line,
             "syncConf": f.compute_syncconf(),
             "seqNo": len(self.fieldinfo) + 1,
             "diskLoc": np.round((f.readloc / self.bytes_per_field) * 10) / 10,
             "fileLoc": int(np.floor(f.readloc)),
-            "fieldPhaseID": f.fieldPhaseID,
         }
+
+        if f.fieldPhaseID is None:
+            fi["fieldPhaseID"] = {
+                (1, 0): 1,
+                (0, 1): 2,
+                (1, 1): 3,
+                (0, 0): 4,
+            }[(fi["isFirstField"], (fi["seqNo"] // 2) % 2)]
+        else:
+            fi["fieldPhaseID"] = f.fieldPhaseID
+
         write_field = True
 
         if self.doDOD:
@@ -350,14 +390,27 @@ class VHSDecode(ldd.LDdecode):
 
         self.fieldinfo.append(fi)
 
+        if self._db_writer:
+            if not self.capture_id:
+                self.build_sqlite_metadata()
+            self._db_writer.write_field(fi, self.dbconn, self.doDOD, self.capture_id)
+            # NOTE: this calls commit so we don't call it in dbwriter.write_field.
+            self.build_sqlite_metadata()
+
         self.outfile_video.write(picturey)
         if self.rf.options.write_chroma:
             self.outfile_chroma.write(picturec)
         self.fields_written += 1
 
     def close(self):
+        if self.decodethread and self.decodethread.is_alive():
+            self.decodethread.join()
+            self.decodethread = None
         if self.rf.options.write_chroma:
             setattr(self, "outfile_chroma", None)
+
+        if self._processing_thread_pool is not None:
+            self._processing_thread_pool.shutdown(wait=True)
         super(VHSDecode, self).close()
 
     def computeMetricsPAL(self, metrics, f, fp=None):
@@ -377,7 +430,7 @@ class VHSDecode(ldd.LDdecode):
             black = jout["videoParameters"]["black16bIre"]
             white = jout["videoParameters"]["white16bIre"]
 
-            if self.rf.color_system == "MPAL" or self.rf.color_system == "NLINHA":
+            if self.rf.color_system == "PAL_M" or self.rf.color_system == "NLINHA":
                 # jout["videoParameters"]["isSourcePal"] = True
                 # jout["videoParameters"]["isSourcePalM"] = True
                 jout["videoParameters"]["system"] = "PAL-M"
@@ -571,6 +624,7 @@ class VHSDecode(ldd.LDdecode):
 class VHSRFDecode(ldd.RFDecode):
     def __init__(
         self,
+        processing_thread_pool=None,
         inputfreq=40,
         system="NTSC",
         tape_format="VHS",
@@ -578,6 +632,7 @@ class VHSRFDecode(ldd.RFDecode):
         extra_options={},
         debug_plot=None,
     ):
+
         # First init the rf decoder normally.
         super(VHSRFDecode, self).__init__(
             inputfreq,
@@ -586,6 +641,9 @@ class VHSRFDecode(ldd.RFDecode):
             has_analog_audio=False,
             extra_options=extra_options,
         )
+        if processing_thread_pool is None:
+            processing_thread_pool = ThreadPoolExecutor(max_workers=1)
+        self._processing_thread_pool = processing_thread_pool
 
         # Store a separate setting for *color* system as opposed to 525/625 line here.
         # TODO: Fix upstream so we don't have to fake tell ld-decode code that we are using ntsc for
@@ -608,7 +666,6 @@ class VHSRFDecode(ldd.RFDecode):
             tape_format == "BETAMAX" or tape_format == "BETAMAX_HIFI"
         )
         track_phase = None if is_secam(system) else rf_options.get("track_phase", None)
-        self._recheck_phase = rf_options.get("recheck_phase", False)
         high_boost = rf_options.get("high_boost", None)
         self._notch = rf_options.get("notch", None)
         self._notch_q = rf_options.get("notch_q", 10.0)
@@ -626,19 +683,11 @@ class VHSRFDecode(ldd.RFDecode):
             if (tape_format == "BETAMAX" and system != "NTSC")
             else rf_options.get("cafc", False)
         )
-        # cafc requires --recheck_phase
-        self._recheck_phase = True if self._do_cafc else self._recheck_phase
 
-        self.detect_track = False
-        self.needs_detect = False
-        if track_phase is None:
-            self.track_phase = 0
-            if not is_secam(system):
-                self.detect_track = True
-                self.needs_detect = True
-        elif track_phase == 0 or track_phase == 1:
+        self.track_phase = None
+        if track_phase == 0 or track_phase == 1:
             self.track_phase = track_phase
-        else:
+        elif track_phase is not None:
             raise Exception("Track phase can only be 0, 1 or None")
 
         self.hsync_tolerance = 0.8
@@ -706,7 +755,10 @@ class VHSRFDecode(ldd.RFDecode):
                 "ire0_adjust",
                 "gnrc_afe",
                 "relaxed_line0",
-                "detect_chroma_track_phase"
+                "detect_chroma_track_phase",
+                "enable_color_killer",
+                "disable_burst_hsync",
+                "disable_phase_correction",
             ],
         )(
             self.iretohz(100) * 2,
@@ -736,13 +788,19 @@ class VHSRFDecode(ldd.RFDecode):
             # TODO: This should be used for everything eventually but needs proper testing
             True,
             export_raw_tbc,
-            rf_options.get("fm_audio_notch", 0),
+            # Optional on VHS/Beta/video8
+            # always enable for hi8 since should pretty much always have the second audio
+            # channel. May want to enable for video8 as well.
+            rf_options.get("fm_audio_notch", 0) or (tape_format == "HI8"),
             self.DecoderParams.get("chroma_audio_notch_freq", 0) > 0,
             int(self.DecoderParams.get("chroma_offset", 5) * (self.freq / 40.0)),
             ire0_adjust,
             rf_options.get("gnrc_afe", False),
             rf_options.get("relaxed_line0", False),
-            rf_options.get("detect_chroma_track_phase", False)
+            rf_options.get("detect_chroma_track_phase", False),
+            rf_options.get("enable_color_killer", False),
+            rf_options.get("disable_burst_hsync", False),
+            rf_options.get("disable_phase_correction", False),
         )
 
         # As agc can alter these sysParams values, store a copy to then
@@ -841,8 +899,7 @@ class VHSRFDecode(ldd.RFDecode):
             if self._do_cafc:
                 self.Filters["FChromaAudioNotch"] = sps.iirnotch(
                     DP["chroma_audio_notch_freq"]
-                    / self._chroma_afc.getOutFreqHalf()
-                    * 1e6,
+                    / (self._chroma_afc.getOutFreqHalf() * 1e6),
                     CHROMA_AUDIO_NOTCH_Q,
                 )
             else:
@@ -886,6 +943,7 @@ class VHSRFDecode(ldd.RFDecode):
             self.freq_hz,
             self.SysParams,
             self._sysparams_const,
+            self._processing_thread_pool,
             divisor=level_detect_divisor,
             debug=self.debug,
         )
@@ -928,10 +986,6 @@ class VHSRFDecode(ldd.RFDecode):
     @property
     def do_cafc(self):
         return self._do_cafc
-
-    @property
-    def recheck_phase(self):
-        return self._recheck_phase
 
     @property
     def color_system(self):

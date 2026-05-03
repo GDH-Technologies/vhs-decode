@@ -5,10 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
-import matplotlib
-
 try:
-    from PyQt6.QtGui import QIcon, QPalette
+    from PyQt6.QtGui import QIcon
     from PyQt6.QtWidgets import (
         QApplication,
         QMainWindow,
@@ -30,11 +28,13 @@ try:
         QGridLayout,
     )
     from PyQt6 import QtGui, QtCore
+    import matplotlib
+
     matplotlib.use("QtAgg")  # Must come before importing pyplot; QtAgg supports PyQt6
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 except ImportError:
-    from PyQt5.QtGui import QIcon, QPalette
+    from PyQt5.QtGui import QIcon
     from PyQt5.QtWidgets import (
         QApplication,
         QMainWindow,
@@ -56,62 +56,73 @@ except ImportError:
         QGridLayout,
     )
     from PyQt5 import QtGui, QtCore
+    import matplotlib
+
     matplotlib.use("Qt5Agg")  # Must come before importing pyplot
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 
 import matplotlib.pyplot as plt
 
-from vhsdecode.hifi.HiFiDecode import (
-    DEFAULT_VHS_EXPANDER_GAIN,
-    DEFAULT_VHS_EXPANDER_RATIO,
-    DEFAULT_VHS_EXPANDER_ATTACK_TAU,
-    DEFAULT_VHS_EXPANDER_HOLD_TAU,
-    DEFAULT_VHS_EXPANDER_RELEASE_TAU,
-
-    DEFAULT_8MM_EXPANDER_GAIN,
-    DEFAULT_8MM_EXPANDER_RATIO,
-    DEFAULT_8MM_EXPANDER_ATTACK_TAU,
-    DEFAULT_8MM_EXPANDER_HOLD_TAU,
-    DEFAULT_8MM_EXPANDER_RELEASE_TAU,
-
-    DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
-    DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
-    DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS,
-    DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION,
-
-    DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1,
-    DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2,
-    DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS,
-    DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION,
-
-    DEFAULT_VHS_NR_DEEMPHASIS_TAU_1,
-    DEFAULT_VHS_NR_DEEMPHASIS_TAU_2,
-    DEFAULT_8MM_NR_DEEMPHASIS_TAU_1,
-    DEFAULT_8MM_NR_DEEMPHASIS_TAU_2,
-
-    DEFAULT_VHS_DEEMPHASIS_TAU_1,
-    DEFAULT_VHS_DEEMPHASIS_TAU_2,
+from vhsdecode.hifi.constants import (
+    DEFAULT_8MM_AUDIO_MODE,
     DEFAULT_8MM_DEEMPHASIS_TAU_1,
     DEFAULT_8MM_DEEMPHASIS_TAU_2,
-
-    DEFAULT_SPECTRAL_NR_AMOUNT,
-    DEFAULT_RESAMPLER_QUALITY,
-    DEFAULT_VHS_AUDIO_MODE,
-    DEFAULT_8MM_AUDIO_MODE,
-    audio_mode_to_ui,
-    ui_to_audio_mode,
-    DEFAULT_DOC_MODE,
-    doc_mode_to_ui,
-    ui_to_doc_mode,
-    DEMOD_QUADRATURE,
-    DEMOD_HILBERT,
+    DEFAULT_8MM_EXPANDER_ATTACK_TAU,
+    DEFAULT_8MM_EXPANDER_GAIN,
+    DEFAULT_8MM_EXPANDER_HOLD_TAU,
+    DEFAULT_8MM_EXPANDER_RATIO,
+    DEFAULT_8MM_EXPANDER_RELEASE_TAU,
+    DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS,
+    DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION,
+    DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1,
+    DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2,
+    DEFAULT_8MM_NR_DEEMPHASIS_TAU_1,
+    DEFAULT_8MM_NR_DEEMPHASIS_TAU_2,
     DEFAULT_DEMOD,
-    tau_as_freq,
-    HiFiDecode,
-    Deemphasis,
-    Expander
+    DEFAULT_DOC_MODE,
+    DEFAULT_RESAMPLER_QUALITY,
+    DEFAULT_SPECTRAL_NR_AMOUNT,
+    DEFAULT_VHS_AUDIO_MODE,
+    DEFAULT_VHS_DEEMPHASIS_TAU_1,
+    DEFAULT_VHS_DEEMPHASIS_TAU_2,
+    DEFAULT_VHS_EXPANDER_ATTACK_TAU,
+    DEFAULT_VHS_EXPANDER_GAIN,
+    DEFAULT_VHS_EXPANDER_HOLD_TAU,
+    DEFAULT_VHS_EXPANDER_RATIO,
+    DEFAULT_VHS_EXPANDER_RELEASE_TAU,
+    DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS,
+    DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION,
+    DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
+    DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
+    DEFAULT_VHS_NR_DEEMPHASIS_TAU_1,
+    DEFAULT_VHS_NR_DEEMPHASIS_TAU_2,
+    DEFAULT_ENV_DETECTION,
+    DEMOD_HILBERT,
+    DEMOD_QUADRATURE,
+    audio_mode_to_ui,
+    doc_mode_to_ui,
+    expander_env_detection_to_ui,
+    ui_to_audio_mode,
+    ui_to_doc_mode,
+    ui_to_expander_env_detection
 )
+from vhsdecode.hifi.afe import get_standard
+
+_PLOT_DEEMPHASIS = None
+_PLOT_EXPANDER = None
+
+
+def _ensure_plot_helpers():
+    global _PLOT_DEEMPHASIS, _PLOT_EXPANDER
+
+    if _PLOT_DEEMPHASIS is None or _PLOT_EXPANDER is None:
+        from vhsdecode.hifi.HiFiDecode import Deemphasis, Expander
+
+        _PLOT_DEEMPHASIS = Deemphasis
+        _PLOT_EXPANDER = Expander
+
+    return _PLOT_DEEMPHASIS, _PLOT_EXPANDER
 
 STOP_STATE = 0
 PLAY_STATE = 1
@@ -125,6 +136,7 @@ class MainUIParameters:
         self.normalize = False
         self.expander_gain: float = DEFAULT_VHS_EXPANDER_GAIN
         self.expander_ratio: float = DEFAULT_VHS_EXPANDER_RATIO
+        self.expander_env_detection = DEFAULT_ENV_DETECTION
         self.expander_attack_tau: float = DEFAULT_VHS_EXPANDER_ATTACK_TAU
         self.expander_hold_tau: float = DEFAULT_VHS_EXPANDER_HOLD_TAU
         self.expander_release_tau: float = DEFAULT_VHS_EXPANDER_RELEASE_TAU
@@ -166,6 +178,7 @@ def decode_options_to_ui_parameters(decode_options):
     values.enable_deemphasis = decode_options["enable_deemphasis"]
     values.expander_gain = decode_options["expander_gain"]
     values.expander_ratio = decode_options["expander_ratio"]
+    values.expander_env_detection = expander_env_detection_to_ui[decode_options["expander_env_detection"]]
     values.expander_attack_tau = decode_options["expander_attack_tau"]
     values.expander_hold_tau = decode_options["expander_hold_tau"]
     values.expander_release_tau = decode_options["expander_release_tau"]
@@ -209,6 +222,7 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
         "enable_deemphasis": values.enable_deemphasis,
         "expander_gain": values.expander_gain,
         "expander_ratio": values.expander_ratio,
+        "expander_env_detection": ui_to_expander_env_detection[values.expander_env_detection],
         "expander_attack_tau": values.expander_attack_tau,
         "expander_hold_tau": values.expander_hold_tau,
         "expander_release_tau": values.expander_release_tau,
@@ -736,6 +750,21 @@ class HifiUi(QMainWindow):
 
         self.enable_expander_checkbox = QCheckBox("Enabled")
         expander_controls_frame.inner_layout.addWidget(self.enable_expander_checkbox)
+
+        # Expander Envelope Detection method combo
+        expander_env_detection_layout = QHBoxLayout()
+        expander_env_detection_label = QLabel("Envelope Detection Method")
+
+        self.expander_env_detection_combo = QComboBox(self)
+        self.expander_env_detection_combo.setToolTip(
+            "Select the expander envelope detection method.\n Peak detection (JVC standard, IEC 60774-2),\n RMS detection (Some Panasonic and early VCRs)"
+        )
+        self.expander_env_detection_combo.addItems(ui_to_expander_env_detection.keys())
+        expander_env_detection_layout.addWidget(expander_env_detection_label)
+        expander_env_detection_layout.addWidget(self.expander_env_detection_combo)
+
+        expander_controls_frame.inner_layout.addLayout(expander_env_detection_layout)
+
         expander_controls_layout = QHBoxLayout()
         self.expander_gain_dial_control = DialControl(
             self, "Gain (db)", QtGui.QDoubleValidator(), 1, 1, 60, width=2
@@ -859,14 +888,17 @@ class HifiUi(QMainWindow):
         return layout
     
     def schedule_plot_update(self):
-        self._plot_update_timer.start(50)
+        if (
+            self.weighting_deemphasis_plot is not None
+            and self.weighting_deemphasis_plot.isVisible()
+        ):
+            self._plot_update_timer.start(50)
     
     def build_plot_window(self):
-        # Sideband / Deemphasis plot window
-        self.weighting_deemphasis_plot = PlotWindow("Weighting / Deemphasis", self.getValues)
+        self.weighting_deemphasis_plot = None
         self._plot_update_timer = QtCore.QTimer()
         self._plot_update_timer.setSingleShot(True)
-        self._plot_update_timer.timeout.connect(self.weighting_deemphasis_plot.update_plot)
+        self._plot_update_timer.timeout.connect(self._update_visible_plot)
 
         self.expander_gain_dial_control.valueChanged.connect(self.schedule_plot_update)
         self.expander_ratio_dial_control.valueChanged.connect(self.schedule_plot_update)
@@ -887,8 +919,19 @@ class HifiUi(QMainWindow):
 
         self.audio_mode_combo.currentIndexChanged.connect(self.schedule_plot_update)
         self.sample_rate_combo.currentIndexChanged.connect(self.schedule_plot_update)
+
+    def _update_visible_plot(self):
+        if (
+            self.weighting_deemphasis_plot is not None
+            and self.weighting_deemphasis_plot.isVisible()
+        ):
+            self.weighting_deemphasis_plot.update_plot()
     
     def show_plot(self):
+        if self.weighting_deemphasis_plot is None:
+            self.weighting_deemphasis_plot = PlotWindow(
+                "Weighting / Deemphasis", self.getValues
+            )
         geo = self.geometry()
         self.weighting_deemphasis_plot.move(geo.x() + geo.width() + 20, geo.y())
         self.weighting_deemphasis_plot.update_plot()
@@ -916,6 +959,10 @@ class HifiUi(QMainWindow):
         self.volume_dial_control.setValue(values.volume)
         self.expander_gain_dial_control.setValue(values.expander_gain)
         self.expander_ratio_dial_control.setValue(values.expander_ratio)
+        self.expander_env_detection_combo.setCurrentText(values.expander_env_detection)
+        self.expander_env_detection_combo.setCurrentIndex(
+            self.expander_env_detection_combo.findText(values.expander_env_detection)
+        )
         self.expander_attack_tau_dial_control.setValue(values.expander_attack_tau)
         self.expander_hold_tau_dial_control.setValue(values.expander_hold_tau)
         self.expander_release_tau_dial_control.setValue(values.expander_release_tau)
@@ -1001,6 +1048,7 @@ class HifiUi(QMainWindow):
         values.volume = self.volume_dial_control.value()
         values.expander_gain = self.expander_gain_dial_control.value()
         values.expander_ratio = self.expander_ratio_dial_control.value()
+        values.expander_env_detection = self.expander_env_detection_combo.currentText()
         values.expander_attack_tau = self.expander_attack_tau_dial_control.value()
         values.expander_hold_tau = self.expander_hold_tau_dial_control.value()
         values.expander_release_tau = self.expander_release_tau_dial_control.value()
@@ -1054,7 +1102,7 @@ class HifiUi(QMainWindow):
         afe_left_carrier=0,
         afe_right_carrier=0,
     ):
-        standard, _ = HiFiDecode.get_standard(
+        standard, _ = get_standard(
             "vhs" if format == "VHS" else "8mm",
             "p" if standard == "PAL" else "n",
             afe_vco_deviation,
@@ -1563,9 +1611,16 @@ class PlotWindow(QWidget):
         super(QWidget, self).__init__()
 
         self.setWindowTitle(title)
+        import matplotlib
 
-        # Matplotlib figure
-        fig, self.ax = plt.subplots(figsize=(12, 8))
+        matplotlib.use("Qt5Agg")
+
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(12, 8))
+        self.ax = fig.subplots()
         self.canvas = FigureCanvas(fig)
 
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -1575,13 +1630,17 @@ class PlotWindow(QWidget):
         layout.addWidget(self.toolbar)
         self.setLayout(layout)
         self.getValues = getValues
+    
+    @staticmethod
+    def tau_as_freq(tau):
+        return 1 / (2 * np.pi * tau)
 
     def plot_response(self, label, color, freq, mag_db, t1, t2):
         # Compute the frequency response
         # Convert taus to frequencies
-        t1_f = round(tau_as_freq(t1))
-        t2_f = round(tau_as_freq(t2))
-        center_f = round(np.sqrt(tau_as_freq(t1) * tau_as_freq(t2)))
+        t1_f = round(PlotWindow.tau_as_freq(t1))
+        t2_f = round(PlotWindow.tau_as_freq(t2))
+        center_f = round(np.sqrt(PlotWindow.tau_as_freq(t1) * PlotWindow.tau_as_freq(t2)))
     
         # Plot the full frequency response
         self.ax.semilogx(freq, mag_db, label=label, color=color)
@@ -1607,6 +1666,7 @@ class PlotWindow(QWidget):
     def update_plot(self):
         self.ax.clear()
         ui_values = self.getValues()
+        Deemphasis, Expander = _ensure_plot_helpers()
 
         deemphasis = Deemphasis(
             ui_values.audio_sample_rate,
@@ -1626,6 +1686,7 @@ class PlotWindow(QWidget):
             ui_values.audio_sample_rate,
             ui_values.expander_gain,
             ui_values.expander_ratio,
+            ui_values.expander_env_detection,
             ui_values.expander_attack_tau,
             ui_values.expander_hold_tau,
             ui_values.expander_release_tau,

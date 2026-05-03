@@ -7,15 +7,36 @@ build-backend = "setuptools.build_meta"
 name = "vhs_decode"
 description = "Software Decoder for raw rf captures of laserdisc, vhs and other analog video formats"
 readme = "README_pypi.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 keywords = ["laserdisc", "vhs", "video", "tape", "decoder"]
 license = {file = "LICENSE"}
 classifiers = [
-    "Topic :: Multimedia :: Video",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Video :: Capture",
 ]
 dependencies = [
-    "numpy>=1.22","numba>=0.58.1","scipy>=1.10.1", "soxr", "static-ffmpeg", "cython", "soundfile>=0.13.1", "sounddevice", "importlib_resources >= 5.0; python_version < '3.10'", "matplotlib", "noisereduce>=2.0.0", "setproctitle"
+    "cython",
+    "matplotlib",
+    "noisereduce>=2.0.0",
+    "numba>=0.59",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "setproctitle",
+    "sounddevice",
+    "soundfile>=0.13.1",
+    "soxr",
+    "static-ffmpeg",
+    "av",
 ]
 dynamic = ["version"]
 # version = "0.2.1dev0"
@@ -30,9 +51,11 @@ cuda11 = [ "cupy-cuda11x", "nvidia-cuda-nvrtc-cu11", "nvidia-cufft-cu11" ]
 # Can probably be depcretaded now since it's also an option in vhs-decode to use it.
 hifi_gnuradio = [ "pyzmq" ]
 gnuradio = [ "pyzmq" ]
+test = [ "pytest>=7.0" ]
 
 [project.scripts]
 ld-decode = "lddecode.main:main"
+ld-ldf-reader-py = "lddecode.ldf_reader:main"
 vhs-decode = "vhsdecode.main:main"
 cvbs-decode = "cvbsdecode.main:main"
 hifi-decode = "vhsdecode.hifi.main:main"
@@ -47,6 +70,9 @@ decode-launcher = "vhsdecode.decode_launcher:main"
 
 [project.urls]
 Homepage = "https://www.domesday86.com"
+Repository = "https://github.com/oyvindln/vhs-decode"
+Documentation = "https://github.com/oyvindln/vhs-decode/wiki"
+Issues = "https://github.com/oyvindln/vhs-decode/issues"
 
 [tool.setuptools_scm]
 write_to = "vhsdecode/_version.py"
@@ -61,6 +87,13 @@ vhs_decode = ["*.txt"]
 [[tool.setuptools-rust.ext-modules]]
 # Private Rust extension module to be nested into the Python package
 target = "vhsd_rust"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
+markers = [
+    "integration: end-to-end decode tests requiring real RF data",
+]
 
 # Needed to prevent building for older macos versions not supported by rust - see https://cibuildwheel.pypa.io/en/stable/faq/#building-rust-wheels
 [tool.cibuildwheel.macos.environment]

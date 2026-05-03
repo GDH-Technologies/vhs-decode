@@ -6,6 +6,8 @@ import traceback
 import json
 import shutil
 import time
+import faulthandler
+import math
 
 import numpy
 
@@ -55,11 +57,22 @@ supported_tape_formats = {
     "VCR_LP",
     "TYPEC",
     "TYPEB",
+    "VHD",
     "VIDEO2000",
 }
 
 
 def main(args=None, use_gui=False):
+    # Allows stack-dump on Unix via `kill -USR1 <pid>` when supported.
+    # Windows does not provide SIGUSR1.
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is not None:
+        try:
+            faulthandler.register(sigusr1)
+        except (RuntimeError, ValueError, OSError):
+            # Ignore unsupported/runtime-specific registration failures and continue.
+            pass
+
     import vhsdecode.formats as f
 
     format_help = "Tape format - " + " ".join(supported_tape_formats) + "are supported"
@@ -102,6 +115,13 @@ def main(args=None, use_gui=False):
         default=None,
         help="Override format/system parameters with specified json file.",
     )
+    parser.add_argument(
+        "--orc",
+        dest="orc",
+        action="store_true",
+        default=False,
+        help="Use new naming tbc file convention for decode orc (command name subject to change).",
+    )
     luma_group = parser.add_argument_group("Luma decoding options")
     luma_group.add_argument(
         "-L",
@@ -133,14 +153,26 @@ def main(args=None, use_gui=False):
         ),
     )
     luma_group.add_argument(
-        "--wow_adjust_smoothing_lines",
-        type=float,
+        "--wow_level_adjust_smoothing",
+        type=int,
         default=None,
         help=(
-            "Adjusts the amount of smoothing in lines that is performed when compensating for brightness variations caused by wow. "
-            "\nWow calculation is based on position of hsync pulses which is affected by the accuracy of the TBC. "
-            "\nDefault is (video system lines / 2) i.e. NTSC=525/2, PAL=625/2, etc."
-            "\nSet to `0` to disable smoothing (only recommended for low noise video)"
+            "Adjusts the amount of smoothing in lines that is performed when compensating for brightness variations caused by wow."
+            "\n  Default is (video system lines / 2) i.e. NTSC=525/2, PAL=625/2, etc."
+            "\n  Wow calculation is based on position of hsync pulses which is affected by the accuracy of the TBC. "
+            "\n  If you see vertical brightness variations (banding), setting to a value larger than 0 will smooth the wow adjustment."
+        )
+    )
+    luma_group.add_argument(
+        "--wow_interpolation_method",
+        type=str,
+        default="linear",
+        choices=["linear", "quadratic", "cubic"],
+        help=(
+            "Sets the type of interpolation spline used to correct wow."
+            "\n  linear     [default]"
+            "\n  quadratic"
+            "\n  cubic"
         )
     )
     luma_group.add_argument(
@@ -223,7 +255,7 @@ def main(args=None, use_gui=False):
         help=(
             "Tries to detect the chroma carrier frequency on a field basis within some"
             " limit instead of using the default one for the format. Mainly useful for"
-            " debug purposes and used on PAL betamax. implies --recheck_phase"
+            " debug purposes and used on PAL betamax."
         ),
     )
     chroma_group.add_argument(
@@ -235,19 +267,36 @@ def main(args=None, use_gui=False):
         help="If set to 0 or 1, force use of video track phase. (No effect on U-matic)",
     )
     chroma_group.add_argument(
-        "-dctp",
+        "--dctp",
         "--detect_chroma_track_phase",
         dest="detect_chroma_track_phase",
         action="store_true",
         default=False,
-        help="Detect and correct chroma phase consistency for each track / field. Corrects chroma artifacts around head-switching area for VHS. (Experimental feature)",
+        help="Detects and corrects color-under heterodyne rotation change around head-switching area. Corrects chroma artifacts around head-switching area for color-under formats. (Experimental feature)",
     )
     chroma_group.add_argument(
-        "--recheck_phase",
-        dest="recheck_phase",
+        "--dpc",
+        "--disable_phase_correction",
+        dest="disable_phase_correction",
         action="store_true",
         default=False,
-        help="Re-check chroma phase on every field. (No effect on U-matic)",
+        help="Disables phase correction after up-heterodyning color under formats. This can safely be disabled if not using the NTSC 3D decoder. (currently only applicable to NTSC)",
+    )
+    chroma_group.add_argument(
+        "--dbh",
+        "--disable_burst_hsync",
+        dest="disable_burst_hsync",
+        action="store_true",
+        default=False,
+        help="Disables using the color burst phase to refine hsync.",
+    )
+    chroma_group.add_argument(
+        "--ck",
+        "--enable_color_killer",
+        dest="enable_color_killer",
+        action="store_true",
+        default=False,
+        help="Enables color killer, i.e. burst detection to enable/disable chroma decoding and hsync refinement."
     )
     chroma_group.add_argument(
         "--no_comb",
@@ -504,7 +553,9 @@ def main(args=None, use_gui=False):
         loader = lddu.LoadFFmpeg()
 
     dod_threshold_p = f.DEFAULT_THRESHOLD_P_DDD
-    if args.cxadc or args.cxadc3 or args.cxadc_tenbit or args.cxadc3_tenbit:
+    # Guesstimate a sample rate of around 28 is cx card and use different doc threshold
+    # may want to change this now that people use amps.
+    if math.floor(sample_freq) == 28:
         dod_threshold_p = f.DEFAULT_THRESHOLD_P_CXADC
 
     rf_options = get_rf_options(args)
@@ -512,7 +563,6 @@ def main(args=None, use_gui=False):
     rf_options["dod_threshold_a"] = args.dod_threshold_a
     rf_options["dod_hysteresis"] = args.dod_hysteresis
     rf_options["track_phase"] = args.track_phase
-    rf_options["recheck_phase"] = args.recheck_phase
     rf_options["high_boost"] = args.high_boost
     rf_options["disable_diff_demod"] = args.disable_diff_demod
     rf_options["fm_audio_notch"] = args.fm_audio_notch
@@ -534,12 +584,16 @@ def main(args=None, use_gui=False):
     rf_options["tape_speed"] = args.tape_speed
     rf_options["ire0_adjust"] = args.ire0_adjust
     rf_options["detect_chroma_track_phase"] = args.detect_chroma_track_phase
+    rf_options["enable_color_killer"] = args.enable_color_killer
+    rf_options["disable_burst_hsync"] = args.disable_burst_hsync
+    rf_options["disable_phase_correction"] = args.disable_phase_correction
     rf_options["gnrc_afe"] = args.gnrc_afe
     rf_options["use_gpu"] = args.use_gpu
     rf_options["force_cpu"] = args.force_cpu
 
     extra_options = get_extra_options(args, not use_gui)
     extra_options["params_file"] = args.params_file
+    extra_options["orc"] = args.orc
 
     # Wrap the LDdecode creation so that the signal handler is not taken by sub-threads,
     # allowing SIGINT/control-C's to be handled cleanly
@@ -556,6 +610,9 @@ def main(args=None, use_gui=False):
         from vhsdecode.debug_plot import DebugPlot
 
         debug_plot = DebugPlot(args.debug_plot)
+
+    if args.cxadc:
+        logger.warning("--cxadc is deprecated! use -f 8fsc instead!")
 
     # Initialize VHS decoder
     # Note, we pass 40 as sample frequency, as any other will be resampled by the
@@ -575,7 +632,6 @@ def main(args=None, use_gui=False):
         extra_options=extra_options,
         debug_plot=debug_plot,
         field_order_action=args.field_order_action,
-        level_smoothing_lines=args.wow_adjust_smoothing_lines
     )
     backend = vhsd.rf.gpu_backend
     if backend.active:

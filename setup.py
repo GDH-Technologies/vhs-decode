@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from setuptools import setup
 import shutil
 import os
@@ -23,6 +25,10 @@ if compiler.compiler_type == "unix":
 else:
     extra_compile_args=[]
     extra_link_args=[]
+
+# Release/performance safety: default Rust extension builds to cargo's
+# release profile unless a caller explicitly overrides it.
+os.environ.setdefault("SETUPTOOLS_RUST_CARGO_PROFILE", "release")
 
 setup(
     # name='ld-decode',
@@ -52,9 +58,8 @@ setup(
     # of including without making them modules.
     scripts=[
         "ld-cut",
-        "cx-expander",
+        "scripts/cx-expander",
         "decode.py",
-        "decode-launcher",
     ],
     # scripts=[
     #    'cx-expander',

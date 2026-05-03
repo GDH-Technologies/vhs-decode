@@ -5,12 +5,17 @@ import itertools
 import json
 import math
 import os
+import errno
 import subprocess
 import sys
 import traceback
 import signal
+import time
+import warnings
 
-from multiprocessing import Event, Pipe, Process
+import threading
+from queue import Queue
+from concurrent.futures import ProcessPoolExecutor
 
 from numba import jit, njit
 import numba
@@ -18,13 +23,31 @@ import numba
 # standard numeric/scientific libraries
 import numpy as np
 import scipy.signal as sps
-from scipy import interpolate
+from scipy.special import i0
 
-# Try to make sure ffmpeg is available
-try:
-    import static_ffmpeg
-except ImportError:
-    pass
+def _ensure_ffmpeg_on_path():
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Unable to find acceptable character detection dependency.*",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="urllib3 .* or chardet .*charset_normalizer .* doesn't match a supported version!",
+            )
+            import static_ffmpeg
+    except ImportError:
+        return False
+    except Exception:
+        return False
+
+    try:
+        static_ffmpeg.add_paths(weak=True)
+    except Exception:
+        return False
+
+    return True
 
 # If profiling is not enabled, make it a pass-through wrapper
 try:
@@ -69,19 +92,67 @@ def scale(buf, begin, end, tgtlen, mult=1):
     return output
 
 
-# Scales and compensates for wow-induced playback-speed variations
-@njit(nogil=True, cache=True, fastmath=True)
-def scale_field(buf, dsout, interpolated_pixel_locs, wowfactors, lineoffset, outwidth, level_smoothing_lines=0, level_adjust_threshold = 15):
-    # Constants preserved as float32
-    point_5 = np.float32(0.5)
-    two = np.float32(2)
-    three = np.float32(3)
-    four = np.float32(4)
-    five = np.float32(5)
+@njit
+def sinc(x):
+    if x == 0.0:
+        return 1.0
+    x_pi = np.pi * x
+    return math.sin(x_pi) / x_pi
 
-    lineoffset += 1
-    lineoffset_out_samples = outwidth * lineoffset
 
+def kaiser_window(x, a, beta, i0_beta):
+    r = x / a
+    if r < -1.0 or r > 1.0:
+        return 0.0
+
+    t = math.sqrt(1.0 - r * r)
+    return i0(beta * t) / i0_beta
+
+
+# https://ccrma.stanford.edu/~jos/sasp/Kaiser_Windows_Transforms.html
+def build_kaiser_lut(beta, taps, phases):
+    a = taps // 2
+
+    offsets = np.arange(a - 1, -a - 1, -1)
+    offsets_len = len(offsets)
+
+    table = np.zeros((phases + 1, taps), dtype=np.float32)
+    weights = np.empty(offsets_len, dtype=np.float32)
+    i0_beta = i0(beta)
+
+    for i in range(phases):
+        phase = i / phases
+
+        s = 0.0
+        for j in range(offsets_len):
+            x = offsets[j] + phase
+            weight = sinc(x) * kaiser_window(x, a, beta, i0_beta)
+
+            weights[j] = weight
+            s += weight
+
+        table[i, :] = weights / s
+
+    # copy the last phase to avoid bounds checking later on when we do linear interpolation
+    table[phases] = table[phases - 1]
+
+    return table
+
+# Kaiser Beta parameter controls trade-off between sharpness and ringing
+# Small Beta = more sharpness / more ringing (narrow main lobe (more sharp), less side lobe cutoff (more ringing))
+# Large Beta = less sharpness / less ringing (wide main lobe (less sharp), more side lobe cutoff (less ringing))
+kaiser_beta = 5
+sinc_tap_count = 16 # must be multiple of 2
+sinc_phase_count = 2**16
+
+# compute sinc table in a process to so it doesn't block other startup tasks
+sinc_lut_future = ProcessPoolExecutor().submit(
+    build_kaiser_lut, kaiser_beta, sinc_tap_count, sinc_phase_count
+)
+
+
+@njit(nogil=True, fastmath=True)
+def scale_field(buf, dsout, interpolated_pixel_locs, wowfactors, sinc_lut, lineoffset, outwidth, wow_level_adjust_smoothing = 0, level_adjust_threshold = 15):
     # average out any unusual spikes in wow that happen on a per line basis
     # this indicates an hsync tbc error vs. being normal wow from playback speed variations
     # in this case for level adjusting we just want to fallback to the average wow to avoid a bright or dark line
@@ -95,16 +166,20 @@ def scale_field(buf, dsout, interpolated_pixel_locs, wowfactors, lineoffset, out
         wowfactors
     )
 
-    if level_smoothing_lines > 0:
+    if wow_level_adjust_smoothing > 0:
         # removes oscillating brightness variations for video with lots of noise around the hsync pulses, i.e. noisy line locations result in noisy wow calculations
         # applies a low pass filter that smooths any sudden brightness variations while still being reactive enough to compensate for low frequency wow
-        alpha = 1 / (level_smoothing_lines * outwidth)
+        alpha = 1 / (wow_level_adjust_smoothing * outwidth)
         one_minus_alpha = 1 - alpha
 
         for i in range(1, len(level_adjusts)):
-            level_adjusts[i] = alpha * level_adjusts[i] + one_minus_alpha * level_adjusts[i-1]       
+            level_adjusts[i] = alpha * level_adjusts[i] + one_minus_alpha * level_adjusts[i-1]
 
-    for i in range(lineoffset_out_samples, len(dsout) + lineoffset_out_samples):
+    half_taps_m1 = (sinc_tap_count // 2) - 1
+
+    dsout_start = outwidth * (lineoffset + 1)
+    dsout_end = len(dsout) + dsout_start
+    for i in range(dsout_start, dsout_end):
         # compensates for the amplitude/frequency shift caused by FM demodulation under varying playback speed.
         level_adjust = level_adjusts[i]
 
@@ -112,18 +187,27 @@ def scale_field(buf, dsout, interpolated_pixel_locs, wowfactors, lineoffset, out
         coord = np.float32(interpolated_pixel_locs[i])
         coord_int = int(coord)
 
-        # get the data from the buffer that aligns to the wow factor index
-        p0 = buf[coord_int - 1]
-        p1 = buf[coord_int]
-        p2 = buf[coord_int + 1]
-        p3 = buf[coord_int + 2]
-        x = np.float32(coord - coord_int)
+        # fractional phase
+        frac = coord - coord_int
 
-        # perform cubic scaling
-        a = p2 - p0
-        b = two * p0 - five * p1 + four * p2 - p3
-        c = three * (p1 - p2) + p3 - p0
-        dsout[i-lineoffset_out_samples] = level_adjust * (p1 + point_5 * x * (a + x * (b + x * c)))
+        phase_pos = frac * sinc_phase_count
+        phase_start = int(phase_pos)
+        phase_end = phase_start + 1
+
+        alpha = np.float32(phase_pos - phase_start)
+
+        w_start = sinc_lut[phase_start]
+        w_end = sinc_lut[phase_end]
+
+        start = coord_int - half_taps_m1
+
+        result = 0.0
+        for t in range(sinc_tap_count):
+            # do linear interpolation between pre-computed phases
+            ws = w_start[t]
+            result += buf[start + t] * (ws + alpha * (w_end[t] - ws))
+
+        dsout[i - dsout_start] = level_adjust * result
 
 
 frequency_suffixes = [
@@ -217,21 +301,9 @@ def make_loader(filename, inputfreq=None):
         or filename.endswith(".flac")
         or filename.endswith(".vhs")
     ):
-        try:
-            return LoadLDF(filename)
-        except FileNotFoundError:
-            print(
-                "ld-ldf-reader not found in PATH, using ffmpeg instead.",
-                file=sys.stderr,
-            )
-        except Exception:
-            # print("Please build and install ld-ldf-reader in your PATH for improved performance", file=sys.stderr)
-            traceback.print_exc()
-            print(
-                "Failed to load with ld-ldf-reader, trying ffmpeg instead.",
-                file=sys.stderr,
-            )
+        return LoadLDF(filename)
 
+    # Fallback to LoadFFmpeg for other formats (with stdin input)
     return LoadFFmpeg()
 
 
@@ -409,6 +481,7 @@ class LoadFFmpeg:
         readlen_bytes = readlen * 2
 
         if self.ffmpeg is None:
+            _ensure_ffmpeg_on_path()
             command = ["ffmpeg", "-hide_banner", "-loglevel", "quiet"]
             command += self.input_args
             command += ["-i", "-"]
@@ -433,7 +506,10 @@ class LoadFFmpeg:
         while sample_bytes > self.position:
             # Seeking forwards - read and discard samples
             count = min(sample_bytes - self.position, self.rewind_size)
-            self._read_data(count)
+            data = self._read_data(count)
+            if len(data) == 0:
+                # EOF
+                return None
 
         if readlen_bytes > 0:
             # Read some new data from ffmpeg
@@ -453,7 +529,7 @@ class LoadFFmpeg:
 
 
 class LoadLDF:
-    """Load samples from an .ldf file, using ld-ldf-reader which itself uses ffmpeg."""
+    """Load samples from an .ldf file, using ld-ldf-reader-py which itself uses ffmpeg."""
 
     def __init__(self, filename, input_args=[], output_args=[]):
         self.input_args = input_args
@@ -461,7 +537,7 @@ class LoadLDF:
 
         self.filename = filename
 
-        # The number of the next byte ld-ldf-reader will return
+        # The number of the next byte ld-ldf-reader-py will return
 
         self.position = 0
         # Keep a buffer of recently-read data, to allow seeking backwards by
@@ -472,7 +548,7 @@ class LoadLDF:
 
         self.ldfreader = None
 
-        # ld-ldf-reader subprocess
+        # ld-ldf-reader-py subprocess
         self.ldfreader = self._open(0)
 
     def __del__(self):
@@ -503,13 +579,38 @@ class LoadLDF:
             traceback.print_exc()
             pass
 
+    @staticmethod
+    def _find_ldf_reader():
+        """Find ld-ldf-reader-py, checking the repo root as a fallback."""
+        import shutil
+
+        if shutil.which("ld-ldf-reader-py"):
+            return "ld-ldf-reader-py"
+
+        # Fall back to the script next to this package (i.e. the repo root)
+        repo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ld-ldf-reader-py")
+        if os.path.isfile(repo_path):
+            return repo_path
+
+        raise FileNotFoundError("Cannot find ld-ldf-reader-py on PATH or in the source tree")
+
     def _open(self, sample):
         self._close()
 
-        command = ["ld-ldf-reader", self.filename, str(sample)]
+        if sys.platform == "win32":
+            # On Windows, .bat wrappers cannot be launched directly by CreateProcess.
+            # Use the current Python interpreter to run ldf_reader as a module instead.
+            # sys.executable is always valid, and the subprocess inherits PYTHONHOME/
+            # PYTHONPATH from the parent process so lddecode is importable.
+            command = [
+                sys.executable, "-m", "lddecode.ldf_reader",
+                "--quiet", "--start-offset", str(sample), self.filename,
+            ]
+        else:
+            command = [self._find_ldf_reader(), "--quiet", "--start-offset", str(sample), self.filename]
 
         ldfreader = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.position = sample * 2
         self.rewind_buf = b""
@@ -544,7 +645,10 @@ class LoadLDF:
         while sample_bytes > self.position:
             # Seeking forwards - read and discard samples
             count = min(sample_bytes - self.position, self.rewind_size)
-            self._read_data(count)
+            data = self._read_data(count)
+            if len(data) == 0:
+                # EOF
+                return None
 
         if readlen_bytes > 0:
             # Read some new data from ffmpeg
@@ -564,6 +668,7 @@ class LoadLDF:
 
 
 def ffmpeg_pipe(outname: str, opts: str):
+    _ensure_ffmpeg_on_path()
     cmd = f"ffmpeg -y -hide_banner -loglevel quiet -f s16le -ar 40k -ac 1 -i -"
     if opts and len(opts):
         cmd += f" {opts}"
@@ -606,52 +711,6 @@ def ac3_pipe(outname: str):
                                       stdout=processes[-1].stdin))
 
     return processes, processes[-1].stdin
-
-# Git helpers
-
-def get_version():
-    """ get version info stashed in this directory's version file """
-
-    try:
-        # get the directory this file was pulled from, then add /version
-        scriptdir = os.path.dirname(os.path.realpath(__file__))
-        fd = open(os.path.join(scriptdir, 'version'), 'r')
-
-        fdata = fd.read()
-        return fdata.strip() # remove trailing \n etc
-    except (FileNotFoundError, OSError):
-        # Just return 'unknown' if we fail to find anything.
-        return "unknown"
-
-
-def get_git_info():
-    """ Return git branch and commit for current directory, if available. """
-
-    branch = "UNKNOWN"
-    commit = "UNKNOWN"
-
-    version = get_version()
-    if ':' in version:
-        branch, commit = version.split(':')[0:2]
-
-    try:
-        sp = subprocess.run(
-            "git rev-parse --abbrev-ref HEAD", shell=True, capture_output=True
-        )
-        if not sp.returncode:
-            branch = sp.stdout.decode("utf-8").strip()
-
-        sp = subprocess.run(
-            "git rev-parse --short HEAD", shell=True, capture_output=True
-        )
-        if not sp.returncode:
-            commit = sp.stdout.decode("utf-8").strip()
-    except Exception:
-        print("Something went wrong when trying to read git info...", file=sys.stderr)
-        traceback.print_exc()
-        pass
-
-    return branch, commit
 
 
 # Essential (or at least useful) standalone routines and lambdas
@@ -970,16 +1029,18 @@ def roundfloat(fl, places=3):
     return np.round(fl * r) / r
 
 
-@njit(nogil=True, cache=True)
+@njit(nogil=True, cache=True, fastmath=True)
 def hz_to_output_array(input, ire0, hz_ire, outputZero, vsync_ire, out_scale):
-    reduced = (input - ire0) / hz_ire
-    reduced -= vsync_ire
+    n = len(input)
+    out = np.empty(n, dtype=np.uint16)
 
-    return (
-        np.clip((reduced * out_scale) + outputZero, 0, 65535) + 0.5
-    ).astype(np.uint16)
+    scale = out_scale / hz_ire
+    offset = outputZero - vsync_ire * out_scale - ire0 * scale
 
+    for i in range(n):
+        out[i] = np.uint16(max(0, min(65535, input[i] * scale + offset)))
 
+    return out
 
 # Something like this should be a numpy function, but I can't find it.
 @jit(cache=True, nopython=True)
@@ -1372,34 +1433,41 @@ class FieldInfo:
 
 class JSONDumper:
     def __init__(self, ldd, outname):
-        self._rx, self._tx = Pipe(False)
-        self._writing = Event()
+        # Use a thread instead of a subprocess to avoid macOS multiprocessing
+        # spawn issues (forking after threads are started is unsafe on macOS,
+        # and spawn re-runs the entry point causing argparse errors).
+        self._queue = Queue()
+        self._writing = threading.Event()
         self._build_json = ldd.build_json
         self._get_field_info = ldd.fieldinfo.read
 
         self._outname = outname
-        self._dumper = Process(target=JSONDumper._consume, args=(self._rx, self._writing, self._outname, ldd.verboseVITS,), name="lddecode-json-dumper")
+        self._dumper = threading.Thread(
+            target=JSONDumper._consume,
+            args=(self._queue, self._writing, self._outname, ldd.verboseVITS),
+            name="lddecode-json-dumper",
+            daemon=True,
+        )
         self._dumper.start()
-    
+
     def write(self):
         if not self._writing.is_set():
             json_data = self._build_json()
             field_info = self._get_field_info()
-            self._tx.send(json_data)
-            self._tx.send(field_info)
+            self._queue.put((json_data, field_info))
 
     def close(self):
         json_data = self._build_json()
         field_info = self._get_field_info()
-        self._tx.send(json_data)
-        self._tx.send(field_info)
-
-        self._tx.send(None)
+        self._queue.put((json_data, field_info))
+        self._queue.put(None)  # sentinel to stop the consumer
         self._dumper.join()
 
     @staticmethod
-    def _consume(conn, ready, outname, verboseVITS):
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    def _consume(queue, ready, outname, verboseVITS):
+        # Signal handling is intentionally omitted here: signal handlers can
+        # only be set from the main thread in Python. The main thread already
+        # ignores SIGINT during LDdecode setup, so this thread is unaffected.
 
         indent = 4 if verboseVITS else None
         linebreak = '\n' if verboseVITS else ''
@@ -1409,13 +1477,13 @@ class JSONDumper:
 
         while True:
             try:
-                jsondict = conn.recv()
-                if jsondict is None:
+                item = queue.get()
+                if item is None:
                     break
 
-                next_field_info = conn.recv()
+                jsondict, next_field_info = item
                 ready.set()
-            except (InterruptedError, KeyboardInterrupt, EOFError):
+            except (InterruptedError, KeyboardInterrupt):
                 break
 
             # json serialize each field info object to a string
@@ -1452,7 +1520,20 @@ class JSONDumper:
 
             f.write('\n')
             f.close()
-            os.replace(outname + ".tbc.json.tmp", outname + ".tbc.json")
+            tmp_path = outname + ".tbc.json.tmp"
+            final_path = outname + ".tbc.json"
+            for attempt in range(20):
+                try:
+                    os.replace(tmp_path, final_path)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(0.1)
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EPERM) or attempt == 19:
+                        raise
+                    time.sleep(0.1)
 
             ready.clear()
 
