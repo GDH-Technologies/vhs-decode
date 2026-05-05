@@ -55,7 +55,6 @@ from vhsdecode.gpu_backend import (
 )
 from vhsdecode.dbwriter import DBWriter
 
-
 def is_secam(system: str):
     return system == "SECAM" or system == "MESECAM"
 
@@ -388,14 +387,19 @@ class VHSDecode(ldd.LDdecode):
         if "audioSamples" in fi:
             del fi["audioSamples"]
 
-        self.fieldinfo.append(fi)
-
         if self._db_writer:
+            fi_out = fi.copy()
+            fi_out["seqNo"] = len(self.fieldinfo) + 1
             if not self.capture_id:
                 self.build_sqlite_metadata()
-            self._db_writer.write_field(fi, self.dbconn, self.doDOD, self.capture_id)
+            self.fieldinfo.append(fi_out)
+            self._db_writer.write_field(
+                fi_out, self.dbconn, self.capture_id, self.doDOD
+            )
             # NOTE: this calls commit so we don't call it in dbwriter.write_field.
             self.build_sqlite_metadata()
+        else:
+            self.fieldinfo.append(fi)
 
         self.outfile_video.write(picturey)
         if self.rf.options.write_chroma:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import logging
 import os
 import shutil
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import sysconfig
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -154,6 +156,29 @@ TOOL_ENTRYPOINTS = {
 }
 
 
+def _agent_debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": "ee079b",
+            "runId": "dash-title-icon-debug",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(
+            "/home/rdodge/Repos/digitization-toolkit/.cursor/debug-ee079b.log",
+            "a",
+            encoding="utf-8",
+        ) as _f:
+            _f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+
 def _load_app_icon() -> QIcon:
     icon_dir = Path(__file__).resolve().parents[1] / "assets" / "icons"
 
@@ -177,8 +202,24 @@ def _load_app_icon() -> QIcon:
         if candidate.is_file():
             icon = QIcon(str(candidate))
             if not icon.isNull():
+                # #region agent log
+                _agent_debug_log(
+                    "H2",
+                    "decode_launcher.py:_load_app_icon",
+                    "Loaded icon candidate",
+                    {"candidate": str(candidate), "is_null": False},
+                )
+                # #endregion
                 return icon
 
+    # #region agent log
+    _agent_debug_log(
+        "H2",
+        "decode_launcher.py:_load_app_icon",
+        "No valid icon candidate found",
+        {"candidates": [str(c) for c in candidates]},
+    )
+    # #endregion
     return QIcon()
 
 
@@ -1235,15 +1276,68 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Decode Launcher (Qt) for starting decode/tools commands"
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "input_file",
+        nargs="?",
+        metavar="FILE",
+        help="RF input file to pre-load (optional)",
+    )
+    args = parser.parse_args(argv)
+
+    # #region agent log
+    _agent_debug_log(
+        "H1",
+        "decode_launcher.py:main:before_qapp",
+        "Process startup context",
+        {
+            "sys_executable": sys.executable,
+            "argv0": sys.argv[0] if sys.argv else "",
+            "argv": list(sys.argv),
+            "XDG_SESSION_TYPE": os.environ.get("XDG_SESSION_TYPE", ""),
+            "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY", ""),
+            "DISPLAY": os.environ.get("DISPLAY", ""),
+        },
+    )
+    # #endregion
 
     app = QApplication(sys.argv)
+    app.setApplicationName("io.github.vhs-decode.decode-launcher")
+    if hasattr(app, "setApplicationDisplayName"):
+        app.setApplicationDisplayName("Decode Launcher")
+    if hasattr(app, "setDesktopFileName"):
+        app.setDesktopFileName("io.github.vhs-decode.decode-launcher")
+    # #region agent log
+    _agent_debug_log(
+        "H3",
+        "decode_launcher.py:main:after_qapp",
+        "Initial Qt application identity",
+        {
+            "applicationName": app.applicationName(),
+            "applicationDisplayName": app.applicationDisplayName(),
+            "desktopFileName": app.desktopFileName() if hasattr(app, "desktopFileName") else "",
+        },
+    )
+    # #endregion
     icon = _load_app_icon()
     if icon is not None and not icon.isNull():
         app.setWindowIcon(icon)
     _apply_fusion_dark_mode(app)
     window = DecodeLauncherWindow()
     window.show()
+    # #region agent log
+    _agent_debug_log(
+        "H4",
+        "decode_launcher.py:main:after_show",
+        "Window identity and icon status",
+        {
+            "windowTitle": window.windowTitle(),
+            "windowIconIsNull": window.windowIcon().isNull(),
+            "appWindowIconIsNull": app.windowIcon().isNull(),
+        },
+    )
+    # #endregion
+    if args.input_file:
+        window.input_edit.setText(str(Path(args.input_file).resolve()))
     return app.exec() if hasattr(app, "exec") else app.exec_()
 
 
