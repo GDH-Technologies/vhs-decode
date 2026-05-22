@@ -2092,7 +2092,7 @@ class FieldNTSCUMatic(FieldNTSCShared):
         return (dsout, dschroma), dsaudio, dsefm
 
 
-class FieldNTSCTypeC(FieldShared, ldd.FieldNTSC):
+class FieldNTSCTypeC(FieldNTSCShared, ldd.FieldNTSC):
     def __init__(self, *args, **kwargs):
         super(FieldNTSCTypeC, self).__init__(*args, **kwargs)
 
