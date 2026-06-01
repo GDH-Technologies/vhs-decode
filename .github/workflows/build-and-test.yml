@@ -34,20 +34,39 @@ jobs:
             ctest --output-on-failure -V
           '
 
+  vhs-decode-unit-tests:
+    name: vhs-decode Unit Tests
+    uses: ./.github/workflows/vhs-decode-unit-tests.yml
+    secrets: inherit
+
+  vhs-decode-integration-tests:
+    name: vhs-decode Integration Tests
+    uses: ./.github/workflows/vhs-decode-integration-tests.yml
+    secrets: inherit
+
   build-linux-decode:
     name: Build Linux decode binaries
-    needs: functional-tests
+    needs: 
+    - functional-tests
+    - vhs-decode-unit-tests
+    - vhs-decode-integration-tests
     uses: ./.github/workflows/build_linux_decode.yml
     secrets: inherit
 
   build-windows-decode:
     name: Build Windows decode binaries
-    needs: functional-tests
+    needs:
+    - functional-tests
+    - vhs-decode-unit-tests
+    - vhs-decode-integration-tests
     uses: ./.github/workflows/build_windows_decode.yml
     secrets: inherit
 
   build-macos-decode:
     name: Build macOS decode binaries
-    needs: functional-tests
+    needs:
+    - functional-tests
+    - vhs-decode-unit-tests
+    - vhs-decode-integration-tests
     uses: ./.github/workflows/build_macos_decode.yml
     secrets: inherit
