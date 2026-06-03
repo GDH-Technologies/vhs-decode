@@ -236,4 +236,4 @@ The build produces `./result` with the installed package and CLI tools.
   
 ## Building tools (no longer hosted in this repo)
 
-Please see [tbc-tools](https://github.com/harrypm/tbc-tools) or []decode orc](github.com/simoninns/decode-orc/) for ld-decode only users.
+Please see [tbc-tools](https://github.com/harrypm/tbc-tools) or [decode orc](github.com/simoninns/decode-orc/) for ld-decode only users.
