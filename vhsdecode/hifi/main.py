@@ -36,6 +36,9 @@ from vhsdecode.hifi.utils import (
     PeakGain,
     BLOCK_DTYPE,
     REAL_DTYPE,
+    FLAC_TOTAL_SAMPLES_FIELD_MOD,
+    check_flac_header_total_samples,
+    parse_flac_streaminfo,
 )
 
 import argparse
@@ -701,9 +704,20 @@ class FFMpegFileReader(BufferedInputStream):
 
 
 class UnseekableSoundFile(sf.SoundFile):
-    def __init__(self, file_path, mode, channels, samplerate, format, subtype, endian):
+    def __init__(
+        self,
+        file_path,
+        mode,
+        channels,
+        samplerate,
+        format,
+        subtype,
+        endian,
+        frames_override=None,
+    ):
         self.file_path = file_path
         self._overlap = np.array([], dtype=np.int16)
+        self._frames_override = frames_override
         super().__init__(
             file_path,
             mode,
@@ -713,6 +727,14 @@ class UnseekableSoundFile(sf.SoundFile):
             subtype=subtype,
             endian=endian,
         )
+
+    @property
+    def frames(self):
+        """Number of frames, overridable for streams where libsndfile
+        cannot know the real length (e.g. piped input)."""
+        if self._frames_override is not None:
+            return self._frames_override
+        return super().frames
 
     def seek(self, offset, whence=io.SEEK_SET):
         return self.file_path.seek(offset, whence)
@@ -814,10 +836,90 @@ def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
             endian="LITTLE",
         )
     elif "flac" == extension:
-        return sf.SoundFile(
-            pathR,
-            "r",
-        )
+        streaminfo = parse_flac_streaminfo(pathR)
+        if streaminfo is not None:
+            header_ok, corrected_total = check_flac_header_total_samples(
+                streaminfo, os.path.getsize(pathR)
+            )
+            if not header_ok:
+                declared = streaminfo["total_samples"]
+                print(
+                    f"WARN: The FLAC header sample count ({declared}) does not match the amount of audio data in the file."
+                )
+                print(
+                    f"WARN: The FLAC STREAMINFO total_samples field is 36 bits wide and wraps around every {FLAC_TOTAL_SAMPLES_FIELD_MOD} samples on very long captures."
+                )
+                if corrected_total is not None:
+                    print(
+                        f"WARN: Estimated true length of this capture is {corrected_total} samples."
+                    )
+                if streaminfo["bits_per_sample"] == 16 and test_if_flac_is_installed():
+                    print(
+                        "WARN: Decoding through the flac command line decoder so the whole file is decoded."
+                    )
+                    return UnseekableSoundFile(
+                        FlacFileReader(pathR),
+                        "r",
+                        channels=streaminfo["channels"],
+                        samplerate=int(sample_rate),
+                        format="RAW",
+                        subtype="PCM_16",
+                        endian="LITTLE",
+                        frames_override=corrected_total,
+                    )
+                if test_if_ffmpeg_is_installed():
+                    print(
+                        "WARN: Decoding through ffmpeg so the whole file is decoded."
+                    )
+                    return UnseekableSoundFile(
+                        FFMpegFileReader(pathR),
+                        "r",
+                        channels=streaminfo["channels"],
+                        samplerate=int(sample_rate),
+                        format="RAW",
+                        subtype="PCM_16",
+                        endian="LITTLE",
+                        frames_override=corrected_total,
+                    )
+                print(
+                    "WARN: Neither flac nor ffmpeg is installed (or in PATH). The decode will stop early at the wrapped header sample count!"
+                )
+        try:
+            return sf.SoundFile(
+                pathR,
+                "r",
+            )
+        except sf.LibsndfileError as e:
+            # libsndfile only implements FLAC bit depths 8/16/24/32. Native
+            # 12-bit FLAC captures (e.g. MISRC) fail to open with
+            # "unimplemented format"; ffmpeg decodes them fine and emits
+            # 16-bit left-aligned samples (value << 4), bit-identical to the
+            # same capture padded to 16 bits at record time.
+            if streaminfo is None:
+                raise
+            print(f"WARN: libsndfile could not open this FLAC file: {e}")
+            print(
+                f"WARN: FLAC stream is {streaminfo['bits_per_sample']}-bit "
+                f"({streaminfo['channels']} channel(s))."
+            )
+            if test_if_ffmpeg_is_installed():
+                print(
+                    "WARN: Decoding through ffmpeg instead (16-bit left-aligned output)."
+                )
+                return UnseekableSoundFile(
+                    FFMpegFileReader(pathR),
+                    "r",
+                    channels=streaminfo["channels"],
+                    samplerate=int(sample_rate),
+                    format="RAW",
+                    subtype="PCM_16",
+                    endian="LITTLE",
+                    frames_override=streaminfo["total_samples"] or None,
+                )
+            print(
+                "ERROR: ffmpeg is not installed (or not in PATH), cannot decode this FLAC bit depth."
+            )
+            raise
     elif "ldf" == extension:
         try:
             for ldf_reader_tool in ("ld-ldf-reader", "ld-ldf-reader-py"):
@@ -2484,6 +2586,7 @@ def build_decode_options_from_args(args):
         "input_file": filename,
         "output_file": outname,
         "mode": real_mode,
+        "threads": args.threads,
     }
 
     return decode_options, real_mode
@@ -2494,6 +2597,8 @@ def _run_ui_transport_action(args, ui_t):
     options = ui_parameters_to_decode_options(ui_t.window.getValues())
     previous_state = ui_t.window.transport_state
     options["preview"] = previous_state == PREVIEW_STATE
+    # apply the thread count chosen in the UI (run_decoder reads args.threads)
+    args.threads = max(1, int(options.get("threads", args.threads)))
 
     working_directory = os.getcwd()
     try:

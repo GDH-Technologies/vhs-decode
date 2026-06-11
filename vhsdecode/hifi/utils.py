@@ -4,6 +4,7 @@ import numba
 import numpy as np
 from dataclasses import dataclass
 
+import io
 import string
 from random import SystemRandom
 
@@ -16,6 +17,138 @@ REAL_DTYPE = np.float32
 ALIGNMENT = 64
 
 NumbaAudioArray = numba.types.Array(numba.types.float32, 1, "C")
+
+# The STREAMINFO total_samples field is 36 bits wide, so captures longer than
+# 2^36 samples (~28.6 minutes at 40 MSps) overflow it and the stored count
+# wraps around modulo 2^36. libsndfile trusts this count and stops reading
+# there, truncating the decode. See parse_flac_streaminfo() below.
+FLAC_TOTAL_SAMPLES_FIELD_MOD = 2**36
+
+
+def parse_flac_streaminfo(file_path):
+    """Parse the FLAC STREAMINFO metadata block directly from the file.
+
+    Returns a dict with the STREAMINFO fields and the offset where the
+    audio frames start, or None if the file could not be parsed as FLAC.
+    """
+    try:
+        with open(file_path, "rb") as f:
+            if f.read(4) != b"fLaC":
+                return None
+
+            streaminfo = None
+            audio_offset = None
+            while True:
+                header = f.read(4)
+                if len(header) != 4:
+                    return None
+                is_last = bool(header[0] & 0x80)
+                block_type = header[0] & 0x7F
+                length = int.from_bytes(header[1:4], "big")
+
+                if block_type == 0 and streaminfo is None:
+                    data = f.read(length)
+                    if len(data) < 34:
+                        return None
+                    streaminfo = data
+                else:
+                    f.seek(length, io.SEEK_CUR)
+
+                if is_last:
+                    audio_offset = f.tell()
+                    break
+
+            if streaminfo is None or audio_offset is None:
+                return None
+
+            d = streaminfo
+            return {
+                "min_blocksize": int.from_bytes(d[0:2], "big"),
+                "max_blocksize": int.from_bytes(d[2:4], "big"),
+                "min_framesize": int.from_bytes(d[4:7], "big"),
+                "max_framesize": int.from_bytes(d[7:10], "big"),
+                "sample_rate": (d[10] << 12) | (d[11] << 4) | (d[12] >> 4),
+                "channels": ((d[12] >> 1) & 0x7) + 1,
+                "bits_per_sample": (((d[12] & 1) << 4) | (d[13] >> 4)) + 1,
+                "total_samples": ((d[13] & 0xF) << 32)
+                | int.from_bytes(d[14:18], "big"),
+                "audio_offset": audio_offset,
+            }
+    except OSError:
+        return None
+
+
+def check_flac_header_total_samples(streaminfo, file_size):
+    """Check whether the STREAMINFO total_samples count can be trusted.
+
+    A FLAC frame stores at most max_framesize bytes for at least
+    min_blocksize samples, so `total_samples` samples can never occupy more
+    than (total_samples / min_blocksize + 1) * max_framesize bytes of audio
+    payload. If the file holds substantially more audio data than that, the
+    36 bit total_samples field overflowed and wrapped (or was never
+    finalized), and the header length must not be trusted.
+
+    Returns (header_is_trustworthy, corrected_total_samples or None).
+    """
+    declared = streaminfo["total_samples"]
+    audio_bytes = file_size - streaminfo["audio_offset"]
+
+    if audio_bytes <= 0:
+        return True, None
+
+    if declared == 0:
+        # length marked as unknown (e.g. the encoder could not seek back to
+        # finalize the header)
+        return False, None
+
+    min_blocksize = streaminfo["min_blocksize"]
+    max_blocksize = streaminfo["max_blocksize"]
+    min_framesize = streaminfo["min_framesize"]
+    max_framesize = streaminfo["max_framesize"]
+
+    if min_blocksize > 0 and max_framesize > 0:
+        # largest possible payload for the declared sample count
+        declared_max_bytes = (declared // min_blocksize + 1) * max_framesize
+    else:
+        # min/max frame sizes may legally be 0 (unknown), fall back to the
+        # verbatim worst case (uncompressed samples) plus generous margin
+        declared_max_bytes = (
+            int(
+                declared
+                * streaminfo["channels"]
+                * (streaminfo["bits_per_sample"] / 8)
+                * 1.05
+            )
+            + 65536
+        )
+
+    if audio_bytes <= declared_max_bytes:
+        return True, None
+
+    # the header count is impossibly small for the amount of audio data in
+    # the file: it wrapped modulo 2^36. try to recover the true count using
+    # the frame size statistics, accepting it only if exactly one candidate
+    # fits between the possible payload bounds
+    corrected = None
+    if (
+        min_blocksize > 0
+        and max_blocksize > 0
+        and min_framesize > 0
+        and max_framesize > 0
+    ):
+        lower = audio_bytes / max_framesize * min_blocksize
+        upper = audio_bytes / min_framesize * max_blocksize
+        candidates = []
+        k = 1
+        while declared + k * FLAC_TOTAL_SAMPLES_FIELD_MOD <= upper:
+            candidate = declared + k * FLAC_TOTAL_SAMPLES_FIELD_MOD
+            if candidate >= lower:
+                candidates.append(candidate)
+            k += 1
+        if len(candidates) == 1:
+            corrected = candidates[0]
+
+    return False, corrected
 
 @dataclass
 class DecoderState:
