@@ -154,7 +154,8 @@ class MainUIParameters:
         self.input_sample_rate: float = 40.0
         self.input_file: str = ""
         self.output_file: str = ""
-        self.head_switching_interpolation = "on"
+        # bool: setChecked() requires a bool (PyQt6 rejects the old "on" str)
+        self.head_switching_interpolation = True
         self.doc = DEFAULT_DOC_MODE
 
 
@@ -1502,6 +1503,8 @@ class CollapsableSection(QVBoxLayout):
 
 
 class FileIODialogUI(HifiUi):
+    OUTPUT_FILE_SUFFIX = "_HiFi_Decoded.flac"
+
     def __init__(
         self,
         params: MainUIParameters,
@@ -1509,11 +1512,23 @@ class FileIODialogUI(HifiUi):
         main_layout_callback=None,
     ):
         super(FileIODialogUI, self).__init__(params, title, self._layout_callback)
+        # accept files dragged from a file manager anywhere on the window
+        self.setAcceptDrops(True)
 
     def _layout_callback(self, main_layout):
         # Add file input widgets
         self.file_input_label = QLabel("Input file")
         self.file_input_textbox = QLineEdit(self)
+        self.file_input_textbox.setPlaceholderText(
+            "Select, type or drag && drop the RF capture file here"
+        )
+        # let drops fall through to the window-level drop handler instead of
+        # QLineEdit pasting a file:// url as plain text
+        self.file_input_textbox.setAcceptDrops(False)
+        self.file_input_textbox.editingFinished.connect(
+            self.on_input_editing_finished
+        )
+        self._last_input_path = ""
         self.file_input_button = QPushButton("Browse", self)
         self.file_input_button.clicked.connect(self.on_file_input_button_clicked)
         self.file_input_layout = QHBoxLayout()
@@ -1554,6 +1569,53 @@ class FileIODialogUI(HifiUi):
         self.file_input_label.setMinimumWidth(max_label_width)
         self.file_output_label.setMinimumWidth(max_label_width)
 
+    @staticmethod
+    def derive_output_file(input_path: str) -> str:
+        """Build <input dir>/<input basename>_HiFi_Decoded.flac"""
+        root, _ = os.path.splitext(input_path)
+        return f"{root}{FileIODialogUI.OUTPUT_FILE_SUFFIX}"
+
+    def auto_populate_output_file(self, input_path: str):
+        if not input_path:
+            return
+        derived = FileIODialogUI.derive_output_file(input_path)
+        if self.file_output_textbox.text() != derived:
+            self.file_output_textbox.setText(derived)
+            print(f"Output file auto set to: {derived}")
+
+    def set_input_file(self, file_name: str):
+        self.file_input_textbox.setText(file_name)
+        self._last_input_path = file_name
+        self.auto_populate_output_file(file_name)
+
+    def on_input_editing_finished(self):
+        # auto fill the output when the user typed/pasted a new input path
+        text = self.file_input_textbox.text()
+        if text and text != self._last_input_path:
+            self._last_input_path = text
+            self.auto_populate_output_file(text)
+
+    def dragEnterEvent(self, event):
+        mime_data = event.mimeData()
+        if mime_data.hasUrls() and any(
+            url.isLocalFile() for url in mime_data.urls()
+        ):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if os.path.isfile(path):
+                self.set_input_file(path)
+                print(f"Input file set by drag and drop: {path}")
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
     def on_file_input_button_clicked(self):
         qdialog = QFileDialog(self)
         qdialog.setFileMode(QFileDialog.FileMode.AnyFile)
@@ -1564,7 +1626,7 @@ class FileIODialogUI(HifiUi):
         )
 
         if os.path.exists(file_name):
-            self.file_input_textbox.setText(file_name)
+            self.set_input_file(file_name)
         print("Input browse button clicked.")
 
     def on_file_output_button_clicked(self):
@@ -1588,7 +1650,11 @@ class FileIODialogUI(HifiUi):
     def setValues(self, values: MainUIParameters):
         super(FileIODialogUI, self).setValues(values)
         self.file_input_textbox.setText(values.input_file)
+        self._last_input_path = values.input_file
         self.file_output_textbox.setText(values.output_file)
+        # an input was provided without an output: derive the output name
+        if values.input_file and not values.output_file:
+            self.auto_populate_output_file(values.input_file)
 
     def on_decode_finished(self, decoded_filename: str = "input stream"):
         decoded_filename = os.path.basename(self.file_input_textbox.text())

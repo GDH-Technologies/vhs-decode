@@ -1014,10 +1014,42 @@ def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
                 print(
                     "WARN: Neither flac nor ffmpeg is installed (or in PATH). The decode will stop early at the wrapped header sample count!"
                 )
-        return sf.SoundFile(
-            pathR,
-            "r",
-        )
+        try:
+            return sf.SoundFile(
+                pathR,
+                "r",
+            )
+        except sf.LibsndfileError as e:
+            # libsndfile only implements FLAC bit depths 8/16/24/32. Native
+            # 12-bit FLAC captures (e.g. MISRC) fail to open with
+            # "unimplemented format"; ffmpeg decodes them fine and emits
+            # 16-bit left-aligned samples (value << 4), bit-identical to the
+            # same capture padded to 16 bits at record time.
+            if streaminfo is None:
+                raise
+            print(f"WARN: libsndfile could not open this FLAC file: {e}")
+            print(
+                f"WARN: FLAC stream is {streaminfo['bits_per_sample']}-bit "
+                f"({streaminfo['channels']} channel(s))."
+            )
+            if test_if_ffmpeg_is_installed():
+                print(
+                    "WARN: Decoding through ffmpeg instead (16-bit left-aligned output)."
+                )
+                return UnseekableSoundFile(
+                    FFMpegFileReader(pathR),
+                    "r",
+                    channels=streaminfo["channels"],
+                    samplerate=int(sample_rate),
+                    format="RAW",
+                    subtype="PCM_16",
+                    endian="LITTLE",
+                    frames_override=streaminfo["total_samples"] or None,
+                )
+            print(
+                "ERROR: ffmpeg is not installed (or not in PATH), cannot decode this FLAC bit depth."
+            )
+            raise
     elif "ldf" == extension:
         try:
             for ldf_reader_tool in ("ld-ldf-reader", "ld-ldf-reader-py"):
