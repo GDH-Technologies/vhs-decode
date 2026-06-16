@@ -10,6 +10,8 @@ from time import perf_counter
 from setproctitle import setproctitle
 from multiprocessing import current_process
 from copy import deepcopy
+
+from vhsdecode.rust_utils import sosfiltfilt_rust
 import string
 from random import SystemRandom
 
@@ -28,7 +30,8 @@ from scipy.signal import (
     fftconvolve,
     find_peaks,
     freqz,
-    bilinear
+    bilinear,
+    tf2sos
 )
 from scipy.interpolate import interp1d
 from soxr import ResampleStream, resample
@@ -67,13 +70,6 @@ DEMOD_DTYPE_NB = numba.types.float64
 
 BLOCKS_PER_SECOND = 2
 
-@dataclass
-class AFEParamsFront:
-    def __init__(self):
-        self.cutoff = 3e6
-        self.FDC = 1e6
-        self.transition_width = 700e3
-
 
 # assembles the current filter design on a pipe-able filter
 class FiltersClass:
@@ -94,27 +90,34 @@ class AFEBandPass:
         self.samp_rate = sample_rate
         self.filter_params = filters_params
 
-        iir_lo = firdes_lowpass(
+        b_lo, a_lo = firdes_lowpass(
             self.samp_rate,
-            self.filter_params.cutoff,
-            self.filter_params.transition_width,
-        )
-        iir_hi = firdes_highpass(
-            self.samp_rate, self.filter_params.FDC, self.filter_params.transition_width
+            self.filter_params.RFFrontend_R,
+            self.filter_params.RFtransition,
         )
 
-        # filter_plot(iir_lo[0], iir_lo[1], self.samp_rate, type="lopass", title="Front lopass")
-        self.filter_lo = FiltersClass(iir_lo[0], iir_lo[1], dtype=np.float64)
-        self.filter_hi = FiltersClass(iir_hi[0], iir_hi[1], dtype=np.float64)
+        b_hi, a_hi = firdes_highpass(
+            self.samp_rate,
+            self.filter_params.RFFrontend_L,
+            self.filter_params.RFtransition,
+        )
+
+        self.sos = np.vstack(
+            [
+                tf2sos(b_hi, a_hi),
+                tf2sos(b_lo, a_lo),
+            ]
+        )
 
     def work(self, data):
-        return self.filter_lo.lfilt(self.filter_hi.filtfilt(data))
+        return sosfiltfilt_rust(self.sos, data)
 
 
 @dataclass
 class AFEParamsVHS:
     def __init__(self):
         self.VCODeviation = 150e3
+        self.RFtransition = 350e3
 
 
 @dataclass
@@ -123,6 +126,9 @@ class AFEParams8mm:
         self.VCODeviation = 100e3
         self.LCarrierRef = 1.5e6
         self.RCarrierRef = 1.7e6
+        self.RFFrontend_L = self.LCarrierRef - self.VCODeviation
+        self.RFFrontend_R = self.RCarrierRef + self.VCODeviation
+        self.RFtransition = 350e3
 
 
 @dataclass
@@ -131,6 +137,8 @@ class AFEParamsPALVHS(AFEParamsVHS):
         super().__init__()
         self.LCarrierRef = 1.4e6
         self.RCarrierRef = 1.8e6
+        self.RFFrontend_L = self.LCarrierRef - self.VCODeviation
+        self.RFFrontend_R = self.RCarrierRef + self.VCODeviation
         self.Hfreq = 15.625e3
 
 
@@ -140,6 +148,8 @@ class AFEParamsNTSCVHS(AFEParamsVHS):
         super().__init__()
         self.LCarrierRef = 1.3e6
         self.RCarrierRef = 1.7e6
+        self.RFFrontend_L = self.LCarrierRef - self.VCODeviation
+        self.RFFrontend_R = self.RCarrierRef + self.VCODeviation
         self.Hfreq = 15.750e3
 
 
@@ -161,44 +171,67 @@ class AFEFilterable:
     def __init__(self, filters_params, sample_rate, channel=0):
         self.samp_rate = sample_rate
         self.filter_params = filters_params
-        d = abs(self.filter_params.LCarrierRef - self.filter_params.RCarrierRef)
-        QL = self.filter_params.LCarrierRef / (4 * self.filter_params.VCODeviation)
-        QR = self.filter_params.RCarrierRef / (4 * self.filter_params.VCODeviation)
+
+        d = abs(
+            self.filter_params.LCarrierRef
+            - self.filter_params.RCarrierRef
+        )
+
+        QL = self.filter_params.LCarrierRef / (
+            4 * self.filter_params.VCODeviation
+        )
+        QR = self.filter_params.RCarrierRef / (
+            4 * self.filter_params.VCODeviation
+        )
+
         if channel == 0:
-            iir_front_peak = iirpeak(
-                self.filter_params.LCarrierRef, QL, fs=self.samp_rate
-            )
-            iir_notch_other = iirnotch(
-                self.filter_params.RCarrierRef, QR, fs=self.samp_rate
-            )
-            iir_notch_image = iirnotch(
-                self.filter_params.LCarrierRef - d, QR, fs=self.samp_rate
-            )
-        else:
-            iir_front_peak = iirpeak(
-                self.filter_params.RCarrierRef, QR, fs=self.samp_rate
-            )
-            iir_notch_other = iirnotch(
-                self.filter_params.LCarrierRef, QL, fs=self.samp_rate
-            )
-            iir_notch_image = iirnotch(
-                self.filter_params.RCarrierRef - d, QL, fs=self.samp_rate
+            b_peak, a_peak = iirpeak(
+                self.filter_params.LCarrierRef,
+                QL,
+                fs=self.samp_rate,
             )
 
-        self.filter_reject_other = FiltersClass(
-            iir_notch_other[0], iir_notch_other[1], dtype=DEMOD_DTYPE_NP
-        )
-        self.filter_band = FiltersClass(
-            iir_front_peak[0], iir_front_peak[1], dtype=DEMOD_DTYPE_NP
-        )
-        self.filter_reject_image = FiltersClass(
-            iir_notch_image[0], iir_notch_image[1], dtype=DEMOD_DTYPE_NP
+            b_notch_other, a_notch_other = iirnotch(
+                self.filter_params.RCarrierRef,
+                QR,
+                fs=self.samp_rate,
+            )
+
+            b_notch_image, a_notch_image = iirnotch(
+                self.filter_params.LCarrierRef - d,
+                QR,
+                fs=self.samp_rate,
+            )
+        else:
+            b_peak, a_peak = iirpeak(
+                self.filter_params.RCarrierRef,
+                QR,
+                fs=self.samp_rate,
+            )
+
+            b_notch_other, a_notch_other = iirnotch(
+                self.filter_params.LCarrierRef,
+                QL,
+                fs=self.samp_rate,
+            )
+
+            b_notch_image, a_notch_image = iirnotch(
+                self.filter_params.RCarrierRef - d,
+                QL,
+                fs=self.samp_rate,
+            )
+
+        self.sos = np.array(
+            [
+                np.r_[b_peak, a_peak],
+                np.r_[b_notch_other, a_notch_other],
+                np.r_[b_notch_image, a_notch_image],
+            ],
+            dtype=DEMOD_DTYPE_NP,
         )
 
     def work(self, data):
-        return self.filter_band.filtfilt(
-            self.filter_reject_other.filtfilt(self.filter_reject_image.filtfilt(data))
-        )
+        return sosfiltfilt_rust(self.sos, data)
 
 QUADRATURE_LP_ORDER = 5
 
@@ -289,7 +322,7 @@ class FMdemod:
                 numba.types.int32
             ),
             (
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
+                numba.types.Array(numba.types.float64, 1, "C"),
                 NumbaAudioArray,
                 numba.types.float32,
                 numba.types.float32,
@@ -297,7 +330,7 @@ class FMdemod:
                 numba.types.int32
             ),
             (
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "A"),
+                numba.types.Array(numba.types.float32, 1, "A"),
                 NumbaAudioArray,
                 numba.types.float32,
                 numba.types.float32,
@@ -356,7 +389,7 @@ class FMdemod:
     @njit(
         [
             (
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
+                numba.types.Array(numba.types.float32, 1, "C"),
                 NumbaAudioArray,
                 numba.types.float32,
                 numba.types.float32,
@@ -369,7 +402,7 @@ class FMdemod:
                 numba.types.int32,
             ),
             (
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "A"),
+                numba.types.Array(numba.types.float32, 1, "A"),
                 NumbaAudioArray,
                 numba.types.float32,
                 numba.types.float32,
@@ -939,7 +972,7 @@ class Expander:
             numba.types.boolean
         )],
         cache=True,
-        fastmath=True,
+        fastmath=False,
         nogil=True
     )
     def expand(
@@ -1103,7 +1136,6 @@ class HiFiDecode:
         self.audio_rate: int = 192000
         self.audio_final_rate: int = int(options["audio_rate"])
 
-        self.rfBandPassParams = AFEParamsFront()
         (
             self.ifresample_numerator,
             self.ifresample_denominator,
@@ -1137,13 +1169,6 @@ class HiFiDecode:
         self.set_block_sizes()
         self._set_block_overlap()
 
-        self.bandpassRF = AFEBandPass(self.rfBandPassParams, self.input_rate)
-        a_iirb, a_iira = firdes_lowpass(
-            self.if_rate, self.audio_rate * 3 / 4, self.audio_rate / 3, order_limit=10
-        )
-        self.preAudioResampleL = FiltersClass(a_iirb, a_iira, dtype=np.float64)
-        self.preAudioResampleR = FiltersClass(a_iirb, a_iira, dtype=np.float64)
-
         self.standard, self.field_rate = HiFiDecode.get_standard(
             options["format"],
             options["standard"],
@@ -1152,6 +1177,13 @@ class HiFiDecode:
             options["afe_right_carrier"],
         )
         self.standard_original = deepcopy(self.standard)
+
+        self.bandpassRF = AFEBandPass(self.standard, self.input_rate)
+        a_iirb, a_iira = firdes_lowpass(
+            self.if_rate, self.audio_rate * 3 / 4, self.audio_rate / 3, order_limit=10
+        )
+        self.preAudioResampleL = FiltersClass(a_iirb, a_iira, dtype=np.float64)
+        self.preAudioResampleR = FiltersClass(a_iirb, a_iira, dtype=np.float64)
 
         self.headswitch_interpolation_enabled = self.options[
             "head_switching_interpolation"
@@ -1214,6 +1246,7 @@ class HiFiDecode:
 
         if not bias_guess:
             # defer until carriers can be determined
+            self.bandpassRF = AFEBandPass(self.standard, self.input_rate)
             self.afeL, self.afeR = self._get_afe()
 
             self.fmL, self.fmR = self._get_fm_demod(
