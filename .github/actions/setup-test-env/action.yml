@@ -29,4 +29,4 @@ runs:
       shell: bash
       run: |
         cd /tmp
-        python -c "import vhsdecode.sync; import vhsdecode.hilbert; print('Cython OK')"
+        python -c "import vhsdecode.linear_filter; import vhsdecode.sync; print('Cython OK')"
