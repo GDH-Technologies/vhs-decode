@@ -8,18 +8,17 @@ import os
 import subprocess
 import sys
 import traceback
-import signal
 
 import threading
 from queue import Queue
+from math import tau
 
-from numba import jit, njit
+from numba import njit
 import numba
 
 # standard numeric/scientific libraries
 import numpy as np
 import scipy.signal as sps
-from scipy.special import i0
 
 def _ensure_ffmpeg_on_path():
     try:
@@ -48,7 +47,7 @@ def _ensure_ffmpeg_on_path():
 # If profiling is not enabled, make it a pass-through wrapper
 try:
     profile
-except:
+except NameError:
     def profile(fn):
         return fn
 
@@ -91,55 +90,55 @@ def scale(buf, begin, end, tgtlen, mult=1):
 # Kaiser Beta parameter controls trade-off between sharpness and ringing
 # Small Beta = more sharpness / more ringing (narrow main lobe (more sharp), less side lobe cutoff (more ringing))
 # Large Beta = less sharpness / less ringing (wide main lobe (less sharp), more side lobe cutoff (less ringing))
-kaiser_beta = 5
-sinc_tap_count = 16 # must be multiple of 2
+# kaiser_beta = 5
+sinc_tap_count = 16  # must be multiple of 2
 sinc_phase_count = 2**16
 
-@njit
-def sinc(x):
-    if x == 0.0:
-        return 1.0
-    x_pi = np.pi * x
-    return math.sin(x_pi) / x_pi
+# @njit
+# def sinc(x):
+#     if x == 0.0:
+#         return 1.0
+#     x_pi = np.pi * x
+#     return math.sin(x_pi) / x_pi
 
 
-def kaiser_window(x, a, beta, i0_beta):
-    r = x / a
-    if r < -1.0 or r > 1.0:
-        return 0.0
-
-    t = math.sqrt(1.0 - r * r)
-    return i0(beta * t) / i0_beta
+# def kaiser_window(x, a, beta, i0_beta):
+#     r = x / a
+#     if r < -1.0 or r > 1.0:
+#         return 0.0
+#
+#     t = math.sqrt(1.0 - r * r)
+#     return i0(beta * t) / i0_beta
 
 
 # https://ccrma.stanford.edu/~jos/sasp/Kaiser_Windows_Transforms.html
-def build_kaiser_lut(beta, taps, phases):
-    a = taps // 2
-
-    offsets = np.arange(a - 1, -a - 1, -1)
-    offsets_len = len(offsets)
-
-    table = np.zeros((phases + 1, taps), dtype=np.float32)
-    weights = np.empty(offsets_len, dtype=np.float32)
-    i0_beta = i0(beta)
-
-    for i in range(phases):
-        phase = i / phases
-
-        s = 0.0
-        for j in range(offsets_len):
-            x = offsets[j] + phase
-            weight = sinc(x) * kaiser_window(x, a, beta, i0_beta)
-
-            weights[j] = weight
-            s += weight
-
-        table[i, :] = weights / s
-
-    # copy the last phase to avoid bounds checking later on when we do linear interpolation
-    table[phases] = table[phases - 1]
-
-    return table
+# def build_kaiser_lut(beta, taps, phases):
+#     a = taps // 2
+#
+#     offsets = np.arange(a - 1, -a - 1, -1)
+#     offsets_len = len(offsets)
+#
+#     table = np.zeros((phases + 1, taps), dtype=np.float32)
+#     weights = np.empty(offsets_len, dtype=np.float32)
+#     i0_beta = i0(beta)
+#
+#     for i in range(phases):
+#         phase = i / phases
+#
+#         s = 0.0
+#         for j in range(offsets_len):
+#             x = offsets[j] + phase
+#             weight = sinc(x) * kaiser_window(x, a, beta, i0_beta)
+#
+#             weights[j] = weight
+#             s += weight
+#
+#         table[i, :] = weights / s
+#
+#     # copy the last phase to avoid bounds checking later on when we do linear interpolation
+#     table[phases] = table[phases - 1]
+#
+#     return table
 
 
 @njit(nogil=True, fastmath=True)
@@ -520,137 +519,230 @@ class LoadFFmpeg:
 
 
 class LoadLDF:
-    """Load samples from an .ldf file, using ld-ldf-reader-py which itself uses ffmpeg."""
+    """Load samples from an .ldf file using PyAV (FFmpeg) for in-process FLAC decode.
 
-    def __init__(self, filename, input_args=[], output_args=[]):
-        self.input_args = input_args
-        self.output_args = output_args
+    Uses a background thread to decode FLAC frames and fill a buffer.
+    Eliminates the subprocess and pipe overhead of the previous design.
+    """
+
+    def __init__(self, filename):
+        try:
+            import av  # noqa: F401
+        except ImportError:
+            raise ImportError("PyAV library required for .ldf/.flac files. Install with: pip install av")
 
         self.filename = filename
 
-        # The number of the next byte ld-ldf-reader-py will return
-
         self.position = 0
-        # Keep a buffer of recently-read data, to allow seeking backwards by
-        # small amounts. The last byte returned by ffmpeg is at the end of
-        # this buffer.
         self.rewind_size = 2 * 1024 * 1024
         self.rewind_buf = b""
 
-        self.ldfreader = None
+        # Forward seeks farther than this (in bytes) restart the decoder with a
+        # container seek instead of reading and discarding samples one by one.
+        self.seek_threshold = 40 * 1024 * 1024
 
-        # ld-ldf-reader-py subprocess
-        self.ldfreader = self._open(0)
+        # Soft cap on the decode buffer, to bound memory use.  The reader thread
+        # pauses once the buffer grows past this -- unless a single read needs
+        # more than this many bytes (see _read_data), to avoid a deadlock.
+        self._max_buffer = 64 * 1024 * 1024
 
-    def __del__(self):
-        self._close()
+        self._container = None
+        self._stream = None
+        self._resampler = None
+        self._decode_iter = None
+        self._buffer = bytearray()
+        self._want = 0
+        self._cv = threading.Condition()
+        self._eof = False
+        self._reader_thread = None
+        self._stop_event = None
+
+    def _start_decoder(self, sample):
+        """Start/reset the decoder so the next sample returned is `sample`."""
+        import av
+
+        self._stop_decoder()
+
+        self._container = av.open(self.filename)
+        self._stream = self._container.streams.audio[0]
+        self._resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono")
+
+        if sample > 0:
+            # Seek a little before the target; the reader thread discards the
+            # lead-in so the buffer starts exactly at `sample`.
+            # The container sample_rate is stored at 40k (an audio-friendly
+            # rate), while the actual RF data is 40 MHz -- 1000x difference.
+            # Convert RF sample offset to stream time_base units:
+            #   1 RF sample = 1/40_000_000 sec
+            #   1 stream unit = 1/40_000 sec
+            #   -> 1 RF sample = 1/1000 stream units
+            seek_offset = sample // 1000
+            seek_offset = max(0, seek_offset - self._stream.sample_rate)
+            self._container.seek(seek_offset, any_frame=True)
+
+        self._decode_iter = self._container.decode(audio=0)
+
+        # Capture the buffer and stop flag per run so a reader thread left over
+        # from a previous decoder can never touch the current buffer.
+        buf = bytearray()
+        stop_event = threading.Event()
+        with self._cv:
+            self._buffer = buf
+            self._want = 0
+            self._eof = False
+        self._stop_event = stop_event
+
+        self.position = sample * 2
+        self.rewind_buf = b""
+
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(stop_event, buf, sample),
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def _reader_loop(self, stop_event, buf, target_sample):
+        """Background thread: decode FLAC frames into `buf`.
+
+        Discards any samples decoded before `target_sample` (the lead-in that
+        results from seeking to a frame before the requested position)."""
+        try:
+            skip_samples = None
+            for frame in self._decode_iter:
+                if stop_event.is_set():
+                    return
+                if frame is None:
+                    continue
+
+                if skip_samples is None:
+                    # The first decoded frame tells us where decoding actually
+                    # resumed after the seek, via its presentation timestamp.
+                    # Scale by 1000: container stores 40k rate, RF data is 40 MHz.
+                    if frame.pts is not None:
+                        base_sample = round(
+                            float(frame.pts * self._stream.time_base)
+                            * self._stream.sample_rate * 1000
+                        )
+                    else:
+                        base_sample = target_sample
+                    skip_samples = max(0, target_sample - base_sample)
+
+                for rf in self._resampler.resample(frame):
+                    if stop_event.is_set():
+                        return
+                    data = bytes(rf.planes[0])
+
+                    if skip_samples > 0:
+                        skip_bytes = min(skip_samples * 2, len(data))
+                        data = data[skip_bytes:]
+                        skip_samples -= skip_bytes // 2
+                        if not data:
+                            continue
+
+                    with self._cv:
+                        # Backpressure: pause while the buffer is over the cap,
+                        # but keep filling if a pending read needs even more.
+                        while (
+                            len(buf) >= self._max_buffer
+                            and len(buf) >= self._want
+                            and not stop_event.is_set()
+                        ):
+                            self._cv.wait()
+                        if stop_event.is_set():
+                            return
+                        buf.extend(data)
+                        self._cv.notify_all()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self._cv:
+                self._eof = True
+                self._cv.notify_all()
+
+    def _stop_decoder(self):
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+        if self._reader_thread is not None and self._reader_thread.is_alive():
+            with self._cv:
+                # Wake the reader if it is parked on backpressure.
+                self._cv.notify_all()
+            self._reader_thread.join(timeout=2)
+
+        if self._container is not None:
+            try:
+                self._container.close()
+            except Exception:
+                pass
+            self._container = None
+
+        self._reader_thread = None
+        self._stop_event = None
+        self._decode_iter = None
 
     def _read_data(self, count):
-        """Read data as bytes from ffmpeg, append it to the rewind buffer, and
-        return it. May return less than count bytes if EOF is reached."""
+        """Read up to `count` bytes from the decoded buffer, blocking until they
+        are available or the decoder reaches EOF (so a short read means EOF)."""
+        with self._cv:
+            self._want = count
+            self._cv.notify_all()
+            while len(self._buffer) < count and not self._eof:
+                self._cv.wait()
 
-        data = self.ldfreader.stdout.read(count)
+            available = min(count, len(self._buffer))
+            data = bytes(self._buffer[:available])
+            del self._buffer[:available]
+            self._want = 0
+            self._cv.notify_all()
+
         self.position += len(data)
 
         self.rewind_buf += data
-        self.rewind_buf = self.rewind_buf[-self.rewind_size :]
+        self.rewind_buf = self.rewind_buf[-self.rewind_size:]
 
         return data
 
     def _close(self):
-        try:
-            if self.ldfreader is not None:
-                self.ldfreader.kill()
-                self.ldfreader.wait()
-                del self.ldfreader
+        self._stop_decoder()
 
-            self.ldfreader = None
-        except Exception:
-            print("Failed to close ldf reader", file=sys.stderr)
-            traceback.print_exc()
-            pass
-
-    @staticmethod
-    def _find_ldf_reader():
-        """Find an LDF reader executable, checking the repo root as a fallback."""
-        import shutil
-
-        for command_name in ("ld-ldf-reader", "ld-ldf-reader-py"):
-            if shutil.which(command_name):
-                return command_name
-
-        # Fall back to scripts next to this package (i.e. the repo root)
-        repo_root = os.path.dirname(os.path.dirname(__file__))
-        for script_name in ("ld-ldf-reader", "ld-ldf-reader-py"):
-            repo_path = os.path.join(repo_root, script_name)
-            if os.path.isfile(repo_path):
-                return repo_path
-
-        raise FileNotFoundError(
-            "Cannot find ld-ldf-reader or ld-ldf-reader-py on PATH or in the source tree"
-        )
-
-    def _open(self, sample):
+    def __del__(self):
         self._close()
-
-        if sys.platform == "win32":
-            # On Windows, .bat wrappers cannot be launched directly by CreateProcess.
-            # Use the current Python interpreter to run ldf_reader as a module instead.
-            # sys.executable is always valid, and the subprocess inherits PYTHONHOME/
-            # PYTHONPATH from the parent process so lddecode is importable.
-            command = [
-                sys.executable, "-m", "lddecode.ldf_reader",
-                "--quiet", "--start-offset", str(sample), self.filename,
-            ]
-        else:
-            command = [self._find_ldf_reader(), "--quiet", "--start-offset", str(sample), self.filename]
-
-        ldfreader = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        self.position = sample * 2
-        self.rewind_buf = b""
-
-        return ldfreader
 
     def read(self, infile, sample, readlen):
         sample_bytes = sample * 2
         readlen_bytes = readlen * 2
 
-        if self.ldfreader is None or ((sample_bytes - self.position) > 40000000):
-            self.ldfreader = self._open(sample)
+        # (Re)start the decoder if it isn't running, or if the target is far
+        # enough ahead that seeking beats reading and discarding.
+        if self._container is None or (sample_bytes - self.position) > self.seek_threshold:
+            self._start_decoder(sample)
 
         if sample_bytes < self.position:
-            # Seeking backwards - use data from rewind_buf
+            # Seeking backwards - serve from rewind_buf if it reaches back far
+            # enough, otherwise reseek.
             start = len(self.rewind_buf) - (self.position - sample_bytes)
             end = min(start + readlen_bytes, len(self.rewind_buf))
             if start < 0:
-                # raise IOError("Seeking too far backwards with ffmpeg")
-                self.ldfreader = self._open(sample)
+                self._start_decoder(sample)
                 buf_data = b""
             else:
                 buf_data = self.rewind_buf[start:end]
                 sample_bytes += len(buf_data)
                 readlen_bytes -= len(buf_data)
-        elif (sample_bytes - self.position) > (40 * 1024 * 1024 * 2):
-            self.ldfreader = self._open(sample)
-            buf_data = b""
         else:
             buf_data = b""
 
         while sample_bytes > self.position:
-            # Seeking forwards - read and discard samples
+            # Seeking forwards within range - read and discard samples.
             count = min(sample_bytes - self.position, self.rewind_size)
             data = self._read_data(count)
             if len(data) == 0:
-                # EOF
                 return None
 
         if readlen_bytes > 0:
-            # Read some new data from ffmpeg
             read_data = self._read_data(readlen_bytes)
             if len(read_data) < readlen_bytes:
-                # Short read - end of file
                 return None
         else:
             read_data = b""
@@ -711,12 +803,8 @@ def ac3_pipe(outname: str):
 
 # Essential (or at least useful) standalone routines and lambdas
 
-pi = np.pi
-tau = np.pi * 2
-
 # https://stackoverflow.com/questions/20924085/python-conversion-between-coordinates
 polar2z = lambda r, θ: r * np.exp(1j * θ)
-deg2rad = lambda θ: θ * (np.pi / 180)
 
 
 def emphasis_iir(t1, t2, fs):
@@ -733,6 +821,7 @@ def emphasis_iir(t1, t2, fs):
 
     return rv
 
+
 # This converts a regular B, A filter to an FFT of our selected block length
 def filtfft(filt, blocklen):
     return sps.freqz(filt[0], filt[1], blocklen, whole=1)[1]
@@ -747,7 +836,7 @@ def sqsum(cmplx):
     return np.sqrt((cmplx.real ** 2) + (cmplx.imag ** 2))
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def calczc_findfirst(data, target, rising):
     if rising:
         for i in range(1, len(data)):
@@ -763,7 +852,7 @@ def calczc_findfirst(data, target, rising):
         return None
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def calczc_do(data, _start_offset, target, edge=0, count=16):
     start_offset = int(_start_offset)
     icount = int(count + 1)
@@ -821,6 +910,7 @@ def gen_bpf_supergauss(freq_low, freq_high, order, nyquist_hz, block_len):
 
     return np.concatenate([sg, np.flip(sg)])
 
+
 def supergauss(x, freq, order=1, centerfreq=0):
     return np.exp(
         -2
@@ -829,6 +919,7 @@ def supergauss(x, freq, order=1, centerfreq=0):
             2 * order,
         )
     )
+
 
 # Shamelessly based on https://github.com/scipy/scipy/blob/v1.6.0/scipy/signal/signaltools.py#L2264-2267
 # ... and intended for real FFT, but seems fine with complex as well ;)
@@ -841,6 +932,7 @@ def build_hilbert(fft_size):
     output[1 : fft_size // 2] = 2
 
     return output
+
 
 if not numba.version_info.major and numba.version_info.minor < 59:
     print("DEPRECATION WARNING: Please upgrade numba to 0.59 or later.", file=sys.stderr)
@@ -877,6 +969,7 @@ def unwrap_hilbert(hilbert, freq_hz):
 
     return out * (freq_hz / tau)
 
+
 def fft_determine_slices(center, min_bandwidth, freq_hz, bins_in):
     """ returns the # of sub-bins needed to get center+/-min_bandwidth.
         The returned lowbin is the first bin (symmetrically) needed to be saved.
@@ -912,16 +1005,16 @@ def fft_do_slice(fdomain, lowbin, nbins, blocklen):
         ]
     )
 
-'''
-overlap/save [i]fft functions for testing.  use in a jupyter notebook or similar
-like this:
-
-f = overlap_save_fft(fields[0].dspicture)
-invf = overlap_save_ifft(f, round=True).astype(np.uint16)
-sum(invf != fields[0].dspicture) # should be 0
-'''
 
 def overlap_save_fft(data, blocklen=32768, blockcut_begin=1024, blockcut_end=512):
+    '''
+    overlap/save [i]fft functions for testing.  use in a jupyter notebook or similar
+    like this:
+
+    f = overlap_save_fft(fields[0].dspicture)
+    invf = overlap_save_ifft(f, round=True).astype(np.uint16)
+    sum(invf != fields[0].dspicture) # should be 0
+    '''
     blockstride = blocklen - blockcut_begin - blockcut_end
 
     numblocks = (len(data) // blockstride) + 1
@@ -939,6 +1032,7 @@ def overlap_save_fft(data, blocklen=32768, blockcut_begin=1024, blockcut_end=512
         fft_out.append(np.fft.fft(dcut))
 
     return fft_out
+
 
 def overlap_save_ifft(ffts, blockcut_begin=1024, blockcut_end=512, round=False):
     # blocklen is inferred from fft size
@@ -1024,8 +1118,9 @@ def hz_to_output_array(input, ire0, hz_ire, outputZero, vsync_ire, out_scale):
 
     return out
 
+
 # Something like this should be a numpy function, but I can't find it.
-@jit(cache=True, nopython=True)
+@njit(cache=True)
 def findareas(array, cross):
     """ Find areas where `array` is <= `cross`
 
@@ -1105,8 +1200,9 @@ def findpulses(sync_ref, _, high):
     )
     return _to_pulses_list(pulses_starts, pulses_lengths)
 
+
 if False:
-    @njit(cache=True,nogil=True)
+    @njit(cache=True, nogil=True)
     def numba_pulse_qualitycheck(prevpulse: Pulse, pulse: Pulse, inlinelen: int):
 
         if prevpulse[0] > 0 and pulse[0] > 0:
@@ -1121,7 +1217,7 @@ if False:
 
         return inorder
 
-    @njit(cache=True,nogil=True)
+    @njit(cache=True, nogil=True)
     def numba_computeLineLen(validpulses, inlinelen):
         # determine longest run of 0's
         longrun = [-1, -1]
@@ -1175,105 +1271,59 @@ def LRUupdate(l, k):
 
     l.insert(0, k)
 
-# Lambdas used to shorten filter-building functions
-
-# Split out the frequency list given to the filter builder
-freqrange = lambda f1, f2: [
-    f1 / self.freq_hz_half,
-    f2 / self.freq_hz_half,
-]
-
-# Like freqrange, but for notch filters
-notchrange = lambda f, notchwidth, hz: [
-    (f - notchwidth) / self.freq_hz_half if hz else self.freq_half,
-    (f + notchwidth) / self.freq_hz_half if hz else self.freq_half,
-]
 
 # numba jit functions, used to numba-ify parts of more complex functions
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def nb_median(m):
     return np.median(m)
-
-# Enabling nogil here kills performance - cache issues?
-@njit(cache=True,nogil=False)
-def nb_concatenate(m):
-    tlen = sum([len(i) for i in m])
-
-    out = np.empty(tlen, dtype=m[0].dtype)
-    pos = 0
-    for i in m:
-        out[pos : pos + len(i)] = i
-        pos += len(i)
-
-    return out
 
 @njit(cache=True,nogil=True)
 def nb_round(m):
     return int(np.round(m))
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def nb_mean(m):
     return np.mean(m)
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def nb_min(m):
     return np.min(m)
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def nb_max(m):
     return np.max(m)
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def nb_abs(m):
     return np.abs(m)
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def nb_absmax(m):
     return np.max(np.abs(m))
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def nb_std(m):
     return np.std(m)
 
 
-@njit(cache=True,nogil=True)
-def nb_diff(m):
-    return np.diff(m)
-
-
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def nb_mul(x, y):
     return x * y
 
 
-@njit(cache=True,nogil=True)
-def nb_where(x):
-    return np.where(x)
-
-
-@njit(cache=True,nogil=True)
-def nb_gt(x, y):
-    return (x > y)
-
-
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def n_orgt(a, x, y):
     a |= (x > y)
 
 
-@njit(cache=True,nogil=True)
-def n_orlt(a, x, y):
-    a |= (x < y)
-
-
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def n_ornotrange(a, x, y, z):
     a |= (x < y) | (x > z)
 
@@ -1293,6 +1343,7 @@ def angular_mean_helper(x, cycle_len=1.0, zero_base=True):
     angles = [np.e ** (1j * f * np.pi * 2 / cycle_len) for f in x2]
 
     return angles
+
 
 @njit(cache=True)
 def phase_distance(x, c=0.75):
@@ -1329,7 +1380,7 @@ def dsa_rescale_and_clip(infloat):
 # removed so that they can be JIT'd
 
 
-@njit(cache=True,nogil=True)
+@njit(cache=True, nogil=True)
 def clb_findbursts(isrising, zcs, burstarea, i, endburstarea, threshold, bstart, s_rem, zcburstdiv, phase_adjust):
     zc_count = 0
     rising_count = 0
@@ -1360,30 +1411,12 @@ def clb_findbursts(isrising, zcs, burstarea, i, endburstarea, threshold, bstart,
 
     return zc_count, phase_adjust, rising_count
 
+
 @njit(cache=True)
 def distance_from_round(x):
     # Yes, this was a hotspot.
     return np.round(x) - x
 
-
-def init_opencl(cl, name = None):
-    # Create some context on the first available GPU
-    if 'PYOPENCL_CTX' in os.environ:
-        ctx = cl.create_some_context()
-    else:
-        ctx = None
-        # Find the first OpenCL GPU available and use it, unless
-        for p in cl.get_platforms():
-            for d in p.get_devices():
-                if d.type & cl.device_type.GPU == 1:
-                    continue
-                print("Selected device: ", d.name)
-                ctx = cl.Context(devices=(d,))
-                break
-            if ctx is not None:
-                break
-    #queue = cl.CommandQueue(ctx)
-    return ctx
 
 class FieldInfo:
     def __init__(self, field_history_size=3):
@@ -1395,7 +1428,7 @@ class FieldInfo:
 
     def __len__(self):
         return self._len
-    
+
     # called like a normal python list, where -1 is the last element, -2 the one before that, etc.
     # using [0] is not allowed since this only stores the end of the list
     def __getitem__(self, key):
@@ -1407,11 +1440,12 @@ class FieldInfo:
         unsent = self._fieldinfo_unsent
         self._fieldinfo_unsent = []
         return unsent
-    
+
     def append(self, value):
         self._fieldinfo[self._len % self._field_history_size] = value
         self._fieldinfo_unsent.append(value)
         self._len += 1
+
 
 class JSONDumper:
     def __init__(self, ldd, outname):
@@ -1502,22 +1536,10 @@ class JSONDumper:
 
             f.write('\n')
             f.close()
-            tmp_path = outname + ".tbc.json.tmp"
-            final_path = outname + ".tbc.json"
-            for attempt in range(20):
-                try:
-                    os.replace(tmp_path, final_path)
-                    break
-                except PermissionError:
-                    if attempt == 19:
-                        raise
-                    time.sleep(0.1)
-                except OSError as e:
-                    if e.errno not in (errno.EACCES, errno.EPERM) or attempt == 19:
-                        raise
-                    time.sleep(0.1)
+            os.replace(outname + ".tbc.json.tmp", outname + ".tbc.json")
 
             ready.clear()
+
 
 class StridedCollector:
     # This keeps a numpy buffer and outputs an fft block and keeps the overlap
