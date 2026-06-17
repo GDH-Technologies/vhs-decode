@@ -28,13 +28,10 @@ class TestRustUnwrap:
 
 class TestRustDiff:
     def test_matches_cython(self, hilbert_data):
-        from vhsdecode.hilbert import diff_forward
         from vhsd_rust import diff_forward_in_place
 
         data = np.angle(hilbert_data)
         output_ediff = np.ediff1d(data, to_begin=0)
-        output_cython = diff_forward(data)
         output_rust = np.copy(data)
         diff_forward_in_place(output_rust)
-        assert (output_ediff == output_cython).all()
-        assert (output_rust == output_cython).all()
+        assert (output_ediff == output_rust).all()
