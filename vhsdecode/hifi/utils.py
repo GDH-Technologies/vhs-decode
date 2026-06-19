@@ -10,7 +10,6 @@ from random import SystemRandom
 
 from cProfile import Profile
 import ctypes
-import platform
 import mmap
 import os
 from functools import lru_cache
@@ -158,7 +157,8 @@ def check_flac_header_total_samples(streaminfo, file_size):
 
 
 class NUMA:
-    _lib = None
+    _libnuma = None
+    _libc = None
 
     class Bitmask(ctypes.Structure):
         _fields_ = [
@@ -167,36 +167,52 @@ class NUMA:
         ]
 
     @classmethod
-    def _load_lib(cls):
-        if cls._lib is not None:
-            return cls._lib
+    def _load_libnuma(cls):
+        if cls._libnuma is not None:
+            return cls._libnuma
 
         try:
-            lib = ctypes.CDLL("libnuma.so.1")
+            libnuma = ctypes.CDLL("libnuma.so.1")
 
-            lib.numa_available.restype = ctypes.c_int
-            lib.numa_max_node.restype = ctypes.c_int
-            lib.numa_node_to_cpus.argtypes = [ctypes.c_int, ctypes.c_void_p]
-            lib.numa_node_to_cpus.restype = ctypes.c_int
-            lib.numa_run_on_node.argtypes = [ctypes.c_int]
-            lib.numa_set_preferred.argtypes = [ctypes.c_int]
-            lib.numa_tonode_memory.argtypes = [
+            libnuma.numa_available.restype = ctypes.c_int
+            libnuma.numa_max_node.restype = ctypes.c_int
+            libnuma.numa_node_to_cpus.argtypes = [ctypes.c_int, ctypes.c_void_p]
+            libnuma.numa_node_to_cpus.restype = ctypes.c_int
+            libnuma.numa_run_on_node.argtypes = [ctypes.c_int]
+            libnuma.numa_set_preferred.argtypes = [ctypes.c_int]
+            libnuma.numa_tonode_memory.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_size_t,
                 ctypes.c_int,
             ]
 
-            cls._lib = lib
-            return lib
+            cls._libnuma = libnuma
+            return libnuma
 
         except Exception:
-            cls._lib = None
+            cls._libnuma = None
             return None
 
     @classmethod
+    def _load_libc(cls):
+        if cls._libc is not None:
+            return cls._libc
+
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+            cls._libc = libc
+            return libc
+
+        except Exception:
+            cls._libc = None
+            return None      
+
+    @classmethod
     def _available(cls):
-        lib = cls._load_lib()
-        return bool(lib and lib.numa_available() >= 0)
+        libnuma = cls._load_libnuma()
+        libc = cls._load_libc()
+        return bool(libc and libnuma and libnuma.numa_available() >= 0)
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -205,7 +221,7 @@ class NUMA:
             return cycle([0])
 
         try:
-            max_node = cls._lib.numa_max_node()
+            max_node = cls._libnuma.numa_max_node()
             nodes = [n for n in range(max_node + 1) if cls._cpus_for_node(n)]
             return cycle(nodes or [0])
         except Exception:
@@ -217,7 +233,7 @@ class NUMA:
         if not cls._available():
             return None
 
-        lib = cls._lib
+        lib = cls._libnuma
         MAX_CPUS = 1024
 
         words = MAX_CPUS // (8 * ctypes.sizeof(ctypes.c_ulong))
@@ -256,36 +272,53 @@ class NUMA:
 
         try:
             os.sched_setaffinity(0, cpus)
-            cls._lib.numa_run_on_node(node)
-            cls._lib.numa_set_preferred(node)
+            cls._libnuma.numa_run_on_node(node)
+            cls._libnuma.numa_set_preferred(node)
             return True
         except Exception:
             return False
 
     @classmethod
-    def bind_shared_memory(cls, shm, node: int) -> bool:
-        if platform.system() != "Linux" or not cls._available():
-            return False
+    def get_shared_memory(
+        cls,
+        name: str,
+        size: int,
+        numa_node: int | None = None,
+    ):
+        shm = SharedMemory(name=name, size=size, create=True)
 
-        try:
-            lib = cls._lib
-            buf = memoryview(shm.buf)
-            addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        if cls._available() and numa_node is not None:
+            try:
+                MPOL_BIND = 2
+                MPOL_MF_STRICT = 1
+                MPOL_MF_MOVE = 2
+                SYS_mbind = 237
 
-            lib.numa_tonode_memory(
-                ctypes.c_void_p(addr),
-                ctypes.c_size_t(len(buf)),
-                ctypes.c_int(node),
-            )
+                buf = shm.buf
 
-            page = mmap.PAGESIZE
-            for i in range(0, len(buf), page):
-                buf[i] = 0
+                addr = ctypes.addressof(
+                    ctypes.c_char.from_buffer(buf)
+                )
 
-            return True
+                nodemask = ctypes.c_ulong(1 << numa_node)
 
-        except Exception:
-            return False
+                cls._libc.syscall(
+                    SYS_mbind,
+                    ctypes.c_void_p(addr),
+                    ctypes.c_ulong(len(buf)),
+                    MPOL_BIND,
+                    ctypes.byref(nodemask),
+                    ctypes.sizeof(nodemask) * 8,
+                    MPOL_MF_MOVE | MPOL_MF_STRICT,
+                )
+
+                for offset in range(0, len(buf), mmap.PAGESIZE):
+                    buf[offset] = 0
+
+            except Exception:
+                pass
+
+        return shm
 
 @dataclass
 class DecoderState:
@@ -412,15 +445,10 @@ class PostProcessorSharedMemory:
             for _ in range(8)
         )
 
-        shm = SharedMemory(size=byte_size, name=name, create=True)
-
-        if numa_node is not None:
-            NUMA.bind_shared_memory(shm, numa_node)
-
         # this instance must be saved in a variable that persists on both processes
         # Windows will remove the shared memory if it garbage collects the handle in any of the processes it is open in
         # https://stackoverflow.com/a/63717188
-        return shm
+        return NUMA.get_shared_memory(name, byte_size, numa_node)
 
     def get_pre_left(self) -> np.array:
         return np.ndarray(
@@ -551,15 +579,11 @@ class DecoderSharedMemory:
             for _ in range(8)
         )
 
-        shm = SharedMemory(size=byte_size, name=name, create=True)
-
-        if numa_node is not None:
-            NUMA.bind_shared_memory(shm, numa_node)
 
         # this instance must be saved in a variable that persists on both processes
         # Windows will remove the shared memory if it garbage collects the handle in any of the processes it is open in
         # https://stackoverflow.com/a/63717188
-        return shm
+        return NUMA.get_shared_memory(name, byte_size, numa_node)
 
     ## Decoder methods
 
