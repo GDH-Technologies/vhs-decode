@@ -35,7 +35,7 @@ from vhsdecode.hifi.utils import (
     PostProcessorSharedMemory,
     NumbaAudioArray,
     PeakGain,
-    BLOCK_DTYPE,
+    DEFAULT_BLOCK_DTYPE,
     REAL_DTYPE,
 )
 
@@ -703,169 +703,148 @@ class FFMpegFileReader(BufferedInputStream):
         self._pos: int = 0
 
 
-class AsyncSoundFile(sf.SoundFile):
-    def __init__(self, file, mode, **kwargs):
-        if isinstance(file, str):
-            self._file_handle = open(file, "rb")
+def get_raw_input_format(pathR, format=None):
+    if format is None:
+        format = pathR.lower().split(".")[-1]
+    
+    # format, is_raw_format
+    if format == "u8" or format == "r8":
+        return np.uint8, True
+    elif format == "s8":
+        return np.int8, True
+    elif format == "u16" or format == "r16":
+        return np.uint16, True
+    elif format == "raw" or format == "s16" or pathR == "-":
+        return np.int16, True
+    else:
+        return DEFAULT_BLOCK_DTYPE, False
+    
+
+class AsyncReader:
+    def __init__(self, file, dtype, channels=1):
+        self._file = file
+        self._dtype = dtype # input dtype also sets the output dtype
+        self._channels = channels
+
+    def __enter__(self):
+        if isinstance(self._file, str):
+            self._file_handle = open(self._file, "rb")
         else:
-            self._file_handle = file
+            self._file_handle = self._file
+        
+        self._frames = os.fstat(self._file_handle.fileno()).st_size / np.dtype(self.dtype).itemsize / self._channels
 
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="hifi_decode_reader"
         )
 
-        self._overlap = np.array([], dtype=np.int16)
+        return self
 
-        super().__init__(
-            self._file_handle,
-            mode,
-            **kwargs,
-        )
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if isinstance(self._file, str):
+                self._file_handle.close()
+        finally:
+            self._executor.shutdown(wait=True)
+        return False
 
-    def seek(self, offset, whence=io.SEEK_SET):
-        return self._file_handle.seek(offset, whence)
+    @property
+    def frames(self):
+        return self._frames
 
-    async def buffer_read_into(self, out, dtype="int16"):
+    @property
+    def dtype(self):
+        return self._dtype
+
+    async def buffer_read_into(self, out):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor,
             self._buffer_read_into,
             self._file_handle,
-            out,
-            dtype,
+            out
         )
 
-    def buffer_read_into_sync(self, out, dtype="int16"):
-        return self._buffer_read_into(self._file_handle, out, dtype)
+    def buffer_read_into_sync(self, out):
+        return self._buffer_read_into(self._file_handle, out)
+
+    @staticmethod
+    def _buffer_read_into(file_handle, out):
+        bytes_read = file_handle.readinto(out)
+        frames_read = bytes_read // out.itemsize
+
+        return frames_read
+
+
+class AsyncSoundFileReader(sf.SoundFile):
+    def __init__(self, file, **kwargs):
+        super().__init__(
+            file,
+            "r",
+            **kwargs,
+        )
+
+    def __enter__(self):
+        super().__enter__()
+
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="hifi_decode_reader"
+        )
+
+        return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         try:
-            super().close()
+            super().__exit__()
         finally:
             self._executor.shutdown(wait=True)
         return False
+    
+    @property
+    def dtype(self):
+        return DEFAULT_BLOCK_DTYPE
 
-    @staticmethod
-    def _buffer_read_into(input, out, dtype):
-        item_size = np.dtype(dtype).itemsize
-        bytes_read = input.readinto(out)
+    async def buffer_read_into(self, out):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._buffer_read_into,
+            out,
+        )
 
-        assert bytes_read % item_size == 0, "data is misaligned"
-        return bytes_read // item_size
+    def buffer_read_into_sync(self, out):
+        return self._buffer_read_into(out)
 
-
-class UnSigned16BitFileReader(io.RawIOBase):
-    def __init__(self, file_path):
-        self.file_path = file_path
-        self.file = open(file_path, "rb")
-
-    def readinto(self, buffer):
-        buffer_uint16 = np.frombuffer(buffer, dtype=np.uint16)
-        bytes_read = self.file.readinto(buffer_uint16)
-        UnSigned16BitFileReader.uint16_to_int16(buffer_uint16, buffer)
-        if not bytes_read:
-            return 0
-
-        return bytes_read
-
-    @staticmethod
-    @guvectorize(
-        [
-            (
-                numba.types.Array(numba.types.uint16, 1, "C"),
-                numba.types.Array(numba.types.int16, 1, "C"),
-            )
-        ],
-        "(n)->(n)",
-        cache=True,
-        fastmath=True,
-        nopython=True,
-    )
-    def uint16_to_int16(uint16_in, int16_out):
-        for i in range(len(uint16_in)):
-            int16_out[i] = uint16_in[i] - 2**15
-
-    def readable(self):
-        return True
-
-    def close(self):
-        self.file.close()
+    def _buffer_read_into(self, out):
+        return super().buffer_read_into(out, dtype="int16")
 
 
-# This part is what opens the file
-# The samplerate here could be anything
-def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
-    path = pathR.lower()
+def as_soundfile(pathR):
     extension = pathR.lower().split(".")[-1]
-    if "raw" == extension or "s16" == extension:
-        return AsyncSoundFile(
+    input_format, is_raw = get_raw_input_format(pathR)
+
+    if is_raw: # u8, s8, u16, s16, stdin
+        return AsyncReader(
             pathR,
-            "r",
-            channels=1,
-            samplerate=int(sample_rate),
-            format="RAW",
-            subtype="PCM_16",
-            endian="LITTLE",
-        )
-    elif "u8" == extension or "r8" == extension:
-        return AsyncSoundFile(
-            pathR,
-            "r",
-            channels=1,
-            samplerate=int(sample_rate),
-            format="RAW",
-            subtype="PCM_U8",
-            endian="LITTLE",
-        )
-    elif "s8" == extension:
-        return AsyncSoundFile(
-            pathR,
-            "r",
-            channels=1,
-            samplerate=int(sample_rate),
-            format="RAW",
-            subtype="PCM_S8",
-            endian="LITTLE",
-        )
-    elif "u16" == extension or "r16" == extension:
-        return AsyncSoundFile(
-            UnSigned16BitFileReader(pathR),
-            "r",
-            channels=1,
-            samplerate=int(sample_rate),
-            format="RAW",
-            subtype="PCM_16",
-            endian="LITTLE",
+            input_format
         )
     elif "flac" == extension:
         if test_if_ffmpeg_is_installed():
-            return AsyncSoundFile(
+            return AsyncReader(
                 FFMpegFileReader(pathR),
-                "r",
-                channels=1,
-                samplerate=int(sample_rate),
-                format="RAW",
-                subtype="PCM_16",
-                endian="LITTLE"
+                DEFAULT_BLOCK_DTYPE
             )
         else:
-            return AsyncSoundFile(
-                pathR,
-                "r",
-            )
+            return AsyncSoundFileReader(pathR)
     elif "ldf" == extension:
         try:
             for ldf_reader_tool in ("ld-ldf-reader", "ld-ldf-reader-py"):
                 if test_ld_tools(ldf_reader_tool):
-                    return AsyncSoundFile(
+                    return AsyncReader(
                         LDToolFileReader(ldf_reader_tool, pathR),
-                        "r",
-                        channels=1,
-                        samplerate=int(sample_rate),
-                        format="RAW",
-                        subtype="PCM_16",
-                        endian="LITTLE",
+                        DEFAULT_BLOCK_DTYPE
                     )
             print(
                 "WARN: ld-ldf-reader/ld-ldf-reader-py not installed. LDF file format may not decode correctly"
@@ -877,32 +856,19 @@ def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
         
         try:    
             if test_if_flac_is_installed():
-                return AsyncSoundFile(
+                return AsyncReader(
                     FlacFileReader(pathR),
-                    "r",
-                    channels=1,
-                    samplerate=int(sample_rate),
-                    format="RAW",
-                    subtype="PCM_16",
-                    endian="LITTLE",
+                    DEFAULT_BLOCK_DTYPE
                 )
             if test_if_ffmpeg_is_installed():
-                return AsyncSoundFile(
+                return AsyncReader(
                     FFMpegFileReader(pathR),
-                    "r",
-                    channels=1,
-                    samplerate=int(sample_rate),
-                    format="RAW",
-                    subtype="PCM_16",
-                    endian="LITTLE",
+                    DEFAULT_BLOCK_DTYPE
                 )
         except Exception as e:
             pass
 
-        return AsyncSoundFile(
-            pathR,
-            "r",
-        )
+        return AsyncSoundFileReader(pathR)
     elif "lds" == extension:
         try:
             for lds_reader_tool, input_arg in (
@@ -910,14 +876,9 @@ def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
                 ("ld-lds-converter", "-i"),
             ):
                 if test_ld_tools(lds_reader_tool):
-                    return AsyncSoundFile(
+                    return AsyncReader(
                         LDToolFileReader(lds_reader_tool, pathR, input_arg),
-                        "r",
-                        channels=1,
-                        samplerate=int(sample_rate),
-                        format="RAW",
-                        subtype="PCM_16",
-                        endian="LITTLE",
+                        DEFAULT_BLOCK_DTYPE
                     )
             print(
                 "ERROR: Unable to decode LDS without ld-lds-reader or ld-lds-converter. Please install one of them and try again."
@@ -926,38 +887,19 @@ def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
             print(
                 "ERROR: Unexpected error opening LDS reader tool", e
             )
-    elif "-" == path:
-        try:
-            return AsyncSoundFile(
-                BufferedInputStream(sys.stdin.buffer),
-                "r",
-                channels=1,
-                samplerate=int(sample_rate),
-                format="RAW",
-                subtype="PCM_16",
-                endian="LITTLE",
-            )
-        except Exception as e:
-            print("Failed to open standard in, unable to decode")
-            raise e
     else:
         print("WARN: Unknown file format.")
         print("WARN: Attempting to decode with ffmpeg")
         try:
             if test_if_ffmpeg_is_installed():
-                return AsyncSoundFile(
+                return AsyncReader(
                     FFMpegFileReader(pathR),
-                    "r",
-                    channels=1,
-                    samplerate=int(sample_rate),
-                    format="RAW",
-                    subtype="PCM_16",
-                    endian="LITTLE",
+                    DEFAULT_BLOCK_DTYPE
                 )
         except Exception:
             pass
         print("WARN: Attempting to decode with SoundFile")
-        return AsyncSoundFile(pathR, "r")
+        return AsyncSoundFileReader(pathR)
 
 
 def get_normalize_filename(path, sample_rate):
@@ -2001,6 +1943,8 @@ async def decode_parallel(
     input_file = decode_options["input_file"]
     output_file = decode_options["output_file"]
 
+    input_format, _ = get_raw_input_format(input_file)
+
     channel_1_suffix = DEFAULT_CHANNEL_SUFFIX + "_1"
     channel_2_suffix = DEFAULT_CHANNEL_SUFFIX + "_2"
 
@@ -2045,6 +1989,7 @@ async def decode_parallel(
             decoder.blockOverlap,
             decoder.initialBlockFinalAudioSize,
             f"hifi_decoder_{i}",
+            input_format,
             numa_node=numa_node
         )
         shared_memory_instances.append(buffer_instance)
@@ -2134,7 +2079,7 @@ async def decode_parallel(
         # read input data into the shared memory buffer
         block_in = buffer.get_block_in()
         try:
-            frames_read = await f.buffer_read_into(block_in, "int16")
+            frames_read = await f.buffer_read_into(block_in)
         except sf.LibsndfileError as e:
             print("Error decoding input rf:", e)
             print("Stopping decode...")
@@ -2162,6 +2107,7 @@ async def decode_parallel(
                 decoder,
                 buffer.name,
                 decoder_state.block_frames_read,
+                decoder_state.block_dtype,
                 new_block_length,
                 decoder_state.block_num,
                 decoder_state.is_last_block,
@@ -2170,12 +2116,12 @@ async def decode_parallel(
             buffer = DecoderSharedMemory(decoder_state)
             block = buffer.get_block()
             # copy starting at half the normal read overlap
-            DecoderSharedMemory.copy_data_dst_offset_int16(
+            DecoderSharedMemory.copy_data_dst_offset(
                 block_data_read, block, start_overlap_end, len(block_data_read)
             )
 
             # this is the first block, fill in the empty data before half the read overlap, this will be discarded
-            DecoderSharedMemory.copy_data_int16(
+            DecoderSharedMemory.copy_data(
                 block_data_read, block, start_overlap_end
             )
         elif decoder_state.is_last_block and frames_read > 0:
@@ -2185,26 +2131,26 @@ async def decode_parallel(
             frames_read_with_overlap = frames_read + decoder_state.block_overlap
             block_in_offset = len(block) - frames_read_with_overlap
             block_data_read = block_in[0:frames_read].copy()
-            DecoderSharedMemory.copy_data_dst_offset_int16(
+            DecoderSharedMemory.copy_data_dst_offset(
                 block_data_read, block, block_in_offset, frames_read
             )
 
             # copy in the entire previous block to use as overlap
             # at the end of this decode worker, only the new audio will be returned
             previous_block_in_offset = len(previous_block) - block_in_offset
-            DecoderSharedMemory.copy_data_src_offset_int16(
+            DecoderSharedMemory.copy_data_src_offset(
                 previous_block, block, previous_block_in_offset, block_in_offset
             )
         else:
             # copy the overlapping data from the previous read
             block_in_overlap = buffer.get_block_in_start_overlap()
-            DecoderSharedMemory.copy_data_int16(
+            DecoderSharedMemory.copy_data(
                 previous_overlap, block_in_overlap, len(block_in_overlap)
             )
 
             # copy the the current overlap to use in the next iteration
             current_overlap = buffer.get_block_in_end_overlap()
-            DecoderSharedMemory.copy_data_int16(
+            DecoderSharedMemory.copy_data(
                 current_overlap, previous_overlap, len(current_overlap)
             )
 
@@ -2212,7 +2158,7 @@ async def decode_parallel(
             # save the full block for the next iteration, including previous overlap
             # will be used if the next block is the last block
             block = buffer.get_block()
-            DecoderSharedMemory.copy_data_int16(
+            DecoderSharedMemory.copy_data(
                 block, previous_block, len(previous_block)
             )
 
@@ -2253,7 +2199,7 @@ async def decode_parallel(
     with as_soundfile(input_file) as f:
         loop = asyncio.get_event_loop()
         previous_overlap = np.empty(0)
-        previous_block = np.empty(block_size, dtype=BLOCK_DTYPE)
+        previous_block = np.empty(block_size, dtype=f.dtype)
         progressB = TimeProgressBar(f.frames, f.frames)
         block_num = 0
 
@@ -2271,12 +2217,12 @@ async def decode_parallel(
                     return
 
             decoder_state = DecoderState(
-                decoder, buffer_name, 0, block_size, block_num, False, numa_node
+                decoder, buffer_name, 0, f.dtype, block_size, block_num, False, numa_node
             )
 
             if len(previous_overlap) == 0:
                 previous_overlap = np.empty(
-                    decoder_state.block_read_overlap, dtype=np.int16, order="C"
+                    decoder_state.block_read_overlap, dtype=f.dtype, order="C"
                 )
 
             is_last_block = await read_and_send_to_decoder(
@@ -2361,12 +2307,10 @@ async def normalize(input_file_post_gain, output_file, peak_gain, channels, audi
         total_frames_read = 0
         buffer = np.empty(2**20, dtype=np.float32, order="C")
 
-        with AsyncSoundFile(
+        with AsyncReader(
             input_file_post_gain,
-            "r",
-            samplerate=int(audio_rate),
-            channels=channels,
-            **normalize_parameters,
+            np.float32,
+            channels
         ) as f, as_outputfile(output_file, channels, audio_rate, False) as w:
             gain_adjust = (
                 1 / peak_gain - np.finfo(np.float16).eps
@@ -2376,7 +2320,7 @@ async def normalize(input_file_post_gain, output_file, peak_gain, channels, audi
             progressB = TimeProgressBar(f.frames, f.frames)
             done = False
             while not done:
-                frames_read = await f.buffer_read_into(buffer, dtype="float32")
+                frames_read = await f.buffer_read_into(buffer)
 
                 if frames_read < len(buffer):
                     buffer = buffer[0:frames_read]
@@ -2386,7 +2330,7 @@ async def normalize(input_file_post_gain, output_file, peak_gain, channels, audi
                 w.buffer_write(buffer, "float32")
 
                 total_frames_read += frames_read
-                progressB.print(total_frames_read / 2, False)
+                progressB.print(total_frames_read / channels, False)
         print("")
     finally:
         os.remove(input_file_post_gain)
@@ -2397,8 +2341,8 @@ def guess_bias(decoder, input_file, block_size, blocks_limits=10):
 
     with as_soundfile(input_file) as f:
         while f.tell() < f.frames and len(blocks) <= blocks_limits:
-            block_buffer = np.empty(block_size, dtype=np.int16, order="C")
-            f.buffer_read_into_sync(block_buffer, "int16")
+            block_buffer = np.empty(block_size, dtype=f.dtype, order="C")
+            f.buffer_read_into_sync(block_buffer)
             blocks.append(block_buffer)
 
     decoder.guessBiases(blocks)
