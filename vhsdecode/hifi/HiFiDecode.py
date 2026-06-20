@@ -97,7 +97,7 @@ class AFEParamsVHS:
 @dataclass
 class AFEParams8mm:
     def __init__(self):
-        # IEC 60843-1 6.2.3
+        # IEC 60843-1 pg.71 (6.2.3 FM audio signal recording, Maximum deviation)
         self.LVCODeviation = 100e3 # main channel deviation +-100kHz
         self.RVCODeviation = 50e3 # sub channel deviation +-50kHz
 
@@ -837,15 +837,6 @@ class Expander:
 
         self.hold_state = 0
 
-        self.lowpass_iirb, self.lowpass_iira = firdes_lowpass(
-            self.audio_rate,
-            min(weighting_low_pass, self.audio_rate / 2 - 1), # limit to nyquist
-            weighting_low_pass_transition,
-        )
-        self.WeightedLowcut = FiltersClass(
-            np.array(self.lowpass_iirb), np.array(self.lowpass_iira), dtype=np.float64
-        )
-
         # weighted filter for envelope detector
         self.weighting_T1 = weighting_low_tau
         self.weighting_T2 = weighting_high_tau
@@ -876,7 +867,7 @@ class Expander:
     @njit(
         [(
             NumbaAudioArray,
-            numba.types.Array(numba.types.float64, 1, "C"),
+            numba.types.Array(numba.types.float32, 1, "C"),
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
@@ -960,11 +951,9 @@ class Expander:
         return env_lin, hold_state
 
     def process(self, pre_in, audio_out):
-        side_chain = self.WeightedLowcut.lfilt(pre_in)
-
         # high pass weighted input to envelope detector
         self.zi_x, self.zi_y = Deemphasis.lfilt_inplace(
-            side_chain,
+            pre_in,
             self.env_iirb[0],
             self.env_iirb[1],
             self.env_iira[1],
@@ -974,7 +963,7 @@ class Expander:
 
         self.env_lin, self.hold_state = Expander.expand(
             audio_out,
-            side_chain,
+            pre_in,
             self.env_lin,
             self.atkCoeff,
             self.relCoeff,

@@ -1367,7 +1367,7 @@ class PostProcessor:
             if enable_expander:
                 if decoder_state.block_num == 0:
                     # prime the expander's gain if this is the first block
-                    expander.process(pre, np.copy(post, order="C"))
+                    expander.process(np.copy(pre, order="C"), np.copy(post, order="C"))
                 expander.process(pre, post)
 
             buffer.close()
