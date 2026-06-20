@@ -157,6 +157,11 @@ def check_flac_header_total_samples(streaminfo, file_size):
 
 
 class NUMA:
+    MPOL_BIND = 2
+    MPOL_MF_MOVE = 2
+    MPOL_MF_STRICT = 1
+    SYS_mbind = 237 # x86_64
+
     _libnuma = None
     _libc = None
 
@@ -206,7 +211,7 @@ class NUMA:
 
         except Exception:
             cls._libc = None
-            return None      
+            return None
 
     @classmethod
     def _available(cls):
@@ -271,8 +276,15 @@ class NUMA:
             return False
 
         try:
-            os.sched_setaffinity(0, cpus)
-            cls._libnuma.numa_run_on_node(node)
+            cpus = cls._cpus_for_node(node)
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+
+            mask = cls._libnuma.numa_allocate_nodemask()
+            cls._libnuma.numa_bitmask_clearall(mask)
+            cls._libnuma.numa_bitmask_setbit(mask, node)
+
+            cls._libnuma.numa_run_on_node_mask(mask)
             cls._libnuma.numa_set_preferred(node)
             return True
         except Exception:
@@ -289,11 +301,6 @@ class NUMA:
 
         if cls._available() and numa_node is not None:
             try:
-                MPOL_BIND = 2
-                MPOL_MF_STRICT = 1
-                MPOL_MF_MOVE = 2
-                SYS_mbind = 237
-
                 buf = shm.buf
 
                 addr = ctypes.addressof(
@@ -303,13 +310,13 @@ class NUMA:
                 nodemask = ctypes.c_ulong(1 << numa_node)
 
                 cls._libc.syscall(
-                    SYS_mbind,
+                    NUMA.SYS_mbind,
                     ctypes.c_void_p(addr),
                     ctypes.c_ulong(len(buf)),
-                    MPOL_BIND,
+                    NUMA.MPOL_BIND,
                     ctypes.byref(nodemask),
                     ctypes.sizeof(nodemask) * 8,
-                    MPOL_MF_MOVE | MPOL_MF_STRICT,
+                    NUMA.MPOL_MF_MOVE | NUMA.MPOL_MF_STRICT,
                 )
 
                 for offset in range(0, len(buf), mmap.PAGESIZE):

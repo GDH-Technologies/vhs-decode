@@ -40,7 +40,7 @@ from vhsdecode.addons.gnuradioZMQ import ZMQSend, ZMQ_AVAILABLE
 from vhsdecode.utils import firdes_lowpass, firdes_highpass, StackableMA
 
 from vhsdecode.hifi.TimeProgressBar import TimeProgressBar
-from vhsdecode.hifi.utils import DecoderSharedMemory, NumbaAudioArray, NUMA
+from vhsdecode.hifi.utils import DecoderSharedMemory, NumbaAudioArray
 
 import matplotlib.pyplot as plt
 
@@ -2373,7 +2373,6 @@ class HiFiDecode:
     def hifi_decode_worker(
         decoder_in_queue, decoder_out_queue, decode_options, standard, numa_node
     ):
-        NUMA.bind_process(numa_node)
         setproctitle(current_process().name)
         measure_perf = False
         decoder = HiFiDecode(decode_options, is_main_process=False)

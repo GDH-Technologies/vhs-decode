@@ -1130,9 +1130,10 @@ class PostProcessor:
         decoder_shared_memory_idle_queue,
         blocks_enqueued,
         out_conn,
-        peak_gain
+        peak_gain,
+        numa_node
     ):
-        self.numa_node = 0
+        self.numa_node = numa_node
         self.final_audio_rate = decode_options["audio_rate"]
         self.enable_expander = decode_options["enable_expander"]
         self.enable_deemphasis = decode_options["enable_deemphasis"]
@@ -1174,7 +1175,6 @@ class PostProcessor:
             target=PostProcessor.block_sorter_worker,
             name="hifi_block_sort",
             args=(
-                self.numa_node,
                 self.decoder_out_queue,
                 self.decoder_shared_memory_idle_queue,
                 self.blocks_enqueued,
@@ -1192,7 +1192,6 @@ class PostProcessor:
             target=PostProcessor.dc_block_worker,
             name="hifi_dc_block_l",
             args=(
-                self.numa_node,
                 block_sort_l_in_rx,
                 dc_blocker_worker_l_tx,
                 self.final_audio_rate,
@@ -1207,7 +1206,6 @@ class PostProcessor:
             target=PostProcessor.dc_block_worker,
             name="hifi_dc_block_r",
             args=(
-                self.numa_node,
                 block_sort_r_in_rx,
                 dc_blocker_worker_r_tx,
                 self.final_audio_rate,
@@ -1222,7 +1220,6 @@ class PostProcessor:
             target=PostProcessor.spectral_noise_reduction_worker,
             name="hifi_spec_nr_l",
             args=(
-                self.numa_node,
                 dc_blocker_worker_l_rx,
                 spectral_nr_worker_l_tx,
                 self.spectral_nr_amount,
@@ -1238,7 +1235,6 @@ class PostProcessor:
             target=PostProcessor.spectral_noise_reduction_worker,
             name="hifi_spec_nr_r",
             args=(
-                self.numa_node,
                 dc_blocker_worker_r_rx,
                 spectral_nr_worker_r_tx,
                 self.spectral_nr_amount,
@@ -1256,7 +1252,6 @@ class PostProcessor:
             target=expander_worker,
             name="hifi_expander_l",
             args=(
-                self.numa_node,
                 spectral_nr_worker_l_rx,
                 expander_worker_l_out_tx,
                 self.enable_deemphasis,
@@ -1287,7 +1282,6 @@ class PostProcessor:
             target=expander_worker,
             name="hifi_expander_r",
             args=(
-                self.numa_node,
                 spectral_nr_worker_r_rx,
                 expander_worker_r_out_tx,
                 self.enable_deemphasis,
@@ -1317,7 +1311,6 @@ class PostProcessor:
             target=PostProcessor.mix_to_stereo_worker,
             name="hifi_stereo_mix",
             args=(
-                self.numa_node,
                 expander_worker_l_out_rx,
                 expander_worker_r_out_rx,
                 self.mix_to_stereo_worker_output,
@@ -1343,12 +1336,10 @@ class PostProcessor:
 
     @staticmethod
     def dc_block_worker(
-        numa_node,
         in_conn,
         out_conn,
         final_audio_rate
     ):
-        NUMA.bind_process(numa_node)
         setproctitle(current_process().name)
         _ensure_hifi_engine_imported()
         dc_blocker = DCBlocker(
@@ -1379,13 +1370,11 @@ class PostProcessor:
         
     @staticmethod
     def spectral_noise_reduction_worker(
-        numa_node,
         in_conn,
         out_conn,
         spectral_nr_amount,
         final_audio_rate,
     ):
-        NUMA.bind_process(numa_node)
         setproctitle(current_process().name)
         _ensure_hifi_engine_imported()
         spectral_nr = SpectralNoiseReduction(
@@ -1423,7 +1412,6 @@ class PostProcessor:
 
     @staticmethod
     def expander_vhs_worker(
-        numa_node,
         in_conn,
         out_conn,
         enable_deemphasis,
@@ -1444,7 +1432,6 @@ class PostProcessor:
         expander_weighting_low_pass,
         expander_weighting_low_pass_transition,
     ):
-        NUMA.bind_process(numa_node)
         setproctitle(current_process().name)
         _ensure_hifi_engine_imported()
         deemphasis_pre_1 = Deemphasis(
@@ -1516,7 +1503,6 @@ class PostProcessor:
 
     @staticmethod
     def expander_8mm_worker(
-        numa_node,
         in_conn,
         out_conn,
         enable_deemphasis,
@@ -1537,7 +1523,6 @@ class PostProcessor:
         expander_weighting_low_pass,
         expander_weighting_low_pass_transition,
     ):
-        NUMA.bind_process(numa_node)
         setproctitle(current_process().name)
         _ensure_hifi_engine_imported()
         deemphasis_2 = Deemphasis(
@@ -1601,9 +1586,8 @@ class PostProcessor:
 
     @staticmethod
     def mix_to_stereo_worker(
-        numa_node, expander_l_in_conn, expander_r_in_conn, out_conn, peak_gain, sample_rate
+        expander_l_in_conn, expander_r_in_conn, out_conn, peak_gain, sample_rate
     ):
-        NUMA.bind_process(numa_node)
         setproctitle(current_process().name)
         while True:
             while True:
@@ -1698,7 +1682,6 @@ class PostProcessor:
 
     @staticmethod
     def block_sorter_worker(
-        numa_node,
         decoder_out_queue,
         decoder_shared_memory_idle_queue,
         blocks_enqueued,
@@ -1706,7 +1689,6 @@ class PostProcessor:
         l_tx,
         r_tx,
     ):
-        NUMA.bind_process(numa_node)
         setproctitle(current_process().name)
         next_block = 0
         last_block_submitted = -1
@@ -2123,6 +2105,8 @@ async def decode_parallel(
     max_numa_node = 0
     for i in range(num_shared_memory_instances):
         numa_node = NUMA.next_node()
+
+        NUMA.bind_process(numa_node)
         if numa_node > max_numa_node:
             max_numa_node = numa_node
 
@@ -2147,6 +2131,8 @@ async def decode_parallel(
 
     for i in range(num_decoders):
         numa_node = i % (max_numa_node + 1)
+
+        NUMA.bind_process(numa_node)
         decoder_process = Process(
             target=HiFiDecode.hifi_decode_worker,
             name=f"hifi_decode_worker_{i}",
@@ -2164,6 +2150,9 @@ async def decode_parallel(
         decoder_processes.append(decoder_process)
 
     # set up the post processor
+    # all new processes should be ont he same numa node at this point
+    post_processor_numa_node = 0
+    NUMA.bind_process(post_processor_numa_node)
     post_processor_out_rx_conn, post_processor_out_tx_conn = Pipe(duplex=False)
     post_processor_shared_memory_idle_queue = SimpleQueue()
     post_processor = PostProcessor(
@@ -2175,6 +2164,7 @@ async def decode_parallel(
         blocks_enqueued,
         post_processor_out_tx_conn,
         peak_gain,
+        post_processor_numa_node
     )
     atexit.register(post_processor.close)
 
