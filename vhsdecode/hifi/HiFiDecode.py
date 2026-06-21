@@ -90,10 +90,8 @@ class AFEParamsVHS:
         self.RVCODeviation = 150e3
 
         # Carson's bandwidth rule: 2 * (peak_frequency_deviation + highest frequency)
-        # 35.8 sounds good
-        # possibly a tuning knob, auto fine tune based on high frequency errors during non-dropout situations
-        self.LNotchWidth = 2 * (self.LVCODeviation + 35.6e3)
-        self.RNotchWidth = 2 * (self.RVCODeviation + 35.6e3)
+        self.LNotchWidth = 2 * (self.LVCODeviation + 35.753125e3)
+        self.RNotchWidth = 2 * (self.RVCODeviation + 35.753125e3)
 
 
 @dataclass
@@ -680,8 +678,7 @@ class DCBlocker:
         scale = 1.0 / np.sqrt(2.0**(1.0 / stages) - 1.0)
         stage_cutoff = cutoff * scale
 
-        K = np.tan(np.pi * stage_cutoff / sample_rate)
-        self.R = np.clip((1.0 - K) / (1.0 + K), 0.0, 0.999999999999)
+        self.R = np.exp(-2 * np.pi * stage_cutoff / sample_rate)
 
         # Stage 1 state
         self.x1 = np.float64(0.0)

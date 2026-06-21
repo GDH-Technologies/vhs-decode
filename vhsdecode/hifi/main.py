@@ -1241,6 +1241,10 @@ class PostProcessor:
             else:
                 pre = buffer.get_pre_right()
 
+            if decoder_state.block_num == 0:
+                # prime the state
+                dc_blocker.process(pre.copy())
+
             dc_blocker.process(pre)
 
             buffer.close()
