@@ -17,7 +17,6 @@ from itertools import cycle
 
 from pstats import SortKey, Stats
 
-DEFAULT_BLOCK_DTYPE = np.int16
 REAL_DTYPE = np.float32
 ALIGNMENT = 64
 
@@ -255,7 +254,7 @@ class NUMA:
 
 @dataclass
 class DecoderState:
-    def __init__(self, decoder, buffer_name, block_frames_read, block_dtype, block_size, block_num, is_last_block, numa_node):
+    def __init__(self, decoder, buffer_name, block_frames_read, block_size, block_num, is_last_block, numa_node):
         block_sizes = decoder.set_block_sizes(block_size)
         block_overlap = decoder.get_block_overlap()
 
@@ -266,7 +265,7 @@ class DecoderState:
 
         # block data for input rf
         self.block_frames_read = block_frames_read
-        self.block_dtype = block_dtype
+        self.block_dtype = REAL_DTYPE
         self.block_size = block_sizes["block_size"]
         self.block_overlap = block_overlap["block_overlap"]
         self.block_read_overlap = block_overlap["block_read_overlap"]
@@ -494,14 +493,12 @@ class DecoderSharedMemory:
         block_overlap,
         block_audio_final_size,
         name,
-        block_dtype,
-        audio_dtype=REAL_DTYPE,
         numa_node=None,
     ):
         max_audio_size = (
             block_audio_final_size + to_aligned_offset(block_audio_final_size)
-        ) * np.dtype(audio_dtype).itemsize
-        block_size = (block_size + block_overlap * 2) * np.dtype(block_dtype).itemsize
+        ) * np.dtype(REAL_DTYPE).itemsize
+        block_size = (block_size + block_overlap * 2) * np.dtype(REAL_DTYPE).itemsize
 
         byte_size = max(max_audio_size, block_size)
 
@@ -577,114 +574,6 @@ class DecoderSharedMemory:
             buffer=self.buf,
             order="C"
         )
-
-    @staticmethod
-    @njit(
-        [
-            numba.types.void(
-                numba.types.Array(numba.uint8, 1, "C"),
-                numba.types.Array(numba.uint8, 1, "C"),
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.int8, 1, "C"),
-                numba.types.Array(numba.int8, 1, "C"),
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.uint16, 1, "C"),
-                numba.types.Array(numba.uint16, 1, "C"),
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.int16, 1, "C"),
-                numba.types.Array(numba.int16, 1, "C"),
-                numba.types.int64,
-            ),
-        ],
-        cache=True,
-        fastmath=True,
-        nogil=True,
-    )
-    def copy_data(src: np.array, dst: np.array, length: int):
-        for i in range(length):
-            dst[i] = src[i]
-
-    @staticmethod
-    @njit(
-        [
-            numba.types.void(
-                numba.types.Array(numba.uint8, 1, "C"),
-                numba.types.Array(numba.uint8, 1, "C"),
-                numba.types.int64,
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.int8, 1, "C"),
-                numba.types.Array(numba.int8, 1, "C"),
-                numba.types.int64,
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.uint16, 1, "C"),
-                numba.types.Array(numba.uint16, 1, "C"),
-                numba.types.int64,
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.int16, 1, "C"),
-                numba.types.Array(numba.int16, 1, "C"),
-                numba.types.int64,
-                numba.types.int64,
-            ),
-        ],
-        cache=True,
-        fastmath=True,
-        nogil=True,
-    )
-    def copy_data_dst_offset(
-        src: np.array, dst: np.array, dst_offset: int, length: int
-    ):
-        for i in range(length):
-            dst[i + dst_offset] = src[i]
-
-    @staticmethod
-    @njit(
-        [
-            numba.types.void(
-                numba.types.Array(numba.uint8, 1, "C"),
-                numba.types.Array(numba.uint8, 1, "C"),
-                numba.types.int64,
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.int8, 1, "C"),
-                numba.types.Array(numba.int8, 1, "C"),
-                numba.types.int64,
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.uint16, 1, "C"),
-                numba.types.Array(numba.uint16, 1, "C"),
-                numba.types.int64,
-                numba.types.int64,
-            ),
-            numba.types.void(
-                numba.types.Array(numba.int16, 1, "C"),
-                numba.types.Array(numba.int16, 1, "C"),
-                numba.types.int64,
-                numba.types.int64,
-            ),
-        ],
-        cache=True,
-        fastmath=True,
-        nogil=True,
-    )
-    def copy_data_src_offset(
-        src: np.array, dst: np.array, src_offset: int, length: int
-    ):
-        for i in range(length):
-            dst[i] = src[i + src_offset]
 
     @staticmethod
     @njit(
