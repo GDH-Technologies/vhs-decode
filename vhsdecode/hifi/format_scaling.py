@@ -2,14 +2,14 @@ import numba as nb
 import numpy as np
 from vhsdecode.hifi.constants import (
     FORMAT_U8,
-    FORMAT_U10,
-    FORMAT_U12,
-    FORMAT_U16,
+    FORMAT_U10_LE,
+    FORMAT_U12_LE,
+    FORMAT_U16_LE,
     FORMAT_S8,
-    FORMAT_S10,
-    FORMAT_S12,
-    FORMAT_S16,
-    FORMAT_F32,
+    FORMAT_S10_LE,
+    FORMAT_S12_LE,
+    FORMAT_S16_LE,
+    FORMAT_F32_LE,
     FORMAT_TO_DTYPE,
     DTYPE_TO_FORMAT
 )
@@ -69,14 +69,14 @@ def _f32_to_f32(x, out, n):
 
 _FORMAT_TO_NORMALIZER = {
     FORMAT_U8: _u8_to_f32,
-    FORMAT_U10: _u10_to_f32,
-    FORMAT_U12: _u12_to_f32,
-    FORMAT_U16: _u16_to_f32,
+    FORMAT_U10_LE: _u10_to_f32,
+    FORMAT_U12_LE: _u12_to_f32,
+    FORMAT_U16_LE: _u16_to_f32,
     FORMAT_S8: _s8_to_f32,
-    FORMAT_S10: _s10_to_f32,
-    FORMAT_S12: _s12_to_f32,
-    FORMAT_S16: _s16_to_f32,
-    FORMAT_F32: _f32_to_f32
+    FORMAT_S10_LE: _s10_to_f32,
+    FORMAT_S12_LE: _s12_to_f32,
+    FORMAT_S16_LE: _s16_to_f32,
+    FORMAT_F32_LE: _f32_to_f32
 }
 
 def get_normalizer(fmt_or_dtype):

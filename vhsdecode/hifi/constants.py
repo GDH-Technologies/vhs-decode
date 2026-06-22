@@ -23,34 +23,34 @@ DEFAULT_VHS_AUDIO_MODE = AUDIO_MODE_STEREO
 DEFAULT_8MM_AUDIO_MODE = AUDIO_MODE_STEREO_MS
 
 FORMAT_U8 = "u8"
-FORMAT_U10 = "u10"
-FORMAT_U12 = "u12"
-FORMAT_U16 = "u16"
+FORMAT_U10_LE = "u10le"
+FORMAT_U12_LE = "u12le"
+FORMAT_U16_LE = "u16le"
 FORMAT_S8 = "s8"
-FORMAT_S10 = "s10"
-FORMAT_S12 = "s12"
-FORMAT_S16 = "s16"
-FORMAT_F32 = "f32"
+FORMAT_S10_LE = "s10le"
+FORMAT_S12_LE = "s12le"
+FORMAT_S16_LE = "s16le"
+FORMAT_F32_LE = "f32le"
 
 FORMAT_TO_DTYPE = {
     FORMAT_U8: np.uint8,
-    FORMAT_U10: np.uint16,
-    FORMAT_U12: np.uint16,
-    FORMAT_U16: np.uint16,
+    FORMAT_U10_LE: np.uint16,
+    FORMAT_U12_LE: np.uint16,
+    FORMAT_U16_LE: np.uint16,
     FORMAT_S8: np.int8,
-    FORMAT_S10: np.int16,
-    FORMAT_S12: np.int16,
-    FORMAT_S16: np.int16,
+    FORMAT_S10_LE: np.int16,
+    FORMAT_S12_LE: np.int16,
+    FORMAT_S16_LE: np.int16,
     "raw": np.int16,
-    FORMAT_F32: np.float32
+    FORMAT_F32_LE: np.float32
 }
 
 DTYPE_TO_FORMAT = {
     np.uint8: FORMAT_U8,
-    np.uint16: FORMAT_U16,
+    np.uint16: FORMAT_U16_LE,
     np.int8:  FORMAT_S8,
-    np.int16:  FORMAT_S16,
-    np.float32: FORMAT_F32,
+    np.int16:  FORMAT_S16_LE,
+    np.float32: FORMAT_F32_LE,
 }
 
 audio_mode_to_ui = {

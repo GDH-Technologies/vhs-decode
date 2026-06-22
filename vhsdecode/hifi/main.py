@@ -53,14 +53,14 @@ from vhsdecode.hifi.constants import (
     AUDIO_MODE_DUAL_MONO_MS,
     FORMAT_TO_DTYPE,
     FORMAT_U8,
-    FORMAT_U10,
-    FORMAT_U12,
-    FORMAT_U16,
+    FORMAT_U10_LE,
+    FORMAT_U12_LE,
+    FORMAT_U16_LE,
     FORMAT_S8,
-    FORMAT_S10,
-    FORMAT_S12,
-    FORMAT_S16,
-    FORMAT_F32,
+    FORMAT_S10_LE,
+    FORMAT_S12_LE,
+    FORMAT_S16_LE,
+    FORMAT_F32_LE,
     FORMAT_TO_DTYPE,
     ENV_DETECTION_PEAK,
     ENV_DETECTION_RMS,
@@ -209,7 +209,7 @@ parser.add_argument(
     "infile",
     metavar="infile",
     type=str,
-    help="source file",
+    help="source file path or '-' for stdin\n  NOTE: `--raw_format` is required for stdin",
     nargs="?",
     default="",
     action=TestInputFile,
@@ -218,7 +218,7 @@ parser.add_argument(
     "outfile",
     metavar="outfile",
     type=str,
-    help="base name for destination files",
+    help="output file",
     nargs="?",
     default="",
     action=TestOutputFile,
@@ -274,19 +274,20 @@ parser.add_argument(
     metavar='',
     type=str,
     default=None,
-    help=f'(advanced) RF input data normalization override.'
-    '\nThis option is for adjusting the normalization amount, it does not support packed data.'
-    '\nRF input data is assumed to be little endian.'
-    '\n**required for stdin**'
-    f'\n  {FORMAT_U8} \t 8 bit as  8 bit unsigned integer'
-    f'\n  {FORMAT_U10} \t10 bit as 16 bit unsigned integer'
-    f'\n  {FORMAT_U12} \t12 bit as 16 bit unsigned integer'
-    f'\n  {FORMAT_U16} \t16 bit as 16 bit unsigned integer'
-    f'\n  {FORMAT_S8} \t 8 bit as  8 bit signed integer'
-    f'\n  {FORMAT_S10} \t10 bit as 16 bit signed integer'
-    f'\n  {FORMAT_S12} \t12 bit as 16 bit signed integer'
-    f'\n  {FORMAT_S16} \t16 bit as 16 bit signed integer'
-    f'\n  {FORMAT_F32} \t32 bit as 32 bit floating point'
+    help=f'Specify RF input data precision. Packed data is unsupported.'
+    '\n  Required for stdin.'
+    '\n  This option can be used to override the precision of the input file for better normalization.'
+    '\n  (i.e. when decoding 10bit data is stored in 16bit FLAC, specifying `--raw_format s10le` will normalize the input data as 10bit)'
+    '\nInput Formats:'
+    f'\n  {FORMAT_U8}    \t8 bit unsigned integer'
+    f'\n  {FORMAT_U16_LE}  \t16 bit unsigned integer'
+    f'\n  {FORMAT_U10_LE}  \t16 bit (10 bit precision) unsigned integer'
+    f'\n  {FORMAT_U12_LE}  \t16 bit (12 bit precision) unsigned integer'
+    f'\n  {FORMAT_S8}    \t8 bit signed integer'
+    f'\n  {FORMAT_S16_LE}  \t16 bit signed integer'
+    f'\n  {FORMAT_S10_LE}  \t16 bit (10 bit precision) signed integer'
+    f'\n  {FORMAT_S12_LE}  \t16 bit (12 bit precision) signed integer'
+    f'\n  {FORMAT_F32_LE}  \t32 bit floating point'
 )
 
 system_options_group = parser.add_argument_group("System options")
@@ -895,7 +896,7 @@ def as_soundfile(pathR, input_format_override: np.dtype = None):
 
     if is_raw or pathR == "-":
         if pathR == "-" and input_format == None:
-            raise Exception("stdin input must have a format specified")
+            raise Exception("`--raw_format <format>` is required for stdin input")
 
         return AsyncReader(
             pathR,
