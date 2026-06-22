@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import traceback
+import warnings
 
 import threading
 from queue import Queue
