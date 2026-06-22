@@ -233,24 +233,6 @@ parser.add_argument(
     help="RF sampling frequency in source file (default is 40MHz)",
 )
 parser.add_argument(
-    "--raw_format",
-    dest="raw_format",
-    metavar='',
-    type=str,
-    default=None,
-    help=f'RF input data format override'
-    '\n**required for stdin**'
-    f'\n  {FORMAT_U8} \t 8 bit unsigned integer'
-    f'\n  {FORMAT_U10} \t 10 bit unsigned integer'
-    f'\n  {FORMAT_U12} \t 12 bit unsigned integer'
-    f'\n  {FORMAT_U16} \t 16 bit unsigned integer'
-    f'\n  {FORMAT_S8} \t 8 bit signed integer'
-    f'\n  {FORMAT_S10} \t 10 bit signed integer'
-    f'\n  {FORMAT_S12} \t 12 bit signed integer'
-    f'\n  {FORMAT_S16} \t 16 bit signed integer'
-    f'\n  {FORMAT_F32} \t 32 bit floating point'
-)
-parser.add_argument(
     "--overwrite",
     dest="overwrite",
     action="store_true",
@@ -264,6 +246,13 @@ parser.add_argument(
     type=int,
     default=default_threads,
     help="number of CPU threads to use",
+)
+parser.add_argument(
+    "--preview",
+    dest="preview",
+    action="store_true",
+    default=False,
+    help="Preview the audio through your speakers as it decodes. Uses preview quality (faster and noisier)",
 )
 parser.add_argument(
     "--gui",
@@ -280,11 +269,24 @@ parser.add_argument(
     help="Opens ZMQ REP pipe to gnuradio at port 5555",
 )
 parser.add_argument(
-    "--preview",
-    dest="preview",
-    action="store_true",
-    default=False,
-    help="Preview the audio through your speakers as it decodes. Uses preview quality (faster and noisier)",
+    "--raw_format",
+    dest="raw_format",
+    metavar='',
+    type=str,
+    default=None,
+    help=f'(advanced) RF input data normalization override.'
+    '\nThis option is for adjusting the normalization amount, it does not support packed data.'
+    '\nRF input data is assumed to be little endian.'
+    '\n**required for stdin**'
+    f'\n  {FORMAT_U8} \t 8 bit as  8 bit unsigned integer'
+    f'\n  {FORMAT_U10} \t10 bit as 16 bit unsigned integer'
+    f'\n  {FORMAT_U12} \t12 bit as 16 bit unsigned integer'
+    f'\n  {FORMAT_U16} \t16 bit as 16 bit unsigned integer'
+    f'\n  {FORMAT_S8} \t 8 bit as  8 bit signed integer'
+    f'\n  {FORMAT_S10} \t10 bit as 16 bit signed integer'
+    f'\n  {FORMAT_S12} \t12 bit as 16 bit signed integer'
+    f'\n  {FORMAT_S16} \t16 bit as 16 bit signed integer'
+    f'\n  {FORMAT_F32} \t32 bit as 32 bit floating point'
 )
 
 system_options_group = parser.add_argument_group("System options")
