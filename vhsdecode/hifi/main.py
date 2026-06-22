@@ -52,6 +52,16 @@ from vhsdecode.hifi.constants import (
     AUDIO_MODE_DUAL_MONO,
     AUDIO_MODE_DUAL_MONO_MS,
     FORMAT_TO_DTYPE,
+    FORMAT_U8,
+    FORMAT_U10,
+    FORMAT_U12,
+    FORMAT_U16,
+    FORMAT_S8,
+    FORMAT_S10,
+    FORMAT_S12,
+    FORMAT_S16,
+    FORMAT_F32,
+    FORMAT_TO_DTYPE,
     ENV_DETECTION_PEAK,
     ENV_DETECTION_RMS,
     DEFAULT_ENV_DETECTION,
@@ -220,7 +230,25 @@ parser.add_argument(
     metavar='',
     type=parse_frequency,
     default=40,
-    help="RF sampling frequency in source file \n(default is 40MHz)",
+    help="RF sampling frequency in source file (default is 40MHz)",
+)
+parser.add_argument(
+    "--raw_format",
+    dest="raw_format",
+    metavar='',
+    type=str,
+    default=None,
+    help=f'RF input data format override'
+    '\n**required for stdin**'
+    f'\n  {FORMAT_U8} \t 8 bit unsigned integer'
+    f'\n  {FORMAT_U10} \t 10 bit unsigned integer'
+    f'\n  {FORMAT_U12} \t 12 bit unsigned integer'
+    f'\n  {FORMAT_U16} \t 16 bit unsigned integer'
+    f'\n  {FORMAT_S8} \t 8 bit signed integer'
+    f'\n  {FORMAT_S10} \t 10 bit signed integer'
+    f'\n  {FORMAT_S12} \t 12 bit signed integer'
+    f'\n  {FORMAT_S16} \t 16 bit signed integer'
+    f'\n  {FORMAT_F32} \t 32 bit floating point'
 )
 parser.add_argument(
     "--overwrite",
@@ -709,17 +737,22 @@ class FFMpegFileReader(BufferedInputStream):
 class AsyncReader:
     def __init__(self, file, input_dtype, channels=1):
         self._dtype_normalizer, self._numpy_in_dtype = get_normalizer(input_dtype)
-        self._input_dtype_size = np.dtype(input_dtype).itemsize
+        self._input_dtype_size = np.dtype(self._numpy_in_dtype).itemsize
         self._file = file
         self._channels = channels
 
     def __enter__(self):
-        if isinstance(self._file, str):
+        if self._file == "-":
+            self._file_handle = sys.stdin.buffer
+        elif isinstance(self._file, str):
             self._file_handle = open(self._file, "rb")
         else:
             self._file_handle = self._file
 
-        self._frames = os.fstat(self._file_handle.fileno()).st_size / np.dtype(self._numpy_in_dtype).itemsize / self._channels
+        if self._file == "-":
+            self._frames = 0
+        else:
+            self._frames = os.fstat(self._file_handle.fileno()).st_size / np.dtype(self._numpy_in_dtype).itemsize / self._channels
 
         self._executor = ThreadPoolExecutor(
             max_workers=1,
@@ -768,9 +801,21 @@ class AsyncReader:
         output_view = out.view(self._numpy_in_dtype)
 
         bytes_to_read = len(out) * self._input_dtype_size
-        bytes_read = self._file_handle.readinto(memoryview(output_view).cast("B")[:bytes_to_read])
+        byte_view = memoryview(output_view).cast("B")
 
-        values_read = bytes_read // self._input_dtype_size
+        total_bytes_read = 0
+
+        while total_bytes_read < bytes_to_read:
+            n = self._file_handle.readinto(
+                byte_view[total_bytes_read:bytes_to_read]
+            )
+
+            if n == 0:  # EOF
+                break
+
+            total_bytes_read += n
+
+        values_read = total_bytes_read // self._input_dtype_size
 
         if self._dtype_normalizer is not None:
             self._dtype_normalizer(output_view, out, values_read)
@@ -779,13 +824,16 @@ class AsyncReader:
 
 
 class AsyncSoundFileReader(sf.SoundFile):
-    def __init__(self, file, **kwargs):
+    def __init__(self, file, input_dtype, **kwargs):
         super().__init__(
             file,
             "r",
             **kwargs,
         )
-        self._dtype_normalizer, self._numpy_in_dtype = get_normalizer(np.int16)
+        if input_dtype is None:
+            input_dtype = np.int16
+
+        self._dtype_normalizer, self._numpy_in_dtype = get_normalizer(input_dtype)
         self._input_dtype_size = np.dtype(self._numpy_in_dtype).itemsize
 
     def __enter__(self):
@@ -853,7 +901,10 @@ def as_soundfile(pathR, input_format_override: np.dtype = None):
         )
     elif "flac" == extension:
         try:
-            return AsyncSoundFileReader(pathR)
+            return AsyncSoundFileReader(
+                pathR,
+                input_format
+            )
         except sf.LibsndfileError as e:
             print(f"WARN: libsndfile could not open this FLAC file: {e}")
             if test_if_ffmpeg_is_installed():
@@ -895,7 +946,10 @@ def as_soundfile(pathR, input_format_override: np.dtype = None):
         except Exception as e:
             pass
 
-        return AsyncSoundFileReader(pathR)
+        return AsyncSoundFileReader(
+            pathR,
+            input_format
+        )
     elif "lds" == extension:
         try:
             for lds_reader_tool, input_arg in (
@@ -926,7 +980,10 @@ def as_soundfile(pathR, input_format_override: np.dtype = None):
         except Exception:
             pass
         print("WARN: Attempting to decode with SoundFile")
-        return AsyncSoundFileReader(pathR)
+        return AsyncSoundFileReader(
+            pathR,
+            input_format
+        )
 
 
 def get_normalize_filename(path, sample_rate):
@@ -1972,6 +2029,7 @@ async def decode_parallel(
         guess_bias(decoder, decode_options["input_file"], int(decode_options["input_rate"]))
 
     input_file = decode_options["input_file"]
+    input_format_override = decode_options["input_format_override"]
     output_file = decode_options["output_file"]
 
     channel_1_suffix = DEFAULT_CHANNEL_SUFFIX + "_1"
@@ -2223,7 +2281,7 @@ async def decode_parallel(
     if ui_t is not None:
         asyncio.create_task(ui_task(stop_requested, ui_t))
 
-    with as_soundfile(input_file) as f:
+    with as_soundfile(input_file, input_format_override) as f:
         loop = asyncio.get_event_loop()
         previous_block = np.empty(block_size, dtype=REAL_DTYPE)
         progressB = TimeProgressBar(f.frames, f.frames)
@@ -2405,6 +2463,7 @@ def run_decoder(args, decode_options, ui_t: Optional[AppWindow] = None):
 def build_decode_options_from_args(args):
     system = "PAL" if args.pal else "NTSC"
     sample_freq = args.inputfreq
+    input_format_override = args.raw_format
 
     filename = args.infile
     outname = args.outfile
@@ -2471,6 +2530,7 @@ def build_decode_options_from_args(args):
 
     decode_options = {
         "input_rate": sample_freq * 1e6,
+        "input_format_override": input_format_override,
         "standard": "p" if system == "PAL" else "n",
         "format": tape_format,
         "preview": args.preview,
