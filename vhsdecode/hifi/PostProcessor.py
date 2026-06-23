@@ -294,10 +294,12 @@ class PostProcessor:
         final_audio_rate,
     ):
         setproctitle(current_process().name)
-        spectral_nr = SpectralNoiseReduction(
-            nr_reduction_amount=spectral_nr_amount,
-            audio_rate=final_audio_rate,
-        )
+
+        if spectral_nr_amount > 0:
+            spectral_nr = SpectralNoiseReduction(
+                nr_reduction_amount=spectral_nr_amount,
+                audio_rate=final_audio_rate,
+            )
 
         while True:
             while True:
