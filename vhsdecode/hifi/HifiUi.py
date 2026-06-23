@@ -98,8 +98,9 @@ from vhsdecode.hifi.constants import (
     ui_to_doc_mode,
     ui_to_expander_env_detection
 )
-from vhsdecode.hifi.afe import get_standard
-
+from vhsdecode.hifi.HiFiDecode import (
+    get_standard
+)
 _PLOT_DEEMPHASIS = None
 _PLOT_EXPANDER = None
 
@@ -188,7 +189,8 @@ class MainUIParameters:
         self.deemphasis_high_tau: float = DEFAULT_VHS_DEEMPHASIS_TAU_2
         self.nr_deemphasis_low_tau: float = DEFAULT_VHS_NR_DEEMPHASIS_TAU_1
         self.nr_deemphasis_high_tau: float = DEFAULT_VHS_NR_DEEMPHASIS_TAU_2
-        self.afe_vco_deviation = 0
+        self.afe_left_carrier_deviation = 0
+        self.afe_right_carrier_deviation = 0
         self.afe_left_carrier = 0
         self.afe_right_carrier = 0
         self.spectral_nr_amount = DEFAULT_SPECTRAL_NR_AMOUNT
@@ -234,7 +236,8 @@ def decode_options_to_ui_parameters(decode_options):
     values.deemphasis_high_tau = decode_options["deemphasis_high_tau"]
     values.nr_deemphasis_low_tau = decode_options["nr_deemphasis_low_tau"]
     values.nr_deemphasis_high_tau = decode_options["nr_deemphasis_high_tau"]
-    values.afe_vco_deviation = decode_options["afe_vco_deviation"]
+    values.afe_left_carrier_deviation = decode_options["afe_left_carrier_deviation"]
+    values.afe_right_carrier_deviation = decode_options["afe_right_carrier_deviation"]
     values.afe_left_carrier = decode_options["afe_left_carrier"]
     values.afe_right_carrier = decode_options["afe_right_carrier"]
     values.spectral_nr_amount = decode_options["spectral_nr_amount"]
@@ -279,7 +282,8 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
         "deemphasis_high_tau": values.deemphasis_high_tau,
         "nr_deemphasis_low_tau": values.nr_deemphasis_low_tau,
         "nr_deemphasis_high_tau": values.nr_deemphasis_high_tau,
-        "afe_vco_deviation": values.afe_vco_deviation,
+        "afe_left_carrier_deviation": values.afe_left_carrier_deviation,
+        "afe_right_carrier_deviation": values.afe_right_carrier_deviation,
         "afe_left_carrier": values.afe_left_carrier,
         "afe_right_carrier": values.afe_right_carrier,
         "spectral_nr_amount": values.spectral_nr_amount,
@@ -671,6 +675,21 @@ class HifiUi(QMainWindow):
         afe_left_carrier_layout.addWidget(self.afe_left_carrier_spinbox)
         advanced_format_options_frame.inner_layout.addLayout(afe_left_carrier_layout)
 
+        # left vco deviation adjustment
+        afe_left_carrier_deviation_layout = QHBoxLayout()
+        afe_left_carrier_deviation_spinbox_label = QLabel("Left Carrier Deviation (Hz)")
+        self.afe_left_carrier_deviation_spinbox = QSpinBox(self)
+        self.afe_left_carrier_deviation_spinbox.setGroupSeparatorShown(True)
+        self.afe_left_carrier_deviation_spinbox.setMinimum(int(10e3))
+        self.afe_left_carrier_deviation_spinbox.setMaximum(int(10e5))
+        self.afe_left_carrier_deviation_spinbox.setSingleStep(10)
+        self.afe_left_carrier_deviation_spinbox.setToolTip(
+            "Maximum frequency offset + or - from the center frequency"
+        )
+        afe_left_carrier_deviation_layout.addWidget(afe_left_carrier_deviation_spinbox_label)
+        afe_left_carrier_deviation_layout.addWidget(self.afe_left_carrier_deviation_spinbox)
+        advanced_format_options_frame.inner_layout.addLayout(afe_left_carrier_deviation_layout)
+
         # right carrier adjustment
         afe_right_carrier_layout = QHBoxLayout()
         afe_right_carrier_spinbox_label = QLabel("Right Carrier (Hz)")
@@ -684,20 +703,21 @@ class HifiUi(QMainWindow):
         afe_right_carrier_layout.addWidget(self.afe_right_carrier_spinbox)
         advanced_format_options_frame.inner_layout.addLayout(afe_right_carrier_layout)
 
-        # vco deviation adjustment
-        afe_vco_deviation_layout = QHBoxLayout()
-        afe_vco_deviation_spinbox_label = QLabel("VCO Deviation")
-        self.afe_vco_deviation_spinbox = QSpinBox(self)
-        self.afe_vco_deviation_spinbox.setGroupSeparatorShown(True)
-        self.afe_vco_deviation_spinbox.setMinimum(int(10e3))
-        self.afe_vco_deviation_spinbox.setMaximum(int(10e5))
-        self.afe_vco_deviation_spinbox.setSingleStep(10)
-        self.afe_vco_deviation_spinbox.setToolTip(
+        # right vco deviation adjustment
+        afe_right_carrier_deviation_layout = QHBoxLayout()
+        afe_right_carrier_deviation_spinbox_label = QLabel("Right Carrier Deviation (Hz)")
+        self.afe_right_carrier_deviation_spinbox = QSpinBox(self)
+        self.afe_right_carrier_deviation_spinbox.setGroupSeparatorShown(True)
+        self.afe_right_carrier_deviation_spinbox.setMinimum(int(10e3))
+        self.afe_right_carrier_deviation_spinbox.setMaximum(int(10e5))
+        self.afe_right_carrier_deviation_spinbox.setSingleStep(10)
+        self.afe_right_carrier_deviation_spinbox.setToolTip(
             "Maximum frequency offset + or - from the center frequency"
         )
-        afe_vco_deviation_layout.addWidget(afe_vco_deviation_spinbox_label)
-        afe_vco_deviation_layout.addWidget(self.afe_vco_deviation_spinbox)
-        advanced_format_options_frame.inner_layout.addLayout(afe_vco_deviation_layout)
+        afe_right_carrier_deviation_layout.addWidget(afe_right_carrier_deviation_spinbox_label)
+        afe_right_carrier_deviation_layout.addWidget(self.afe_right_carrier_deviation_spinbox)
+        advanced_format_options_frame.inner_layout.addLayout(afe_right_carrier_deviation_layout)
+
         return layout
 
     def build_demodulation_options_section(self):
@@ -1118,7 +1138,8 @@ class HifiUi(QMainWindow):
         self.update_afe_values(
             values.format,
             values.standard,
-            values.afe_vco_deviation,
+            values.afe_left_carrier_deviation,
+            values.afe_right_carrier_deviation,
             values.afe_left_carrier,
             values.afe_right_carrier,
         )
@@ -1153,7 +1174,8 @@ class HifiUi(QMainWindow):
         values.deemphasis_high_tau = self.deemphasis_high_tau_dial_control.value()
         values.nr_deemphasis_low_tau = self.nr_deemphasis_low_tau_dial_control.value()
         values.nr_deemphasis_high_tau = self.nr_deemphasis_high_tau_dial_control.value()
-        values.afe_vco_deviation = self.afe_vco_deviation_spinbox.value()
+        values.afe_left_carrier_deviation = self.afe_left_carrier_deviation_spinbox.value()
+        values.afe_right_deviation = self.afe_right_carrier_deviation_spinbox.value()
         values.afe_left_carrier = self.afe_left_carrier_spinbox.value()
         values.afe_right_carrier = self.afe_right_carrier_spinbox.value()
         values.spectral_nr_amount = float(
@@ -1184,18 +1206,21 @@ class HifiUi(QMainWindow):
         self,
         format,
         standard,
-        afe_vco_deviation=0,
+        afe_left_carrier_deviation=0,
+        afe_right_carrier_deviation=0,
         afe_left_carrier=0,
         afe_right_carrier=0,
     ):
         standard, _ = get_standard(
             "vhs" if format == "VHS" else "8mm",
             "p" if standard == "PAL" else "n",
-            afe_vco_deviation,
+            afe_left_carrier_deviation,
+            afe_right_carrier_deviation,
             afe_left_carrier,
             afe_right_carrier,
         )
-        self.afe_vco_deviation_spinbox.setValue(int(standard.VCODeviation))
+        self.afe_left_carrier_deviation_spinbox.setValue(int(standard.LCarrierDeviation))
+        self.afe_right_carrier_deviation_spinbox.setValue(int(standard.RCarrierDeviation))
         self.afe_left_carrier_spinbox.setValue(int(standard.LCarrierRef))
         self.afe_right_carrier_spinbox.setValue(int(standard.RCarrierRef))
 
