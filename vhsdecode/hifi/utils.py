@@ -14,6 +14,7 @@ import mmap
 import os
 from functools import lru_cache
 from itertools import cycle
+import atexit
 
 from pstats import SortKey, Stats
 
@@ -634,3 +635,9 @@ def profile(function) -> int:
         return return_code
 
     return run_profiler
+
+def cleanup_process(process):
+    atexit.unregister(process.terminate)
+    atexit.unregister(process.join)
+    process.terminate()
+    process.join()
