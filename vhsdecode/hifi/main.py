@@ -739,6 +739,9 @@ class FFMpegFileReader(BufferedInputStream):
 
 class AsyncReader:
     def __init__(self, file, input_dtype, channels=1):
+        if input_dtype is None:
+            input_dtype = np.int16
+
         self._dtype_normalizer, self._numpy_in_dtype = get_normalizer(input_dtype)
         self._input_dtype_size = np.dtype(self._numpy_in_dtype).itemsize
         self._file = file
@@ -885,9 +888,10 @@ class AsyncSoundFileReader(sf.SoundFile):
 
 
 def as_soundfile(pathR, input_format_override: np.dtype = None):
-    extension = pathR.lower().split(".")[-1]
+    extension = pathR.lower().rsplit(".", 1)[-1]
+    extension_with_endian = extension.replace("16", "16le").replace("32", "32le")
 
-    input_format = FORMAT_TO_DTYPE.get(extension)
+    input_format = FORMAT_TO_DTYPE.get(extension_with_endian)
     is_raw = input_format is not None
 
     # TODO add user facing parameter
