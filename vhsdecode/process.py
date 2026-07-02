@@ -16,7 +16,7 @@ import numpy.fft as npfft
 import lddecode.utils as lddu
 import vhsdecode.utils as utils
 from vhsdecode.utils import StackableMA, filtfft
-from vhsdecode.chroma import demod_chroma_filt
+from vhsdecode.chroma import chroma_color_under_filter
 
 import vhsdecode.formats as vhs_formats
 
@@ -1398,7 +1398,7 @@ class VHSRFDecode(ldd.RFDecode):
         # Filter out the color-under signal from the raw data.
         chroma_source = data if self.options.color_under else out_video
         out_chroma = (
-            demod_chroma_filt(
+            chroma_color_under_filter(
                 chroma_source,
                 self.Filters["FVideoBurst"],
                 self.blocklen,

@@ -1773,21 +1773,19 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
-        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[
-            burst_tbc_start:
-        ]:
-            target_phase = odd_burst_avg_phase if line_number % 2 else even_burst_avg_phase
+        for burst in phase_sequence[burst_tbc_start:]:
+            target_phase = odd_burst_avg_phase if burst.line_number % 2 else even_burst_avg_phase
 
-            phase_delta = (target_phase - burst_phase + burst_phase_offset + 180) % 360 - 180
+            phase_delta = (target_phase - burst.phase_deg + burst.phase_offset_deg + 180) % 360 - 180
 
             # scale up burst fsc for each line
-            line_start = linelocs[line_number]
-            line_end = linelocs[line_number + 1]
+            line_start = linelocs[burst.line_number]
+            line_end = linelocs[burst.line_number + 1]
             line_length = line_end - line_start
             scale = line_length / outlinelen
 
             line_adjust = phase_delta / 360.0 * fsc_ratio
-            linelocs[line_number] += (
+            linelocs[burst.line_number] += (
                 line_adjust * scale
             )  # 4fsc, then scaled up to the input line length
 
@@ -1839,19 +1837,17 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
-        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[
-            burst_tbc_start:
-        ]:
-            phase_delta = (burst_avg_phase - burst_phase + burst_phase_offset + 180) % 360 - 180
+        for burst in phase_sequence[burst_tbc_start:]:
+            phase_delta = (burst_avg_phase - burst.phase_deg + burst.phase_offset_deg + 180) % 360 - 180
 
             # scale up burst fsc for each line
-            line_start = linelocs[line_number]
-            line_end = linelocs[line_number + 1]
+            line_start = linelocs[burst.line_number]
+            line_end = linelocs[burst.line_number + 1]
             line_length = line_end - line_start
             scale = line_length / outlinelen
 
             line_adjust = phase_delta / 360.0 * fsc_ratio
-            linelocs[line_number] += (
+            linelocs[burst.line_number] += (
                 line_adjust * scale
             )  # 4fsc, then scaled up to the input line length
 
