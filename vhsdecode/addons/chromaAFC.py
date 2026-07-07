@@ -2,6 +2,7 @@ from vhsdecode import utils
 import numpy as np
 import scipy.signal as sps
 from scipy.fftpack import fft, fftfreq
+from numpy.fft import rfft, rfftfreq
 import lddecode.core as ldd
 from scipy.signal import argrelextrema
 from vhsdecode.linear_filter import FiltersClass
@@ -61,12 +62,8 @@ class ChromaAFC:
         if do_cafc:
             self.narrowband = self._get_narrowband_bandpass()
             self.meas_stack = utils.StackableMA(min_watermark=0, window_average=8192)
-            self.chroma_log_drift = utils.StackableMA(
-                min_watermark=0, window_average=8192
-            )
-            self.chroma_bias_drift = utils.StackableMA(
-                min_watermark=0, window_average=6
-            )
+            self.chroma_log_drift = utils.StackableMA(min_watermark=0, window_average=8192)
+            self.chroma_bias_drift = utils.StackableMA(min_watermark=0, window_average=6)
 
             self.corrector = [1, 0]
             self.on_linearization = linearize
@@ -109,9 +106,7 @@ class ChromaAFC:
         ):
             fdc_wave = utils.gen_wave_at_frequency(freq, self.samp_rate, sample_size)
             self.setCC(freq)
-            mean = self.measureCenterFreq(
-                sosfiltfilt_rust(self.get_chroma_bandpass(), fdc_wave)
-            )
+            mean = self.measureCenterFreq(sosfiltfilt_rust(self.get_chroma_bandpass(), fdc_wave))
             # print(ix, "%.02f %.02f" % (freq / 1e3, mean / 1e3))
             means = np.append(means, [[freq, mean]], axis=0)
 
@@ -181,17 +176,11 @@ class ChromaAFC:
                 # phase 0
                 -np.cos((twopi * het_wave_scale * self.samples) + phase_drift),
                 # phase 90 deg
-                -np.cos(
-                    (twopi * het_wave_scale * self.samples) + (np.pi / 2) + phase_drift
-                ),
+                -np.cos((twopi * het_wave_scale * self.samples) + (np.pi / 2) + phase_drift),
                 # phase 180 deg
                 -np.cos((twopi * het_wave_scale * self.samples) + np.pi + phase_drift),
                 # phase 270 deg
-                -np.cos(
-                    (twopi * het_wave_scale * self.samples)
-                    + (np.pi * 3 / 2)
-                    + phase_drift
-                ),
+                -np.cos((twopi * het_wave_scale * self.samples) + (np.pi * 3 / 2) + phase_drift),
             ],
             dtype=np.float32,
         )
@@ -293,9 +282,9 @@ class ChromaAFC:
         one_step_more = tune_freq + max_step
         one_step_less = tune_freq - max_step
 
-        if self.specsDistance(tune_freq) < self.specsDistance(
-            one_step_less
-        ) and self.specsDistance(tune_freq) < self.specsDistance(one_step_more):
+        if self.specsDistance(tune_freq) < self.specsDistance(one_step_less) and self.specsDistance(
+            tune_freq
+        ) < self.specsDistance(one_step_more):
             return_freq = tune_freq
         else:
             if self.specsDistance(one_step_more) < self.specsDistance(one_step_less):
@@ -309,14 +298,14 @@ class ChromaAFC:
         time_step = 1 / self.samp_rate
 
         # The FFT of the signal
-        sig_fft = fft(data)
+        sig_fft = rfft(data)
 
         # And the power (sig_fft is of complex dtype)
         power = np.abs(sig_fft) ** 2
         phase = np.angle(sig_fft)
 
         # The corresponding frequencies
-        sample_freq = fftfreq(data.size, d=time_step)
+        sample_freq = rfftfreq(data.size, d=time_step)
 
         # Plot the FFT power
         if self.fft_plot:
@@ -333,18 +322,18 @@ class ChromaAFC:
             plt.ylabel("power")
 
         # Find the peak frequency: we can focus on only the positive frequencies
-        pos_mask = np.where(sample_freq > 0)
-        freqs = sample_freq[pos_mask]
-        phases = phase[pos_mask]
+        freqs = sample_freq
+        phases = phase
         assert len(freqs) == len(phases)
 
         if self.on_linearization:
-            carrier_freq = freqs[power[pos_mask].argmax()]
+            power_argmax = power.argmax()
+            carrier_freq = freqs[power_argmax]
             peak_freq = carrier_freq
-            self.cc_phase = phase[power[pos_mask].argmax()]
+            self.cc_phase = phase[power_argmax]
         else:
             power_clip = np.clip(
-                power[pos_mask],
+                power,
                 a_min=max(power) * self.power_threshold,
                 a_max=max(power),
             )
@@ -367,9 +356,7 @@ class ChromaAFC:
             carrier_freq = self.fineTune(peak_freq, fine_tune_threshold)
 
             where_selected = np.where(sample_freq == carrier_freq)[0]
-            self.cc_phase = (
-                phase[where_selected][0] if len(phase[where_selected]) > 0 else 0
-            )
+            self.cc_phase = phase[where_selected][0] if len(phase[where_selected]) > 0 else 0
 
         # An inner plot to show the peak frequency
         if self.fft_plot:
@@ -377,7 +364,7 @@ class ChromaAFC:
 
             print(self.cc_phase)
             # print("Phase %.02f degrees" % (360 * self.cc_phase / twopi))
-            yvert_range = 2 * power[power[pos_mask].argmax()]
+            yvert_range = 2 * power[power.argmax()]
             plt.vlines(
                 peak_freq,
                 ymin=-yvert_range * self.power_threshold,
@@ -431,15 +418,12 @@ class ChromaAFC:
         )
         if comp_f != freq_cc_x:
             ldd.logger.warn(
-                "Chroma PLL range clipped at %.02f, measured %.02f"
-                % (freq_cc_x, comp_f)
+                "Chroma PLL range clipped at %.02f, measured %.02f" % (freq_cc_x, comp_f)
             )
 
         if adjustf:
             self.meas_stack.push(freq_cc_x)
-            freq_cc = (
-                freq_cc_x  # if len(self.meas_stack) < 2 else self.meas_stack[-2:][0]
-            )
+            freq_cc = freq_cc_x  # if len(self.meas_stack) < 2 else self.meas_stack[-2:][0]
             # print(self.meas_stack[-2:])
         else:
             freq_cc = self.cc_freq_mhz * 1e6
@@ -536,6 +520,4 @@ class ChromaAFC:
         ]
 
     def get_band_tolerance(self):
-        return (100 - self.max_f_dev_percents[0]) / 100, (
-            100 + self.max_f_dev_percents[1]
-        ) / 100
+        return (100 - self.max_f_dev_percents[0]) / 100, (100 + self.max_f_dev_percents[1]) / 100

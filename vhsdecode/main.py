@@ -46,6 +46,7 @@ supported_tape_formats = {
     "SVHS_ET",
     "UMATIC",
     "UMATIC_HI",
+    "UMATIC_SP",
     "BETAMAX",
     "BETAMAX_HIFI",
     "SUPERBETA",
@@ -60,6 +61,48 @@ supported_tape_formats = {
     "VHD",
     "VIDEO2000",
 }
+
+_SUPPORTED_IRE0_ADJUST_VALUES = {"hsync", "backporch"}
+
+
+def _parse_ire0_adjust(value):
+    parsed = value.lower()
+    if all(part.strip().lower() in _SUPPORTED_IRE0_ADJUST_VALUES for part in parsed.split(",")):
+        return parsed
+    raise argparse.ArgumentTypeError("Allowed values: hsync, backporch")
+
+
+def _normalize_ire0_adjust_args(raw_args):
+    normalized = []
+    i = 0
+    while i < len(raw_args):
+        token = raw_args[i]
+        if token == "--ire0_adjust":
+            normalized.append(token)
+            if i + 1 >= len(raw_args):
+                i += 1
+                continue
+
+            next_token = raw_args[i + 1]
+            if next_token.startswith("-"):
+                i += 1
+                continue
+
+            try:
+                _parse_ire0_adjust(next_token)
+                normalized.append(next_token)
+                i += 2
+                continue
+            except argparse.ArgumentTypeError:
+                # If the next token is not a valid ire0_adjust value, treat this
+                # as a flag-only invocation and keep the next token positional.
+                normalized.append("backporch")
+                i += 1
+                continue
+
+        normalized.append(token)
+        i += 1
+    return normalized
 
 
 def main(args=None, use_gui=False):
@@ -78,8 +121,7 @@ def main(args=None, use_gui=False):
     format_help = "Tape format - " + " ".join(supported_tape_formats) + "are supported"
 
     parser, debug_group = common_parser(
-        "Extracts video from RAW RF captures of colour-under & composite modulated"
-        " tapes",
+        "Extracts video from RAW RF captures of colour-under & composite modulated" " tapes",
         use_gui=use_gui,
     )
 
@@ -138,9 +180,16 @@ def main(args=None, use_gui=False):
     luma_group.add_argument(
         "--ire0_adjust",
         dest="ire0_adjust",
-        action="store_true",
+        nargs="?",
+        const="backporch",
         default=False,
-        help="Automatic adjust of ire0 based blanking level",
+        type=_parse_ire0_adjust,
+        help=(
+            "Automatically adjust video levels after vsync and TBC."
+            "\nAdd this flag with no arguments for the default, or supply one or more of the below options as a comma separated string. "
+            "\n  backporch [default] adjusts the black level based on the backporch level"
+            "\n  hsync               adjusts the level scaling based on the measured hsync / backporch ratio. This can correct automatic gain control issues with second generation tapes."
+        ),
     )
     luma_group.add_argument(
         "--high_boost",
@@ -161,7 +210,7 @@ def main(args=None, use_gui=False):
             "\n  Default is (video system lines / 2) i.e. NTSC=525/2, PAL=625/2, etc."
             "\n  Wow calculation is based on position of hsync pulses which is affected by the accuracy of the TBC. "
             "\n  If you see vertical brightness variations (banding), setting to a value larger than 0 will smooth the wow adjustment."
-        )
+        ),
     )
     luma_group.add_argument(
         "--wow_interpolation_method",
@@ -173,7 +222,7 @@ def main(args=None, use_gui=False):
             "\n  linear     [default]"
             "\n  quadratic"
             "\n  cubic"
-        )
+        ),
     )
     luma_group.add_argument(
         "--nodd",
@@ -296,7 +345,7 @@ def main(args=None, use_gui=False):
         dest="enable_color_killer",
         action="store_true",
         default=False,
-        help="Enables color killer, i.e. burst detection to enable/disable chroma decoding and hsync refinement."
+        help="Enables color killer, i.e. burst detection to enable/disable chroma decoding and hsync refinement.",
     )
     chroma_group.add_argument(
         "--no_comb",
@@ -320,10 +369,7 @@ def main(args=None, use_gui=False):
         "--dp",
         "--debug_plot",
         dest="debug_plot",
-        help=(
-            "Do a plot for the requested data, separated by whitespace. Current options"
-            " are: "
-        )
+        help=("Do a plot for the requested data, separated by whitespace. Current options" " are: ")
         + plot_options
         + ".",
     )
@@ -395,7 +441,13 @@ def main(args=None, use_gui=False):
         dest="field_order_action",
         default="detect",
         metavar="value",
-        type=lambda x: x if x in ["detect", "duplicate", "drop", "none"] else parser.error('--field_order_action must be one of ["detect", "duplicate", "drop", "none"]'),
+        type=lambda x: (
+            x
+            if x in ["detect", "duplicate", "drop", "none"]
+            else parser.error(
+                '--field_order_action must be one of ["detect", "duplicate", "drop", "none"]'
+            )
+        ),
         help=(
             "Decides how to handle field order discontinuities,\n"
             "  When the field order cadence is broken such that there are two Top or two Bottom fields.\n"
@@ -452,10 +504,7 @@ def main(args=None, use_gui=False):
         metavar="value",
         type=float,
         default=None,
-        help=(
-            "RF level fraction threshold for dropouts as percentage of average (in"
-            " decimal)."
-        ),
+        help=("RF level fraction threshold for dropouts as percentage of average (in" " decimal)."),
     )
     dodgroup.add_argument(
         "--dod_t_abs",
@@ -493,7 +542,9 @@ def main(args=None, use_gui=False):
         ),
     )
 
-    args = parser.parse_args(args)
+    raw_args = list(args) if args is not None else sys.argv[1:]
+    normalized_args = _normalize_ire0_adjust_args(raw_args)
+    args = parser.parse_args(normalized_args)
 
     try:
         filename, outname, firstframe, req_frames = get_basics(args)
@@ -521,10 +572,7 @@ def main(args=None, use_gui=False):
                 conflicts.append(outname + ext)
 
         if conflicts:
-            print(
-                "Existing decode files found, remove them or run command with"
-                " --overwrite"
-            )
+            print("Existing decode files found, remove them or run command with" " --overwrite")
             for conflict in conflicts:
                 print("\t", conflict)
             sys.exit(1)
@@ -641,9 +689,7 @@ def main(args=None, use_gui=False):
         logger.info("Using CPU backend: %s (%s)", backend.name, backend.reason)
 
     if check_debug():
-        logger.warning(
-            "Rust modules are compiled in debug mode! vhs-decode will run slower."
-        )
+        logger.warning("Rust modules are compiled in debug mode! vhs-decode will run slower.")
 
     signal.signal(signal.SIGINT, original_sigint_handler)
 
@@ -696,7 +742,9 @@ def main(args=None, use_gui=False):
             output_dir = os.path.dirname(os.path.abspath(outname))
             try:
                 free_space = shutil.disk_usage(output_dir).free
-                if free_space < 1024 * 1024 * 1024 * 10:  # 10GB, 500 fields_written needs around 675MB, 1G0B for some margin because there can be other things writing to the disk as well, the disk might fill before the next check otherwise.
+                if (
+                    free_space < 1024 * 1024 * 1024 * 10
+                ):  # 10GB, 500 fields_written needs around 675MB, 1G0B for some margin because there can be other things writing to the disk as well, the disk might fill before the next check otherwise.
                     print(
                         "\nLess than 10GB of free disk space is remaining, decoding paused. Decoding will resume once there is more space, or press Ctrl+C to exit.",
                         file=sys.stderr,

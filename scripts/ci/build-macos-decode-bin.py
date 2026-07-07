@@ -52,6 +52,8 @@ PyInstaller.__main__.run(
         "llvmlite",
         "--add-data",
         "vhsdecode/format_defs:vhsdecode/format_defs",
+        "--collect-data",
+        "lddecode",
         "--add-data",
         "assets:assets",
         "--hidden-import",

@@ -1,7 +1,9 @@
-See build instructions in main readme
+See build instructions in main README first, or go to the releases tab for self-contained binarys.
 
 # Building and installing vhs-decode from source using pipx
+
 ## Install all dependencies required by LD-Decode and VHS-Decode:
+
 Ubuntu/debian based (debian 12/Ubuntu 24.04 or newer base required):
 
     sudo apt install git python3-dev pipx ffmpeg
@@ -68,9 +70,9 @@ Build and install vhs-decode via pipx, using **one** of the below scripts.
 
     pipx install .[intel]
 
-### If updating or reinstalling, you may need to add the `--force` flag to overwrite/update the previous installation.
+### If updating or reinstalling, use the `--force` flag to overwrite/update the previous installation.
 
-    pipx install .[intel,hifi_gui_qt6] --force
+    pipx install --force '.[intel,hifi_gui_qt6]'
 
 Go back to the main directory with 
 
@@ -80,13 +82,34 @@ Go back to the main directory with
 ## How to Update
 
 
-To update your local repository enter `git pull` into the terminal while inside the vhs-decode directory, and then do `pipx install .[hifi_gui_qt6] --force`  - it will overwrite your previous installation and deploy the current version of the decoders.
+From inside the `vhs-decode` directory:
+
+    git pull
+    pipx install --force '.[hifi_gui_qt6]'
+
+If you use Intel-specific optimizations, run this instead:
+
+    pipx install --force '.[intel,hifi_gui_qt6]'
+
+If `pipx install --force` fails with a permission error on one or more activation scripts in `~/.local/pipx/venvs/vhs-decode/bin/`, fix permissions and reinstall:
+
+    chmod u+w ~/.local/pipx/venvs/vhs-decode/bin/activate ~/.local/pipx/venvs/vhs-decode/bin/activate.csh ~/.local/pipx/venvs/vhs-decode/bin/activate.fish ~/.local/pipx/venvs/vhs-decode/bin/Activate.ps1
+    pipx reinstall vhs_decode --python python3
+
+Verify the installed package and commands:
+
+    pipx list | sed -n '/package vhs_decode/,+12p'
+    ld-decode --version
+    ld-ldf-reader-py --version
 
 ## Usage
 
 
 Note with WSL2 & Ubuntu, `./` in front of applications and scripts may be needed to run them or to run scripts within the folder.
+
+
 ### Decode Launcher (Qt6)
+
 
 For a basic click-to-open launcher that lets you select common tools and open them in a terminal (or start native GUI tools), use:
 
@@ -110,8 +133,13 @@ You don't actually type `<` and `>` on your input & output files.
 
 # Build and install in a isolated python virtual environment
 
+
 ## Install all dependencies required by LD-Decode and VHS-Decode:
+
+
 ### Linux
+
+
   Ubuntu/debian based (debian 12/Ubuntu 24.04 or newer base required):
 
       sudo apt install git python3-dev pipx ffmpeg
@@ -128,7 +156,9 @@ You don't actually type `<` and `>` on your input & output files.
 
       source "$HOME/.cargo/env" && echo "Rust version: $(rustc --version)" && echo "Cargo version: $(cargo --version)"
       
+
 ### Windows
+
   1. Install Python 3.13
    * Download the [python installer](https://www.python.org/downloads/)
    * **Make sure to check the box requesting Python be added to the PATH**
@@ -150,6 +180,8 @@ open a termial where you want to put the source code
     
     
 ## Enter the virtual environment
+
+
 ### windows (powershell)
     
     .\vhs_decode_venv\Scripts\Activate.ps1
@@ -169,7 +201,7 @@ open a termial where you want to put the source code
     python -m pip install .[hifi_gui_qt6]
     
 
-you should now be able to run `vhs-decode`, `decode`, and `decode-launcher` , `hifi-decode --gui` etc
+You should now be able to run `vhs-decode`, `decode`, and `decode-launcher` , `hifi-decode --gui` etc
 
 You have to re-enter the command under "enter the virtual environent" to enter the python virtual environment and be able to access vhs-decode when you start a new session.
      
@@ -201,42 +233,7 @@ The build produces `./result` with the installed package and CLI tools.
 
 - Enter a dev shell with dependencies:
   - `nix develop`
-
-## Versioning
-
-The flake generates a PEP 440 compliant version string and writes it to `lddecode/version` during the build. The CLI `--version` output comes from that file and includes git commit and dirty status when available.
-
-## Documentation
-
-The project documentation lives in `docs/` and is built with [MkDocs Material](https://squidfunk.github.io/mkdocs-material/). All required dependencies (`mkdocs`, `mkdocs-material`, `mkdocs-awesome-nav`) are provided by the Nix dev shell.
-
-- Enter the dev shell first (if not already inside one):
-  - `nix develop`
-
-- Start a live-reload preview server at `http://127.0.0.1:8000/`:
-  - `mkdocs serve`
-
-- Build a static site into `site/`:
-  - `mkdocs build`
-
-- Build the docs as a Nix package (output in `./result/`):
-  - `nix build .#docs`
-
   
 ## Building tools (no longer hosted in this repo)
 
-install dependencies (ubuntu-based)
-
-    sudo apt install git qtbase5-dev libqwt-qt5-dev libfftw3-dev libavformat-dev libavcodec-dev libavutil-dev ffmpeg pv pkg-config make cmake sox pipx g++ python3-dev
-
-    
-Debian/Ubuntu does not have a qt6 version of qwt in repositories as of yet so you have to inform the build script to use Qt5 if both qt5 and qt6 are installed with `-DUSE_QT_VERSION=5` as it might otherwise try to compile with qt6 instead and failing to locate qwt. The option is otherwise not needed.
-
-
-Compile and Install ld-tools suite:
-
-    mkdir build2
-    cd build2
-    CXXFLAGS="-march=native" CFLAGS="-march=native" cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_QT_VERSION=5
-    make -j4
-    sudo make install
+Please see [tbc-tools](https://github.com/harrypm/tbc-tools) or [decode orc](github.com/simoninns/decode-orc/) for ld-decode only users.

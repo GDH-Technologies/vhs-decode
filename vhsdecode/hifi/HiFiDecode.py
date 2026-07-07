@@ -10,6 +10,8 @@ from time import perf_counter
 from setproctitle import setproctitle
 from multiprocessing import current_process
 from copy import deepcopy
+
+from vhsdecode.rust_utils import sosfiltfilt_rust
 import string
 from random import SystemRandom
 
@@ -20,15 +22,14 @@ from scipy.signal import (
     lfilter_zi,
     filtfilt,
     lfilter,
-    iirpeak,
-    iirnotch,
     butter,
     stft,
     istft,
     fftconvolve,
     find_peaks,
     freqz,
-    bilinear
+    bilinear,
+    cheby2
 )
 from scipy.interpolate import interp1d
 from soxr import ResampleStream, resample
@@ -67,13 +68,6 @@ DEMOD_DTYPE_NB = numba.types.float64
 
 BLOCKS_PER_SECOND = 2
 
-@dataclass
-class AFEParamsFront:
-    def __init__(self):
-        self.cutoff = 3e6
-        self.FDC = 1e6
-        self.transition_width = 700e3
-
 
 # assembles the current filter design on a pipe-able filter
 class FiltersClass:
@@ -89,38 +83,54 @@ class FiltersClass:
         return output
 
 
-class AFEBandPass:
-    def __init__(self, filters_params, sample_rate):
-        self.samp_rate = sample_rate
-        self.filter_params = filters_params
-
-        iir_lo = firdes_lowpass(
-            self.samp_rate,
-            self.filter_params.cutoff,
-            self.filter_params.transition_width,
-        )
-        iir_hi = firdes_highpass(
-            self.samp_rate, self.filter_params.FDC, self.filter_params.transition_width
-        )
-
-        # filter_plot(iir_lo[0], iir_lo[1], self.samp_rate, type="lopass", title="Front lopass")
-        self.filter_lo = FiltersClass(iir_lo[0], iir_lo[1], dtype=np.float64)
-        self.filter_hi = FiltersClass(iir_hi[0], iir_hi[1], dtype=np.float64)
-
-    def work(self, data):
-        return self.filter_lo.lfilt(self.filter_hi.filtfilt(data))
-
-
 @dataclass
 class AFEParamsVHS:
     def __init__(self):
-        self.VCODeviation = 150e3
+        # IEC 60774-2 pg.13 (5.4 Recording characteristics, Frequency deviation)
+        self.LCarrierDeviation = 150e3
+        self.RCarrierDeviation = 150e3
+
+        # Carson's bandwidth rule: 2 * (peak_frequency_deviation + highest frequency)
+        notch_padding = 35.753125e3
+        self.LNotchWidth = 2 * (self.LCarrierDeviation + notch_padding)
+        self.RNotchWidth = 2 * (self.RCarrierDeviation + notch_padding)
+
+        # Notch Padding Tuning Procedure:
+        # 1. Get the baseline data
+        #    a. Pick a test sample. Ideally one that has high fidelity, high frequencies, or sibilance (a tape with noisy 's').
+        #    b. Decode Before Change:
+        #       * `Decode A`: Decode the sample with the original parameter
+        #    c. Pick an initial direction you think the parameter needs to be tuned to
+        #    d. Open Audacity, or an editor of your choice
+        # 2. Tune the parameter
+        #    a. Change the parameter in the code
+        #    b. Decode After Change:
+        #       * `Decode B`: Decode the sample with the changed parameter
+        #    c. Import the two audio files (before and after)
+        #       * Must be same length, and have the same amplitude
+        #    d. Reduce amplitude of `Decode A` and `Decode A` by -6db
+        #    e. Mix down `Decode A` and `Decode A` to create `Decode A + `Decode B`
+        #    f. Invert phase of `Decode A + `Decode B`
+        #    g. Increase amplitude of `Decode A` and `Decode A` by +6db
+        #    h. Mix down `Decode A` and `Decode A + `Decode B` to create `Decode B - Decode A`
+        #    i. Visually inspect `Decode B - Decode A` against `Decode A` and `Decode B` to determine which sample adds more noise
+        #       * Any noise that appears in the subtraction only exists in one of the two clips
+        #    j. After deciding which clip is better, pick a new parameter that is closer to the better clip
+        #       * When narrowing in between two parameters, a bisect search helps to speed up the process
+        #    k. With the new parameter, go to step `a` and repeat until you've completed the bisect search
+        #       * Generally `Decode B` will become your new baseline (`Decode A`)
 
 
 @dataclass
 class AFEParams8mm:
     def __init__(self):
-        self.VCODeviation = 100e3
+        # IEC 60843-1 pg.71 (6.2.3 FM audio signal recording, Maximum deviation)
+        self.LCarrierDeviation = 100e3 # main channel deviation +-100kHz
+        self.RCarrierDeviation = 50e3 # sub channel deviation +-50kHz
+
+        self.LNotchWidth = 2 * (self.LCarrierDeviation + 20e3)
+        self.RNotchWidth = 1.5 * self.RCarrierDeviation # narrower notch for sub channel
+
         self.LCarrierRef = 1.5e6
         self.RCarrierRef = 1.7e6
 
@@ -131,7 +141,6 @@ class AFEParamsPALVHS(AFEParamsVHS):
         super().__init__()
         self.LCarrierRef = 1.4e6
         self.RCarrierRef = 1.8e6
-        self.Hfreq = 15.625e3
 
 
 @dataclass
@@ -157,52 +166,108 @@ class AFEParamsPAL8mm(AFEParams8mm):
         self.Hfreq = 15.625e3
 
 
+@staticmethod
+def get_standard(
+    format, system, afe_left_carrier_deviation, afe_right_carrier_deviation, afe_left_carrier, afe_right_carrier
+):
+    if format == "vhs":
+        if system == "p":
+            field_rate = 50
+            standard = AFEParamsPALVHS()
+        elif system == "n":
+            field_rate = 59.94
+            standard = AFEParamsNTSCVHS()
+    elif format == "8mm":
+        if system == "p":
+            field_rate = 50
+            standard = AFEParamsPAL8mm()
+        elif system == "n":
+            field_rate = 59.94
+            standard = AFEParamsNTSC8mm()
+
+    if afe_left_carrier_deviation != 0:
+        standard.LCarrierDeviation = afe_left_carrier_deviation
+    if afe_right_carrier_deviation != 0:
+        standard.RCarrierDeviation = afe_right_carrier_deviation
+    if afe_left_carrier != 0:
+        standard.LCarrierRef = afe_left_carrier
+    if afe_right_carrier != 0:
+        standard.RCarrierRef = afe_right_carrier
+
+    return standard, field_rate
+
+
+from scipy.signal import chirp
+def plot_responses(*filters, n=2**20):
+    plt.figure()
+
+    # time axis
+    t = np.arange(n)
+
+    for i, filt in enumerate(filters):
+
+        fs = filt.samp_rate
+        t_sec = t / fs
+
+        # log sweep from DC-ish to Nyquist (adjust as needed)
+        f0 = 10          # start freq (Hz)
+        f1 = fs / 2 * 0.9  # end freq (Hz)
+
+        x = chirp(t_sec, f0=f0, f1=f1, t1=t_sec[-1], method='logarithmic')
+
+        # run through filter
+        y = filt.work(x)
+
+        # FFT-based transfer estimate
+        X = np.fft.rfft(x)
+        Y = np.fft.rfft(y)
+
+        H = Y / (X + 1e-12)
+        f = np.fft.rfftfreq(n, 1 / fs)
+
+        plt.plot(
+            f / 1e6,
+            20 * np.log10(np.abs(H) + 1e-12),
+            label=f"Filter {i}"
+        )
+
+    plt.title("Filter Frequency Response (Sweep Method)")
+    plt.xlabel("Frequency (MHz)")
+    plt.ylabel("Magnitude (dB)")
+    plt.grid(True)
+    plt.xlim(0, 10)
+    plt.legend()
+    plt.show()
+
+
 class AFEFilterable:
     def __init__(self, filters_params, sample_rate, channel=0):
         self.samp_rate = sample_rate
         self.filter_params = filters_params
-        d = abs(self.filter_params.LCarrierRef - self.filter_params.RCarrierRef)
-        QL = self.filter_params.LCarrierRef / (4 * self.filter_params.VCODeviation)
-        QR = self.filter_params.RCarrierRef / (4 * self.filter_params.VCODeviation)
-        if channel == 0:
-            iir_front_peak = iirpeak(
-                self.filter_params.LCarrierRef, QL, fs=self.samp_rate
-            )
-            iir_notch_other = iirnotch(
-                self.filter_params.RCarrierRef, QR, fs=self.samp_rate
-            )
-            iir_notch_image = iirnotch(
-                self.filter_params.LCarrierRef - d, QR, fs=self.samp_rate
-            )
-        else:
-            iir_front_peak = iirpeak(
-                self.filter_params.RCarrierRef, QR, fs=self.samp_rate
-            )
-            iir_notch_other = iirnotch(
-                self.filter_params.LCarrierRef, QL, fs=self.samp_rate
-            )
-            iir_notch_image = iirnotch(
-                self.filter_params.RCarrierRef - d, QL, fs=self.samp_rate
-            )
 
-        self.filter_reject_other = FiltersClass(
-            iir_notch_other[0], iir_notch_other[1], dtype=DEMOD_DTYPE_NP
-        )
-        self.filter_band = FiltersClass(
-            iir_front_peak[0], iir_front_peak[1], dtype=DEMOD_DTYPE_NP
-        )
-        self.filter_reject_image = FiltersClass(
-            iir_notch_image[0], iir_notch_image[1], dtype=DEMOD_DTYPE_NP
+        if channel == 0:
+            bandpass_width = self.filter_params.LNotchWidth
+            center = self.filter_params.LCarrierRef
+        else:
+            bandpass_width = self.filter_params.RNotchWidth
+            center = self.filter_params.RCarrierRef
+
+        bandpass_low = center - bandpass_width
+        bandpass_high = center + bandpass_width
+
+        self.bandpass = cheby2(
+            N=22,
+            rs=220,
+            Wn=[bandpass_low, bandpass_high],
+            btype="bandpass",
+            fs=sample_rate,
+            output="sos",
         )
 
     def work(self, data):
-        return self.filter_band.filtfilt(
-            self.filter_reject_other.filtfilt(self.filter_reject_image.filtfilt(data))
-        )
+        return sosfiltfilt_rust(self.bandpass, data)
 
-QUADRATURE_LP_ORDER = 5
-
-class FMdemod:
+class FMDiscriminator:
     def __init__(
         self, sample_rate, carrier_center, deviation, max_iq_len, type
     ):
@@ -216,14 +281,10 @@ class FMdemod:
         self.min_float = float_info.min + float_info.epsneg
 
         if self.type == DEMOD_QUADRATURE:
-            quadrature_lp_b, quadrature_lp_a = butter(QUADRATURE_LP_ORDER, self.carrier / self.sample_rate / 2)
-            self.quadrature_lp_b = quadrature_lp_b.astype(DEMOD_DTYPE_NP)
-            self.quadrature_lp_a = quadrature_lp_a.astype(DEMOD_DTYPE_NP)
-        
             iq_len = self._get_min_iq_length(max_iq_len)
             self.i_osc = np.empty(iq_len, dtype=DEMOD_DTYPE_NP, order="C")
             self.q_osc = np.empty(iq_len, dtype=DEMOD_DTYPE_NP, order="C")
-            FMdemod._generate_iq_oscillators(
+            FMDiscriminator._generate_iq_oscillators(
                 self.i_osc,
                 self.q_osc,
                 self.carrier,
@@ -286,22 +347,25 @@ class FMdemod:
                 numba.types.float32,
                 numba.types.float32,
                 numba.types.float32,
+                numba.types.int32,
                 numba.types.int32
             ),
             (
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
+                numba.types.Array(numba.types.float64, 1, "C"),
                 NumbaAudioArray,
                 numba.types.float32,
                 numba.types.float32,
                 numba.types.float32,
+                numba.types.int32,
                 numba.types.int32
             ),
             (
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "A"),
+                numba.types.Array(numba.types.float32, 1, "A"),
                 NumbaAudioArray,
                 numba.types.float32,
                 numba.types.float32,
                 numba.types.float32,
+                numba.types.int32,
                 numba.types.int32
             ),
         ],
@@ -309,13 +373,14 @@ class FMdemod:
         fastmath=True,
         nogil=True,
     )
-    def demod_hilbert(analytic_signal, output, min_float, max_float, sample_rate, deviation):
+    def demod_hilbert(analytic_signal, output, min_float, max_float, sample_rate, carrier, deviation):
         two_pi = 2 * pi
         analytic_signal_value = 0
         analytic_signal_value_prev = 0
         discont = pi
         ph_correct = 0
         ph_correct_prev = 0
+        carrier_scale = carrier / deviation
 
         i = 1
         instantaneous_frequency_len = len(output)
@@ -348,7 +413,7 @@ class FMdemod:
 
             # FMdemod.unwrap_hilbert
             out = (ph_correct - ph_correct_prev) / two_pi * sample_rate / deviation # np.diff(instantaneous_phase) / (2.0 * pi) * sample_rate
-            output[i - 1] = max(min_float, min(max_float, out))
+            output[i - 1] = max(min_float, min(max_float, out - carrier_scale))
             ph_correct_prev = ph_correct
             i += 1
 
@@ -356,28 +421,22 @@ class FMdemod:
     @njit(
         [
             (
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
+                numba.types.Array(numba.types.float32, 1, "C"),
                 NumbaAudioArray,
                 numba.types.float32,
                 numba.types.float32,
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
-                numba.types.int32,
                 numba.types.int32,
                 numba.types.int32,
             ),
             (
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "A"),
+                numba.types.Array(numba.types.float32, 1, "A"),
                 NumbaAudioArray,
                 numba.types.float32,
                 numba.types.float32,
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
-                numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
-                numba.types.int32,
                 numba.types.int32,
                 numba.types.int32,
             ),
@@ -393,123 +452,70 @@ class FMdemod:
         max_float,
         i_osc,
         q_osc,
-        filter_b,
-        filter_a,
         sample_rate,
-        carrier,
         deviation,
     ):
-        # Numba optimized implementation of:
-        #
-        # # mix in  i/q
-        # i_signal = in_rf * i_osc
-        # q_signal = in_rf * q_osc
-        #
-        # # low pass filter
-        # i_filtered = lfilter(filter_b, filter_a, i_signal)
-        # q_filtered = lfilter(filter_b, filter_a, q_signal)
-        #
-        # # unwrap angles
-        # phase = np.arctan2(q_filtered, i_filtered)
-        # inst_freq = np.diff(np.unwrap(phase)) / (2 * pi * (1 / sample_rate))
-        # demod = inst_freq - carrier
-
         # constants
         two_pi = 2 * pi
         phase_scale = sample_rate / (two_pi * deviation)
-        carrier_scaled = carrier / deviation
+
         iq_len = len(i_osc)
         rf_len = len(in_rf)
 
-        #
-        # low pass filter history
-        #
-        i_in_hist = np.zeros(QUADRATURE_LP_ORDER, dtype=np.float64)
-        q_in_hist = np.zeros(QUADRATURE_LP_ORDER, dtype=np.float64)
-        i_filtered_hist = np.zeros(QUADRATURE_LP_ORDER, dtype=np.float64)
-        q_filtered_hist = np.zeros(QUADRATURE_LP_ORDER, dtype=np.float64)
+        # sign always start positive, iq index always starts at 0
+        prev_i = in_rf[0] * i_osc[0]
+        prev_q = in_rf[0] * q_osc[0]
 
-        prev_angle = 0  # doesn't matter since the final chunks have overlap
-        prev_unwrapped = prev_angle
-
-        for i in range(1, rf_len - QUADRATURE_LP_ORDER):
-            #
-            # mix in i/q, reflect the sine and cosine
-            #
+        for i in range(1, rf_len):
+            # i/q is only the positive side of the wave, and only one half rotation is stored
+            # * the index of the buffer loops around twice for one full rotation
             iq_index = i % iq_len
+            # * sign flips between the first and second loop (1st rotation: positive; 2nd rotation: negative)
             sign = 1 - 2 * ((i // iq_len) & 1)
-
+            # * flip the rf sign, to avoid extra multiplications below
             rf_signed = in_rf[i] * sign
+
             i_in = rf_signed * i_osc[iq_index]
             q_in = rf_signed * q_osc[iq_index]
 
-            #
-            # low pass filter
-            #
-            i_filtered = filter_b[0] * i_in
-            q_filtered = filter_b[0] * q_in
+            # complex-conjugate discriminator, avoids phase error accumulation when wrapping the phase with amplitude
+            imag = q_in * prev_i - i_in * prev_q
+            real = i_in * prev_i + q_in * prev_q
 
-            i_filtered += filter_b[QUADRATURE_LP_ORDER] * i_in_hist[QUADRATURE_LP_ORDER - 1] - filter_a[QUADRATURE_LP_ORDER] * i_filtered_hist[QUADRATURE_LP_ORDER - 1]
-            q_filtered += filter_b[QUADRATURE_LP_ORDER] * q_in_hist[QUADRATURE_LP_ORDER - 1] - filter_a[QUADRATURE_LP_ORDER] * q_filtered_hist[QUADRATURE_LP_ORDER - 1]
+            # angular difference
+            delta = atan2(imag, real)
 
-            for f_idx in range(QUADRATURE_LP_ORDER - 2, -1, -1):
-                next_f_idx = f_idx + 1
-                b = filter_b[next_f_idx]
-                a = filter_a[next_f_idx]
-                i_filtered += b * i_in_hist[f_idx] - a * i_filtered_hist[f_idx]
-                q_filtered += b * q_in_hist[f_idx] - a * q_filtered_hist[f_idx]
-
-                # Shift histories forward
-                i_in_hist[next_f_idx] = i_in_hist[f_idx]
-                i_filtered_hist[next_f_idx] = i_filtered_hist[f_idx]
-
-                q_in_hist[next_f_idx] = q_in_hist[f_idx]
-                q_filtered_hist[next_f_idx] = q_filtered_hist[f_idx]
-
-            i_in_hist[0] = i_in
-            i_filtered_hist[0] = i_filtered
-
-            q_in_hist[0] = q_in
-            q_filtered_hist[0] = q_filtered
-
-            #
-            # unwrap angles
-            #
-            current_angle = atan2(q_filtered, i_filtered)
-            delta = current_angle - prev_angle
-            delta += two_pi * ((delta < -pi) - (delta > pi))
-            unwrapped = prev_unwrapped + delta
-
-            out = carrier_scaled + delta * phase_scale
+            # scale up to deviation
+            out = delta * phase_scale
 
             out_demod[i - 1] = min(max(out, min_float), max_float)
 
-            prev_angle = current_angle
-            prev_unwrapped = unwrapped
+            prev_i = i_in
+            prev_q = q_in
 
+    # estimate carrier frequency deviation from phase changes in the I/Q reference frame
+    # which is like a series of +- values for clean signal, i.e. a fixed carrair wave)
     def work(self, input: np.array, output: np.array):
         if self.type == DEMOD_HILBERT:
-            FMdemod.compute_analytic_signal(input)
-            FMdemod.demod_hilbert(
+            FMDiscriminator.compute_analytic_signal(input)
+            FMDiscriminator.demod_hilbert(
                 input,
                 output,
                 self.min_float,
                 self.max_float,
                 np.float32(self.sample_rate),
+                self.carrier,
                 self.deviation,
             )
         elif self.type == DEMOD_QUADRATURE:
-            FMdemod.demod_quadrature(
+            FMDiscriminator.demod_quadrature(
                 input,
                 output,
                 self.min_float,
                 self.max_float,
                 self.i_osc,
                 self.q_osc,
-                self.quadrature_lp_b,
-                self.quadrature_lp_a,
                 self.sample_rate,
-                self.carrier,
                 self.deviation,
             )
 
@@ -724,46 +730,75 @@ class SpectralNoiseReduction:
 
 class DCBlocker:
     def __init__(self, sample_rate, cutoff):
-        # Compute pole R so cutoff is approximately fc Hz:
-        R = 1 - (2 * np.pi * cutoff) / sample_rate
-        if R < 0:
-            R = 0
-        if R > 0.999999:
-            R = 0.999999  # numerical stability
+        stages = 3
 
-        self.R = R
+        # Per-stage cutoff scaling (correct cascade compensation)
+        scale = 1.0 / np.sqrt(2.0**(1.0 / stages) - 1.0)
+        stage_cutoff = cutoff * scale
 
-        # State
-        self.prev_x = 0.0
-        self.prev_y = 0.0
+        self.R = np.exp(-2 * np.pi * stage_cutoff / sample_rate)
+
+        # Stage 1 state
+        self.x1 = np.float64(0.0)
+        self.y1 = np.float64(0.0)
+
+        # Stage 2 state
+        self.x2 = np.float64(0.0)
+        self.y2 = np.float64(0.0)
+
+        # Stage 3 state
+        self.x3 = np.float64(0.0)
+        self.y3 = np.float64(0.0)
 
     @staticmethod
     @njit(
         [
-            numba.types.UniTuple(numba.types.float32, 2)(
+            numba.types.UniTuple(numba.types.float64, 6)(
                 NumbaAudioArray,
-                numba.types.float32,
-                numba.types.float32,
-                numba.types.float32
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64
             )
         ],
         cache=True,
         fastmath=True,
         nogil=True,
     )
-    def dc_block(audio, px, py, R):
-        for i in range(len(audio)):
-            y = audio[i] - px + R * py
+    def dc_block(audio, x1, y1, x2, y2, x3, y3, R):
+        for i in range(audio.shape[0]):
+            x = audio[i]
 
-            px = audio[i]
-            py = y
+            # Stage 1
+            y1_new = x - x1 + R * y1
+            x1 = x
+            y1 = y1_new
 
-            audio[i] = y
+            # Stage 2
+            y2_new = y1_new - x2 + R * y2
+            x2 = y1_new
+            y2 = y2_new
 
-        return px, py
+            # Stage 3
+            y3_new = y2_new - x3 + R * y3
+            x3 = y2_new
+            y3 = y3_new
+
+            audio[i] = y3_new
+
+        return x1, y1, x2, y2, x3, y3
 
     def process(self, audio):
-        self.prev_x, self.prev_y = DCBlocker.dc_block(audio, self.prev_x, self.prev_y, self.R)
+        self.x1, self.y1, self.x2, self.y2, self.x3, self.y3 = self.dc_block(
+            audio,
+            self.x1, self.y1,
+            self.x2, self.y2,
+            self.x3, self.y3,
+            self.R,
+        )
 
 class Deemphasis:
     def __init__(
@@ -889,15 +924,6 @@ class Expander:
 
         self.hold_state = 0
 
-        self.lowpass_iirb, self.lowpass_iira = firdes_lowpass(
-            self.audio_rate,
-            min(weighting_low_pass, self.audio_rate / 2 - 1), # limit to nyquist
-            weighting_low_pass_transition,
-        )
-        self.WeightedLowcut = FiltersClass(
-            np.array(self.lowpass_iirb), np.array(self.lowpass_iira), dtype=np.float64
-        )
-
         # weighted filter for envelope detector
         self.weighting_T1 = weighting_low_tau
         self.weighting_T2 = weighting_high_tau
@@ -928,7 +954,7 @@ class Expander:
     @njit(
         [(
             NumbaAudioArray,
-            numba.types.Array(numba.types.float64, 1, "C"),
+            numba.types.Array(numba.types.float32, 1, "C"),
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
@@ -939,7 +965,7 @@ class Expander:
             numba.types.boolean
         )],
         cache=True,
-        fastmath=True,
+        fastmath=False,
         nogil=True
     )
     def expand(
@@ -1012,11 +1038,9 @@ class Expander:
         return env_lin, hold_state
 
     def process(self, pre_in, audio_out):
-        side_chain = self.WeightedLowcut.lfilt(pre_in)
-
         # high pass weighted input to envelope detector
         self.zi_x, self.zi_y = Deemphasis.lfilt_inplace(
-            side_chain,
+            pre_in,
             self.env_iirb[0],
             self.env_iirb[1],
             self.env_iira[1],
@@ -1026,7 +1050,7 @@ class Expander:
 
         self.env_lin, self.hold_state = Expander.expand(
             audio_out,
-            side_chain,
+            pre_in,
             self.env_lin,
             self.atkCoeff,
             self.relCoeff,
@@ -1069,8 +1093,7 @@ class HiFiAudioParams:
     headswitch_peak_prominence_limit: int
     headswitch_interpolation_padding: int
     headswitch_interpolation_neighbor_range: int
-    hs_b: float
-    hs_a: float
+    hs_sos: float
     doc_mode: bool
     doc_cutoff_freq: int
     doc_window_size: int
@@ -1103,7 +1126,6 @@ class HiFiDecode:
         self.audio_rate: int = 192000
         self.audio_final_rate: int = int(options["audio_rate"])
 
-        self.rfBandPassParams = AFEParamsFront()
         (
             self.ifresample_numerator,
             self.ifresample_denominator,
@@ -1137,17 +1159,11 @@ class HiFiDecode:
         self.set_block_sizes()
         self._set_block_overlap()
 
-        self.bandpassRF = AFEBandPass(self.rfBandPassParams, self.input_rate)
-        a_iirb, a_iira = firdes_lowpass(
-            self.if_rate, self.audio_rate * 3 / 4, self.audio_rate / 3, order_limit=10
-        )
-        self.preAudioResampleL = FiltersClass(a_iirb, a_iira, dtype=np.float64)
-        self.preAudioResampleR = FiltersClass(a_iirb, a_iira, dtype=np.float64)
-
-        self.standard, self.field_rate = HiFiDecode.get_standard(
+        self.standard, self.field_rate = get_standard(
             options["format"],
             options["standard"],
-            options["afe_vco_deviation"],
+            options["afe_left_carrier_deviation"],
+            options["afe_right_carrier_deviation"],
             options["afe_left_carrier"],
             options["afe_right_carrier"],
         )
@@ -1158,13 +1174,11 @@ class HiFiDecode:
         ]
         self.headswitch_passes = 1
         self.headswitch_signal_rate = self.audio_rate
-        self.headswitch_hz = (
-            self.field_rate
-        )  # frequency used to fit peaks to the expected headswitching interval
+        # frequency used to fit peaks to the expected headswitching interval
+        self.headswitch_hz = self.field_rate  
         self.headswitch_drift_hz = self.field_rate * 0.1  # +- 10% drift is normal
-        self.headswitch_cutoff_freq = (
-            25000  # filter cutoff frequency for peak detection
-        )
+        # filter cutoff frequency for peak detection
+        self.headswitch_cutoff_freq = 28000
         # upper limit for peak promience which is used to widen the interpoation boundary
         # when a peak is detected. Head switching peaks may exceed this number; however,
         # the width of the interpolation will only be expanded up to this number.
@@ -1177,13 +1191,14 @@ class HiFiDecode:
         # time range to look for neighboring noise when a head switch event is detected
         # this helps to determine the correct width of the interpolation
         self.headswitch_interpolation_neighbor_range = 200e-6
-        hs_b, hs_a = butter(
-            3,
-            self.headswitch_cutoff_freq / (0.5 * self.headswitch_signal_rate),
+        hs_sos = cheby2(
+            22,
+            rs=200,
+            Wn=self.headswitch_cutoff_freq,
             btype="highpass",
+            output="sos",
+            fs=self.headswitch_signal_rate
         )
-        hs_b = np.float32(hs_b)
-        hs_a = np.float32(hs_a)
 
         # hifi carrier loss results in broadband noise
         # mute the audio when this broadband noise exists above the audible frequencies
@@ -1215,6 +1230,9 @@ class HiFiDecode:
         if not bias_guess:
             # defer until carriers can be determined
             self.afeL, self.afeR = self._get_afe()
+
+            # plot_responses(self.afeL, self.afeR)
+            # exit()
 
             self.fmL, self.fmR = self._get_fm_demod(
                 self.if_rate, self.options["demod_type"]
@@ -1259,8 +1277,7 @@ class HiFiDecode:
             headswitch_peak_prominence_limit=self.headswitch_peak_prominence_limit,
             headswitch_interpolation_padding=self.headswitch_interpolation_padding,
             headswitch_interpolation_neighbor_range=self.headswitch_interpolation_neighbor_range,
-            hs_b=hs_b,
-            hs_a=hs_a,
+            hs_sos=hs_sos,
             doc_mode=self.doc_mode,
             doc_cutoff_freq=self.doc_cutoff_freq,
             doc_window_size=self.doc_window_size,
@@ -1272,34 +1289,6 @@ class HiFiDecode:
             doc_fft_start=self.doc_fft_start,
             doc_fft_end=self.doc_fft_end,
         )
-
-    @staticmethod
-    def get_standard(
-        format, system, afe_vco_deviation, afe_left_carrier, afe_right_carrier
-    ):
-        if format == "vhs":
-            if system == "p":
-                field_rate = 50
-                standard = AFEParamsPALVHS()
-            elif system == "n":
-                field_rate = 59.94
-                standard = AFEParamsNTSCVHS()
-        elif format == "8mm":
-            if system == "p":
-                field_rate = 50
-                standard = AFEParamsPAL8mm()
-            elif system == "n":
-                field_rate = 59.94
-                standard = AFEParamsNTSC8mm()
-
-        if afe_vco_deviation != 0:
-            standard.VCODeviation = afe_vco_deviation
-        if afe_left_carrier != 0:
-            standard.LCarrierRef = afe_left_carrier
-        if afe_right_carrier != 0:
-            standard.RCarrierRef = afe_right_carrier
-
-        return standard, field_rate
 
     def calculate_block_sizes(self, block_size=None):
         # block overlap and edge discard
@@ -1443,17 +1432,17 @@ class HiFiDecode:
 
     def _get_fm_demod(self, if_rate, demod_type):
         return (
-            FMdemod(
+            FMDiscriminator(
                 if_rate,
                 self.standard.LCarrierRef,
-                self.standard.VCODeviation,
+                self.standard.LCarrierDeviation,
                 self.initialBlockResampledSize,
                 demod_type
             ),
-            FMdemod(
+            FMDiscriminator(
                 if_rate,
                 self.standard.RCarrierRef,
-                self.standard.VCODeviation,
+                self.standard.RCarrierDeviation,
                 self.initialBlockResampledSize,
                 demod_type
             )
@@ -1485,8 +1474,7 @@ class HiFiDecode:
         progressB = TimeProgressBar(len(blocks), len(blocks))
 
         for i in range(len(blocks)):
-            data = self.bandpassRF.work(blocks[i])
-            data = data.astype(REAL_DTYPE, copy=False)
+            data = blocks[i].astype(REAL_DTYPE, copy=False)
 
             data = resample(
                 data,
@@ -1510,8 +1498,8 @@ class HiFiDecode:
             meanL.push(np.mean(preL))
             meanR.push(np.mean(preR))
 
-            meanLResult = meanL.pull() * self.standard.VCODeviation
-            meanRResult = meanR.pull() * self.standard.VCODeviation
+            meanLResult = meanL.pull() * self.standard.LCarrierDeviation + self.standard.LCarrierRef + 1e6
+            meanRResult = meanR.pull() * self.standard.RCarrierDeviation + self.standard.RCarrierRef + 1e6
 
             progressB.label = "Carrier L %.06f MHz, R %.06f MHz" % (
                 meanLResult / 10e5,
@@ -1529,9 +1517,9 @@ class HiFiDecode:
 
         return meanLResult, meanRResult
 
-    def log_bias(self):
-        devL = (self.standard_original.LCarrierRef - self.standard.LCarrierRef) / 1e3
-        devR = (self.standard_original.RCarrierRef - self.standard.RCarrierRef) / 1e3
+    def log_bias(self, dcL, dcR):
+        devL = dcL * self.standard.LCarrierDeviation / 1e3
+        devR = dcR * self.standard.RCarrierDeviation / 1e3
 
         if self.audio_process_params.decode_mode == AUDIO_MODE_MONO_L:
             print("Bias L %.02f kHz" % (devL), end=" ")
@@ -1578,36 +1566,21 @@ class HiFiDecode:
 
     def auto_fine_tune(
         self, dcL: float, dcR: float
-    ) -> Tuple[AFEFilterable, AFEFilterable, FMdemod, FMdemod]:
+    ) -> Tuple[AFEFilterable, AFEFilterable, FMDiscriminator, FMDiscriminator]:
         if self.audio_process_params.decode_mode != AUDIO_MODE_MONO_R:
-            left_carrier_dc_offset = (
-                self.standard.LCarrierRef - dcL * self.standard.VCODeviation
-            )
-            left_carrier_updated = self.standard.LCarrierRef - round(left_carrier_dc_offset)
-            self.standard.LCarrierRef = max(
-                min(left_carrier_updated, self.standard_original.LCarrierRef + 10e3),
-                self.standard_original.LCarrierRef - 10e3,
-            )
+            left_carrier_updated = round(self.standard_original.LCarrierRef + dcL * self.standard.LCarrierDeviation)
+
+            self.standard.LCarrierRef = min(max(left_carrier_updated, self.standard_original.LCarrierRef - 10e3), self.standard_original.LCarrierRef + 10e3)
             
         if self.audio_process_params.decode_mode != AUDIO_MODE_MONO_L:
-            right_carrier_dc_offset = (
-                self.standard.RCarrierRef - dcR * self.standard.VCODeviation
-            )
-            right_carrier_updated = self.standard.RCarrierRef - round(
-                right_carrier_dc_offset
-            )
-            self.standard.RCarrierRef = max(
-                min(right_carrier_updated, self.standard_original.RCarrierRef + 10e3),
-                self.standard_original.RCarrierRef - 10e3,
-            )
+            right_carrier_updated = round(self.standard_original.RCarrierRef + dcR * self.standard.RCarrierDeviation)
 
-        # auto fine tune can't adjust quadrature demodulation since the i/q oscillators are generated once, disabling for now
-        # use the --bg option to adjust for bias at the beginning of the decode
-        if self.options["demod_type"] == DEMOD_HILBERT:
-            self.afeL, self.afeR = self._get_afe()
-            self.fmL, self.fmR = self._get_fm_demod(
-                self.if_rate, self.options["demod_type"]
-            )
+            self.standard.RCarrierRef = min(max(right_carrier_updated, self.standard_original.RCarrierRef - 10e3), self.standard_original.RCarrierRef + 10e3)
+
+        self.afeL, self.afeR = self._get_afe()
+        self.fmL, self.fmR = self._get_fm_demod(
+            self.if_rate, self.options["demod_type"]
+        )
 
     @staticmethod
     @njit(
@@ -1630,8 +1603,8 @@ class HiFiDecode:
         audio_process_params: HiFiAudioParams,
     ) -> Tuple[list[Tuple[float, float, float, float]], np.array, np.array]:
         # remove audible frequencies to avoid detecting them as peaks
-        filtered_signal = filtfilt(
-            audio_process_params.hs_b, audio_process_params.hs_a, audio
+        filtered_signal = sosfiltfilt_rust(
+            audio_process_params.hs_sos, audio
         )
         filtered_signal_abs = abs(filtered_signal)
         filtered_signal_mean, filtered_signal_std_dev = HiFiDecode.mean_stddev(
@@ -2205,7 +2178,7 @@ class HiFiDecode:
 
     @staticmethod
     def demod_process_audio(
-        filtered: np.array, fm: FMdemod, audio_process_params: HiFiAudioParams, audio_resampler, measure_perf: bool
+        filtered: np.array, fm: FMDiscriminator, audio_process_params: HiFiAudioParams, audio_resampler, measure_perf: bool
     ) -> Tuple[np.array, float, dict]:
         perf_measurements = {
             "start_demod": 0,
@@ -2224,11 +2197,13 @@ class HiFiDecode:
         if measure_perf:
             perf_measurements["start_demod"] = perf_counter()
         audio = np.empty(len(filtered), dtype=REAL_DTYPE, order="C")
+
+        # estimate carrier frequency deviation from phase changes in the I/Q reference frame
         fm.work(filtered, audio)
         if measure_perf:
             perf_measurements["end_demod"] = perf_counter()
 
-        # resample if sample rate to audio sample rate
+        # band-limited sinc interpolation to audio rate (i.e. downsample from IF rate to audio rate)
         if measure_perf:
             perf_measurements["start_audio_resample"] = perf_counter()
         audio: np.array = audio_resampler.resample_chunk(audio, True)
@@ -2277,20 +2252,12 @@ class HiFiDecode:
         rf_data: np.array,
         measure_perf: bool = False,
     ) -> Tuple[int, np.array, np.array]:
-        # Do a bandpass filter to remove any the video components from the signal.
-        if measure_perf:
-            start_bandpassRF = perf_counter()
-
-        rf_data = self.bandpassRF.work(rf_data)
-        if measure_perf:
-            end_bandpassRF = perf_counter()
-
         # resample from input sample rate to if sample rate
         if measure_perf:
             start_if_resampler = perf_counter()
 
         if self.options["demod_type"] == DEMOD_HILBERT:
-            rf_data = rf_data.astype(np.float32, copy=False)
+            rf_data = rf_data.astype(REAL_DTYPE, copy=False)
             rf_data_resampled = self.if_resampler.resample_chunk(rf_data, True)
             self.if_resampler.clear()
         else:
@@ -2298,19 +2265,6 @@ class HiFiDecode:
 
         if measure_perf:
             end_if_resampler = perf_counter()
-
-        # low pass filter to remove any remaining high frequency noise
-        # disabled since it interferes with head switching noise detection
-        # preL = self.preAudioResampleL.lfilt(preL)
-        # preR = self.preAudioResampleR.lfilt(preR)
-        # preL = preL.astype(REAL_DTYPE, copy=False)
-        # preR = preR.astype(REAL_DTYPE, copy=False)
-
-        # with ProcessPoolExecutor(2) as stereo_executor:
-        #     audioL_future = stereo_executor.submit(HiFiDecode.audio_process, preL, self.audio_process_params)
-        #     audioR_future = stereo_executor.submit(HiFiDecode.audio_process, preR, self.audio_process_params)
-        #     preL, dcL = audioL_future.result()
-        #     preR, dcR = audioR_future.result()
 
         if measure_perf:
             start_carrier_filter = perf_counter()
@@ -2365,9 +2319,10 @@ class HiFiDecode:
             start_auto_fine_tune = perf_counter()
         if self.options["auto_fine_tune"]:
             self.auto_fine_tune(dcL, dcR)
-            self.log_bias()
         if measure_perf:
             end_auto_fine_tune = perf_counter()
+
+        self.log_bias(dcL, dcR)
 
         # mix for various stereo modes
         if measure_perf:
@@ -2394,7 +2349,6 @@ class HiFiDecode:
         ), f"Audio data must be in {REAL_DTYPE} format, instead got {preR.dtype}"
 
         if measure_perf:
-            duration_bandpassRF = end_bandpassRF - start_bandpassRF
             duration_if_resampler = end_if_resampler - start_if_resampler
             duration_carrier_filter = end_carrier_filter - start_carrier_filter
 
@@ -2448,7 +2402,6 @@ class HiFiDecode:
             duration_stereo_mix = end_stereo_mix - start_stereo_mix
             duration_adjust_gain = end_adjust_gain - start_adjust_gain
             durations = [
-                ("duration_bandpassRF", duration_bandpassRF),
                 ("duration_if_resampler", duration_if_resampler),
                 ("duration_carrier_filter", duration_carrier_filter),
                 ("duration_demod_l", duration_demod_l),
@@ -2474,7 +2427,7 @@ class HiFiDecode:
 
     @staticmethod
     def hifi_decode_worker(
-        decoder_in_queue, decoder_out_queue, decode_options, standard
+        decoder_in_queue, decoder_out_queue, decode_options, standard, numa_node
     ):
         setproctitle(current_process().name)
         measure_perf = False

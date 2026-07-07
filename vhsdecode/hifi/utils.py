@@ -4,32 +4,290 @@ import numba
 import numpy as np
 from dataclasses import dataclass
 
+import io
 import string
 from random import SystemRandom
 
 from cProfile import Profile
 import ctypes
+import mmap
+import os
+from functools import lru_cache
+from itertools import cycle
+import atexit
+
 from pstats import SortKey, Stats
 
-BLOCK_DTYPE = np.int16
 REAL_DTYPE = np.float32
 ALIGNMENT = 64
 
 NumbaAudioArray = numba.types.Array(numba.types.float32, 1, "C")
 
+# The STREAMINFO total_samples field is 36 bits wide, so captures longer than
+# 2^36 samples (~28.6 minutes at 40 MSps) overflow it and the stored count
+# wraps around modulo 2^36. libsndfile trusts this count and stops reading
+# there, truncating the decode. See parse_flac_streaminfo() below.
+
+
+def parse_flac_streaminfo(file_path):
+    """Parse the FLAC STREAMINFO metadata block directly from the file.
+
+    Returns a dict with the STREAMINFO fields and the offset where the
+    audio frames start, or None if the file could not be parsed as FLAC.
+    """
+    try:
+        with open(file_path, "rb") as f:
+            if f.read(4) != b"fLaC":
+                return None
+
+            streaminfo = None
+            audio_offset = None
+            while True:
+                header = f.read(4)
+                if len(header) != 4:
+                    return None
+                is_last = bool(header[0] & 0x80)
+                block_type = header[0] & 0x7F
+                length = int.from_bytes(header[1:4], "big")
+
+                if block_type == 0 and streaminfo is None:
+                    data = f.read(length)
+                    if len(data) < 34:
+                        return None
+                    streaminfo = data
+                else:
+                    f.seek(length, io.SEEK_CUR)
+
+                if is_last:
+                    audio_offset = f.tell()
+                    break
+
+            if streaminfo is None or audio_offset is None:
+                return None
+
+            d = streaminfo
+            return {
+                "min_blocksize": int.from_bytes(d[0:2], "big"),
+                "max_blocksize": int.from_bytes(d[2:4], "big"),
+                "min_framesize": int.from_bytes(d[4:7], "big"),
+                "max_framesize": int.from_bytes(d[7:10], "big"),
+                "sample_rate": (d[10] << 12) | (d[11] << 4) | (d[12] >> 4),
+                "channels": ((d[12] >> 1) & 0x7) + 1,
+                "bits_per_sample": (((d[12] & 1) << 4) | (d[13] >> 4)) + 1,
+                "total_samples": ((d[13] & 0xF) << 32)
+                | int.from_bytes(d[14:18], "big"),
+                "audio_offset": audio_offset,
+            }
+    except OSError:
+        return None
+
+
+class NUMA:
+    MPOL_BIND = 2
+    MPOL_MF_MOVE = 2
+    MPOL_MF_STRICT = 1
+    SYS_mbind = 237 # x86_64
+
+    _libnuma = None
+    _libc = None
+
+    class Bitmask(ctypes.Structure):
+        _fields_ = [
+            ("size", ctypes.c_ulong),
+            ("maskp", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    BitmaskPtr = ctypes.POINTER(Bitmask)
+
+    @classmethod
+    def _load_libnuma(cls):
+        if cls._libnuma is not None:
+            return cls._libnuma
+
+        try:
+            libnuma = ctypes.CDLL("libnuma.so.1")
+
+            # Configure required NUMA symbols in one place to keep this loader concise.
+            signatures = {
+                "numa_available": (None, ctypes.c_int),
+                "numa_max_node": (None, ctypes.c_int),
+                "numa_node_to_cpus": ([ctypes.c_int, ctypes.c_void_p], ctypes.c_int),
+                "numa_run_on_node": ([ctypes.c_int], ctypes.c_int),
+                "numa_set_preferred": ([ctypes.c_int], None),
+                "numa_allocate_nodemask": ([], cls.BitmaskPtr),
+                "numa_bitmask_free": ([cls.BitmaskPtr], None),
+                "numa_bitmask_clearall": ([cls.BitmaskPtr], cls.BitmaskPtr),
+                "numa_bitmask_setbit": ([cls.BitmaskPtr, ctypes.c_uint], cls.BitmaskPtr),
+                "numa_run_on_node_mask": ([cls.BitmaskPtr], ctypes.c_int),
+                "numa_tonode_memory": ([ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int], ctypes.c_long),
+            }
+
+            for symbol_name, (argtypes, restype) in signatures.items():
+                symbol = getattr(libnuma, symbol_name)
+                if argtypes is not None:
+                    symbol.argtypes = argtypes
+                symbol.restype = restype
+
+            cls._libnuma = libnuma
+            return libnuma
+
+        except Exception:
+            cls._libnuma = None
+            return None
+
+    @classmethod
+    def _load_libc(cls):
+        if cls._libc is not None:
+            return cls._libc
+
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+            cls._libc = libc
+            return libc
+
+        except Exception:
+            cls._libc = None
+            return None
+
+    @classmethod
+    def _available(cls):
+        libnuma = cls._load_libnuma()
+        libc = cls._load_libc()
+        return bool(libc and libnuma and libnuma.numa_available() >= 0)
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def _nodes(cls):
+        if not cls._available():
+            return cycle([0])
+
+        try:
+            max_node = cls._libnuma.numa_max_node()
+            nodes = [n for n in range(max_node + 1) if cls._cpus_for_node(n)]
+            return cycle(nodes or [0])
+        except Exception:
+            return cycle([0])
+
+    @classmethod
+    @lru_cache(maxsize=128)
+    def _cpus_for_node(cls, node: int):
+        if not cls._available():
+            return None
+
+        lib = cls._libnuma
+        MAX_CPUS = 1024
+
+        words = MAX_CPUS // (8 * ctypes.sizeof(ctypes.c_ulong))
+        mask = (ctypes.c_ulong * words)()
+
+        bm = cls.Bitmask()
+        bm.size = MAX_CPUS
+        bm.maskp = mask
+
+        if lib.numa_node_to_cpus(node, ctypes.byref(bm)) != 0:
+            return None
+
+        cpus = set()
+        bits = 8 * ctypes.sizeof(ctypes.c_ulong)
+
+        for cpu in range(MAX_CPUS):
+            word = mask[cpu // bits]
+            bit = cpu % bits
+            if word & (1 << bit):
+                cpus.add(cpu)
+
+        return cpus
+
+    @classmethod
+    def next_node(cls):
+        return next(cls._nodes())
+
+    @classmethod
+    def bind_process(cls, node: int) -> bool:
+        if not cls._available():
+            return False
+
+        cpus = cls._cpus_for_node(node)
+        if not cpus:
+            return False
+
+        mask = None
+        try:
+            cpus = cls._cpus_for_node(node)
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+
+            mask = cls._libnuma.numa_allocate_nodemask()
+            if not mask:
+                return False
+
+            cls._libnuma.numa_bitmask_clearall(mask)
+            cls._libnuma.numa_bitmask_setbit(mask, node)
+
+            cls._libnuma.numa_run_on_node_mask(mask)
+            cls._libnuma.numa_set_preferred(node)
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                if mask:
+                    cls._libnuma.numa_bitmask_free(mask)
+            except Exception:
+                pass
+
+    @classmethod
+    def get_shared_memory(
+        cls,
+        name: str,
+        size: int,
+        numa_node: int | None = None,
+    ):
+        shm = SharedMemory(name=name, size=size, create=True)
+
+        if cls._available() and numa_node is not None:
+            try:
+                buf = shm.buf
+
+                addr = ctypes.addressof(
+                    ctypes.c_char.from_buffer(buf)
+                )
+
+                nodemask = ctypes.c_ulong(1 << numa_node)
+
+                cls._libc.syscall(
+                    NUMA.SYS_mbind,
+                    ctypes.c_void_p(addr),
+                    ctypes.c_ulong(len(buf)),
+                    NUMA.MPOL_BIND,
+                    ctypes.byref(nodemask),
+                    ctypes.sizeof(nodemask) * 8,
+                    NUMA.MPOL_MF_MOVE | NUMA.MPOL_MF_STRICT,
+                )
+
+                for offset in range(0, len(buf), mmap.PAGESIZE):
+                    buf[offset] = 0
+
+            except Exception:
+                pass
+
+        return shm
+
 @dataclass
 class DecoderState:
-    def __init__(self, decoder, buffer_name, block_frames_read, block_size, block_num, is_last_block):
+    def __init__(self, decoder, buffer_name, block_frames_read, block_size, block_num, is_last_block, numa_node):
         block_sizes = decoder.set_block_sizes(block_size)
         block_overlap = decoder.get_block_overlap()
 
         self.name = buffer_name
+        self.numa_node = numa_node
         self.block_num = block_num
         self.is_last_block = is_last_block
 
         # block data for input rf
         self.block_frames_read = block_frames_read
-        self.block_dtype = BLOCK_DTYPE
+        self.block_dtype = REAL_DTYPE
         self.block_size = block_sizes["block_size"]
         self.block_overlap = block_overlap["block_overlap"]
         self.block_read_overlap = block_overlap["block_read_overlap"]
@@ -43,6 +301,7 @@ class DecoderState:
         self.block_audio_final_overlap = block_overlap["block_audio_final_overlap"]
 
     name: str
+    numa_node: int
     block_num: int
     is_last_block: bool
 
@@ -87,6 +346,7 @@ class PostProcessorSharedMemory:
         self.close = self.shared_memory.close
         self.unlink = self.shared_memory.unlink
 
+        self.numa_node = decoder_state.numa_node
         self.audio_dtype = decoder_state.audio_dtype
         self.channel_len = decoder_state.block_audio_final_len
         self.audio_dtype_item_size = np.dtype(self.audio_dtype).itemsize
@@ -126,7 +386,7 @@ class PostProcessorSharedMemory:
         self.r_post_bytes = self.r_post_len * self.audio_dtype_item_size
 
     @staticmethod
-    def get_shared_memory(channel_size, name, audio_dtype=REAL_DTYPE):
+    def get_shared_memory(channel_size, name, audio_dtype=REAL_DTYPE, numa_node=None):
         byte_size = (
             to_aligned_offset(channel_size * np.dtype(audio_dtype).itemsize * 4)
             + ALIGNMENT * 16
@@ -142,7 +402,7 @@ class PostProcessorSharedMemory:
         # this instance must be saved in a variable that persists on both processes
         # Windows will remove the shared memory if it garbage collects the handle in any of the processes it is open in
         # https://stackoverflow.com/a/63717188
-        return SharedMemory(size=byte_size, name=name, create=True)
+        return NUMA.get_shared_memory(name, byte_size, numa_node)
 
     def get_pre_left(self) -> np.array:
         return np.ndarray(
@@ -201,6 +461,7 @@ class DecoderSharedMemory:
         self.close = self.shared_memory.close
         self.unlink = self.shared_memory.unlink
 
+        self.numa_node = decoder_state.numa_node
         self.block_dtype = decoder_state.block_dtype
         self.block_dtype_item_size = np.dtype(self.block_dtype).itemsize
 
@@ -254,13 +515,12 @@ class DecoderSharedMemory:
         block_overlap,
         block_audio_final_size,
         name,
-        block_dtype=BLOCK_DTYPE,
-        audio_dtype=REAL_DTYPE,
+        numa_node=None,
     ):
         max_audio_size = (
             block_audio_final_size + to_aligned_offset(block_audio_final_size)
-        ) * np.dtype(audio_dtype).itemsize
-        block_size = (block_size + block_overlap * 2) * np.dtype(block_dtype).itemsize
+        ) * np.dtype(REAL_DTYPE).itemsize
+        block_size = (block_size + block_overlap * 2) * np.dtype(REAL_DTYPE).itemsize
 
         byte_size = max(max_audio_size, block_size)
 
@@ -274,7 +534,7 @@ class DecoderSharedMemory:
         # this instance must be saved in a variable that persists on both processes
         # Windows will remove the shared memory if it garbage collects the handle in any of the processes it is open in
         # https://stackoverflow.com/a/63717188
-        return SharedMemory(size=byte_size, name=name, create=True)
+        return NUMA.get_shared_memory(name, byte_size, numa_node)
 
     ## Decoder methods
 
@@ -352,57 +612,6 @@ class DecoderSharedMemory:
     @staticmethod
     @njit(
         numba.types.void(
-            numba.types.Array(numba.int16, 1, "C"),
-            numba.types.Array(numba.int16, 1, "C"),
-            numba.types.int64,
-        ),
-        cache=True,
-        fastmath=True,
-        nogil=True,
-    )
-    def copy_data_int16(src: np.array, dst: np.array, length: int):
-        for i in range(length):
-            dst[i] = src[i]
-
-    @staticmethod
-    @njit(
-        numba.types.void(
-            numba.types.Array(numba.int16, 1, "C"),
-            numba.types.Array(numba.int16, 1, "C"),
-            numba.types.int64,
-            numba.types.int64,
-        ),
-        cache=True,
-        fastmath=True,
-        nogil=True,
-    )
-    def copy_data_dst_offset_int16(
-        src: np.array, dst: np.array, dst_offset: int, length: int
-    ):
-        for i in range(length):
-            dst[i + dst_offset] = src[i]
-
-    @staticmethod
-    @njit(
-        numba.types.void(
-            numba.types.Array(numba.int16, 1, "C"),
-            numba.types.Array(numba.int16, 1, "C"),
-            numba.types.int64,
-            numba.types.int64,
-        ),
-        cache=True,
-        fastmath=True,
-        nogil=True,
-    )
-    def copy_data_src_offset_int16(
-        src: np.array, dst: np.array, src_offset: int, length: int
-    ):
-        for i in range(length):
-            dst[i] = src[i + src_offset]
-
-    @staticmethod
-    @njit(
-        numba.types.void(
             NumbaAudioArray,
             NumbaAudioArray,
             numba.types.int64,
@@ -447,3 +656,9 @@ def profile(function) -> int:
         return return_code
 
     return run_profiler
+
+def cleanup_process(process):
+    atexit.unregister(process.terminate)
+    atexit.unregister(process.join)
+    process.terminate()
+    process.join()

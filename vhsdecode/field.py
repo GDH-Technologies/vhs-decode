@@ -1,5 +1,4 @@
 import numpy as np
-from numba import njit
 
 import lddecode.core as ldd
 import lddecode.utils as lddu
@@ -10,10 +9,7 @@ import vhsdecode.sync as sync
 import vhsdecode.formats as formats
 from vhsdecode.doc import detect_dropouts_rf
 from vhsdecode.addons.resync import Pulse
-from vhsdecode.chroma import (
-    decode_chroma,
-    decode_chroma_phase_rotation
-)
+from vhsdecode.chroma import decode_chroma, decode_chroma_phase_rotation
 
 from vhsdecode.debug_plot import plot_data_and_pulses
 
@@ -52,17 +48,13 @@ def y_comb(data, line_len, limit):
     return data
 
 
-def field_class_from_formats(system: str, tape_format: str):
+def field_class_from_formats(system: str, tape_format: str) -> ldd.Field:
     field_class = None
     if system == "PAL":
-        if tape_format in ["UMATIC", "UMATIC_HI", "EIAJ", "VCR", "VCR_LP"]:
+        if tape_format in ["UMATIC", "UMATIC_HI", "UMATIC_SP", "EIAJ", "VCR", "VCR_LP"]:
             # These use simple chroma downconversion and filters.
             field_class = FieldPALUMatic
-        elif (
-            tape_format == "TYPEC"
-            or tape_format == "TYPEB"
-            or tape_format == "QUADRUPLEX"
-        ):
+        elif tape_format == "TYPEC" or tape_format == "TYPEB" or tape_format == "QUADRUPLEX":
             field_class = FieldPALTypeC
         elif tape_format == "SVHS" or tape_format == "SVHS_ET":
             field_class = FieldPALSVHS
@@ -71,35 +63,25 @@ def field_class_from_formats(system: str, tape_format: str):
         elif tape_format == "VIDEO8" or tape_format == "HI8":
             field_class = FieldPALVideo8
         else:
-            if (
-                tape_format != "VHS"
-                and tape_format != "VHSHQ"
-                and tape_format != "VIDEO2000"
-            ):
-                ldd.logger.info(
-                    "Tape format unimplemented for PAL, using VHS field class."
-                )
+            if tape_format != "VHS" and tape_format != "VHSHQ" and tape_format != "VIDEO2000":
+                ldd.logger.info("Tape format unimplemented for PAL, using VHS field class.")
             field_class = FieldPALVHS
     elif system == "NTSC":
-        if tape_format == "UMATIC":
+        if tape_format in ["UMATIC", "UMATIC_HI", "UMATIC_SP", "EIAJ"]:
             field_class = FieldNTSCUMatic
         elif tape_format == "TYPEC" or tape_format == "TYPEB" or tape_format == "VHD":
             field_class = FieldNTSCTypeC
         elif tape_format == "SVHS" or tape_format == "SVHS_ET":
             field_class = FieldNTSCSVHS
         elif (
-            tape_format == "BETAMAX"
-            or tape_format == "BETAMAX_HIFI"
-            or tape_format == "SUPERBETA"
+            tape_format == "BETAMAX" or tape_format == "BETAMAX_HIFI" or tape_format == "SUPERBETA"
         ):
             field_class = FieldNTSCBetamax
         elif tape_format == "VIDEO8" or tape_format == "HI8":
             field_class = FieldNTSCVideo8
         else:
             if tape_format != "VHS" and tape_format != "VHSHQ":
-                ldd.logger.info(
-                    "Tape format unimplemented for NTSC, using VHS field class."
-                )
+                ldd.logger.info("Tape format unimplemented for NTSC, using VHS field class.")
             field_class = FieldNTSCVHS
     elif (system == "PAL_M" or system == "NLINHA") and tape_format == "VHS":
         field_class = FieldPALMVHS
@@ -117,7 +99,7 @@ def field_class_from_formats(system: str, tape_format: str):
             raise Exception("819 line not implemented for format!", format)
 
     if not field_class:
-        raise Exception("Unknown video system!", system)
+        raise Exception("Unknown video system and/or tape format combination!", system)
 
     return field_class
 
@@ -155,9 +137,7 @@ def _to_type_list(raw_pulses, lt_hsync, lt_eq, lt_vsync):
 
 
 def _add_type_to_pulses(raw_pulses, lt_hsync, lt_eq, lt_vsync):
-    return list(
-        map(lambda p: (_len_to_type(p, lt_hsync, lt_eq, lt_vsync), p), raw_pulses)
-    )
+    return list(map(lambda p: (_len_to_type(p, lt_hsync, lt_eq, lt_vsync), p), raw_pulses))
 
 
 def _to_seq(type_list, num_pulses, skip_bad=True):
@@ -296,19 +276,17 @@ def get_line0_fallback(
     LONG_PULSE_MIN = 0.35 * linelen
 
     if DEBUG_PRINT:
-        print(f"get_line0_fallback called. Raw pulses: {len(raw_pulses)}, Filtered: {len(filtered_pulses)} (filtering logic skipped for debug print)")
+        print(
+            f"get_line0_fallback called. Raw pulses: {len(raw_pulses)}, Filtered: {len(filtered_pulses)} (filtering logic skipped for debug print)"
+        )
 
     # First try: Find end of long sync pulses
     i = 15
     while line_0 is None and i < (len(filtered_pulses) - 2):
-        disPPspp = (
-            filtered_pulses[i - 1].start - filtered_pulses[i - 2].start
-        ) / linelen
+        disPPspp = (filtered_pulses[i - 1].start - filtered_pulses[i - 2].start) / linelen
         dispPSpp = (filtered_pulses[i].start - filtered_pulses[i - 1].start) / linelen
         disppSPp = (filtered_pulses[i + 1].start - filtered_pulses[i].start) / linelen
-        disppsPP = (
-            filtered_pulses[i + 2].start - filtered_pulses[i + 1].start
-        ) / linelen
+        disppsPP = (filtered_pulses[i + 2].start - filtered_pulses[i + 1].start) / linelen
         if (
             abs(disPPspp - 0.5) < 0.06
             and abs(dispPSpp - 0.5) < 0.06
@@ -323,17 +301,13 @@ def get_line0_fallback(
             # we measure the distance of three pulses in previous field to start of long pulses
             # to check if this is first or second field
             # as there may be broken sync pulses we scan backwards
-            measured_linelen = (disPPspp + dispPSpp + disppSPp + disppsPP) * (
-                linelen / 2
-            )
+            measured_linelen = (disPPspp + dispPSpp + disppSPp + disppsPP) * (linelen / 2)
             line_offset = None
             # count "half lines" for detecting top/bottom field:
             half_lines = 0
             j = i
             while j < i + 9:
-                dis = (
-                    filtered_pulses[j + 1].start - filtered_pulses[j].start
-                ) / linelen
+                dis = (filtered_pulses[j + 1].start - filtered_pulses[j].start) / linelen
                 if (
                     abs(dis - 0.5) < 0.06
                     and filtered_pulses[j].len < SHORT_PULSE_MAX
@@ -373,20 +347,11 @@ def get_line0_fallback(
                 for d in range(15, min(i, 30) + 1):
                     pp = np.array(
                         [
-                            (
-                                filtered_pulses[i - 2].start
-                                - filtered_pulses[i - d].start
-                            )
+                            (filtered_pulses[i - 2].start - filtered_pulses[i - d].start)
                             / measured_linelen,
-                            (
-                                filtered_pulses[i - 2].start
-                                - filtered_pulses[i - d + 1].start
-                            )
+                            (filtered_pulses[i - 2].start - filtered_pulses[i - d + 1].start)
                             / measured_linelen,
-                            (
-                                filtered_pulses[i - 2].start
-                                - filtered_pulses[i - d + 2].start
-                            )
+                            (filtered_pulses[i - 2].start - filtered_pulses[i - d + 2].start)
                             / measured_linelen,
                         ]
                     )
@@ -423,9 +388,7 @@ def get_line0_fallback(
 
             if line_offset is not None:
                 # in case we cannot find a matching pulse, we can still use this prediction
-                line_0_est = (
-                    filtered_pulses[i - 2].start - line_offset * measured_linelen
-                )
+                line_0_est = filtered_pulses[i - 2].start - line_offset * measured_linelen
                 if DEBUG_PRINT:
                     print(
                         f"1. End of long sync pulses, pred: {line_0_est}, First-Field: {first_field}, confidence: {first_field_confidence}"
@@ -446,14 +409,10 @@ def get_line0_fallback(
     while (line_0 is None or line_0 > (linelen * (frame_lines - 1) / 2)) and i < (
         len(filtered_pulses) - 2
     ):
-        disPPspp = (
-            filtered_pulses[i - 1].start - filtered_pulses[i - 2].start
-        ) / linelen
+        disPPspp = (filtered_pulses[i - 1].start - filtered_pulses[i - 2].start) / linelen
         dispPSpp = (filtered_pulses[i].start - filtered_pulses[i - 1].start) / linelen
         disppSPp = (filtered_pulses[i + 1].start - filtered_pulses[i].start) / linelen
-        disppsPP = (
-            filtered_pulses[i + 2].start - filtered_pulses[i + 1].start
-        ) / linelen
+        disppsPP = (filtered_pulses[i + 2].start - filtered_pulses[i + 1].start) / linelen
 
         if (
             abs(disPPspp - 0.5) < 0.06
@@ -469,9 +428,7 @@ def get_line0_fallback(
             # we measure the distance of three pulses in previous field to start of long pulses
             # to check if this is first or second field
             # as there may be broken syncs we scan backwards
-            measured_linelen = (disPPspp + dispPSpp + disppSPp + disppsPP) * (
-                linelen / 2
-            )
+            measured_linelen = (disPPspp + dispPSpp + disppSPp + disppsPP) * (linelen / 2)
             line_offset = None
             phase_cnt = [0, 0, 0]
             for d in range(10, min(i, 25) + 1):
@@ -479,15 +436,9 @@ def get_line0_fallback(
                     [
                         (filtered_pulses[i - 2].start - filtered_pulses[i - d].start)
                         / measured_linelen,
-                        (
-                            filtered_pulses[i - 2].start
-                            - filtered_pulses[i - d + 1].start
-                        )
+                        (filtered_pulses[i - 2].start - filtered_pulses[i - d + 1].start)
                         / measured_linelen,
-                        (
-                            filtered_pulses[i - 2].start
-                            - filtered_pulses[i - d + 2].start
-                        )
+                        (filtered_pulses[i - 2].start - filtered_pulses[i - d + 2].start)
                         / measured_linelen,
                     ]
                 )
@@ -514,9 +465,7 @@ def get_line0_fallback(
 
             if line_offset is not None:
                 # in case we cannot find a matching pulse, we can still use this prediction
-                line_0_est = (
-                    filtered_pulses[i - 2].start - line_offset * measured_linelen
-                )
+                line_0_est = filtered_pulses[i - 2].start - line_offset * measured_linelen
                 if DEBUG_PRINT:
                     print(
                         f"2. Begin of long sync pulses, pred: {line_0_est}, First-Field: {_first_field}, confidence: {_first_field_confidence}"
@@ -543,21 +492,19 @@ def get_line0_fallback(
     while (line_0 is None or line_0 > (linelen * (frame_lines - 1) / 2)) and i < (
         len(filtered_pulses) - 2
     ):
-        disPpspp = (
-            filtered_pulses[i - 2].start - filtered_pulses[i - 3].start
-        ) / linelen
-        disPPspp = (
-            filtered_pulses[i - 1].start - filtered_pulses[i - 2].start
-        ) / linelen
+        disPpspp = (filtered_pulses[i - 2].start - filtered_pulses[i - 3].start) / linelen
+        disPPspp = (filtered_pulses[i - 1].start - filtered_pulses[i - 2].start) / linelen
         dispPSpp = (filtered_pulses[i].start - filtered_pulses[i - 1].start) / linelen
         disppSPp = (filtered_pulses[i + 1].start - filtered_pulses[i].start) / linelen
-        disppsPP = (
-            filtered_pulses[i + 2].start - filtered_pulses[i + 1].start
-        ) / linelen
+        disppsPP = (filtered_pulses[i + 2].start - filtered_pulses[i + 1].start) / linelen
 
         if DEBUG_PRINT and i < 60:
-             print(f"Try 3 scan i={i}: Pps={disPpspp:.3f} PPs={disPPspp:.3f} pSP={dispPSpp:.3f} ppS={disppSPp:.3f} pps={disppsPP:.3f}")
-             print(f"  lens: {filtered_pulses[i - 2].len:.1f}, {filtered_pulses[i - 1].len:.1f}, {filtered_pulses[i].len:.1f}")
+            print(
+                f"Try 3 scan i={i}: Pps={disPpspp:.3f} PPs={disPPspp:.3f} pSP={dispPSpp:.3f} ppS={disppSPp:.3f} pps={disppsPP:.3f}"
+            )
+            print(
+                f"  lens: {filtered_pulses[i - 2].len:.1f}, {filtered_pulses[i - 1].len:.1f}, {filtered_pulses[i].len:.1f}"
+            )
 
         # Relaxed check: ignore the first interval (disPpspp) to handle dropouts better
         check_strict = (
@@ -568,7 +515,7 @@ def get_line0_fallback(
             and abs(disppsPP - 1.0) < 0.06
         )
         check_relaxed = (
-            # abs(disPpspp - 0.5) < 0.06 and 
+            # abs(disPpspp - 0.5) < 0.06 and
             abs(disPPspp - 0.5) < 0.06
             and abs(dispPSpp - 0.5) < 0.06
             and abs(disppSPp - 1.0) < 0.06
@@ -586,16 +533,10 @@ def get_line0_fallback(
             # we measure the distance of three pulses in previous field to start of long pulses
             # to check if this is first or second field
             # as there may be broken sync pulses we scan backwards
-            measured_linelen = (disPPspp + dispPSpp + disppSPp + disppsPP) * (
-                linelen / 3.0
-            )
+            measured_linelen = (disPPspp + dispPSpp + disppSPp + disppsPP) * (linelen / 3.0)
             line_offset = None
-            eq_pulse_len = (
-                filtered_pulses[i - 2].len + filtered_pulses[i - 1].len
-            ) / 2.0
-            hsync_pulse_len = (
-                filtered_pulses[i + 1].len + filtered_pulses[i + 2].len
-            ) / 2.0
+            eq_pulse_len = (filtered_pulses[i - 2].len + filtered_pulses[i - 1].len) / 2.0
+            hsync_pulse_len = (filtered_pulses[i + 1].len + filtered_pulses[i + 2].len) / 2.0
 
             if hsync_pulse_len / eq_pulse_len > 1.75:
                 if filtered_pulses[i].len < eq_pulse_len * 1.25:
@@ -616,12 +557,10 @@ def get_line0_fallback(
                     _first_field_confidence = (
                         80 if filtered_pulses[i].len > hsync_pulse_len * 0.9 else 60
                     )
-                    
+
             if line_offset is not None:
                 # in case we cannot find a matching pulse, we can still use this prediction
-                line_0_est = (
-                    filtered_pulses[i - 2].start - line_offset * measured_linelen
-                )
+                line_0_est = filtered_pulses[i - 2].start - line_offset * measured_linelen
                 if DEBUG_PRINT:
                     print(
                         f"3. End of blanking, pred: {line_0_est}, First-Field: {_first_field}, confidence: {_first_field_confidence}"
@@ -632,11 +571,13 @@ def get_line0_fallback(
                     first_field_confidence_backup = _first_field_confidence
                 # find pulse
                 if DEBUG_PRINT:
-                     print(f"Searching for pulse near {line_0_est} (range {max(0, i - 25)} to {i})")
+                    print(f"Searching for pulse near {line_0_est} (range {max(0, i - 25)} to {i})")
                 for j in range(max(0, i - 25), i) if relaxed else range(max(0, i - 20), i - 4):
                     diff = abs(filtered_pulses[j].start - line_0_est) / linelen
                     if DEBUG_PRINT:
-                        print(f"    Checking pulse {j}: start={filtered_pulses[j].start}, est={line_0_est}, diff_lines={diff:.4f}")
+                        print(
+                            f"    Checking pulse {j}: start={filtered_pulses[j].start}, est={line_0_est}, diff_lines={diff:.4f}"
+                        )
 
                     if diff < 0.08:
                         if (
@@ -654,17 +595,11 @@ def get_line0_fallback(
     while (line_0 is None or line_0 > (linelen * (frame_lines - 1) / 2)) and i < (
         len(filtered_pulses) - 3
     ):
-        disPPspp = (
-            filtered_pulses[i - 1].start - filtered_pulses[i - 2].start
-        ) / linelen
+        disPPspp = (filtered_pulses[i - 1].start - filtered_pulses[i - 2].start) / linelen
         dispPSpp = (filtered_pulses[i].start - filtered_pulses[i - 1].start) / linelen
         disppSPp = (filtered_pulses[i + 1].start - filtered_pulses[i].start) / linelen
-        disppsPP = (
-            filtered_pulses[i + 2].start - filtered_pulses[i + 1].start
-        ) / linelen
-        disppspP = (
-            filtered_pulses[i + 3].start - filtered_pulses[i + 2].start
-        ) / linelen
+        disppsPP = (filtered_pulses[i + 2].start - filtered_pulses[i + 1].start) / linelen
+        disppspP = (filtered_pulses[i + 3].start - filtered_pulses[i + 2].start) / linelen
 
         # Relaxed check: ignore the last interval (disppspP)
         check_strict = (
@@ -690,12 +625,8 @@ def get_line0_fallback(
             and filtered_pulses[i + 1].len < SHORT_PULSE_MAX
             and filtered_pulses[i + 2].len < SHORT_PULSE_MAX
         ):
-            hsync_pulse_len = (
-                filtered_pulses[i - 2].len + filtered_pulses[i - 1].len
-            ) / 2.0
-            eq_pulse_len = (
-                filtered_pulses[i + 1].len + filtered_pulses[i + 2].len
-            ) / 2.0
+            hsync_pulse_len = (filtered_pulses[i - 2].len + filtered_pulses[i - 1].len) / 2.0
+            eq_pulse_len = (filtered_pulses[i + 1].len + filtered_pulses[i + 2].len) / 2.0
 
             if hsync_pulse_len / eq_pulse_len > 1.75:
                 if filtered_pulses[i].len < eq_pulse_len * 1.25:
@@ -788,10 +719,7 @@ def get_line0_fallback(
                     and abs(lineP_avg - lineN_avg) / (lineP_avg + lineN_avg) > 0.15
                     and abs(lineP_std - lineI_std) * 2 < abs(lineP_std - lineN_std)
                 ):
-                    if (
-                        line_0 != filtered_pulses[i - 1].start
-                        or 20 > first_field_confidence
-                    ):
+                    if line_0 != filtered_pulses[i - 1].start or 20 > first_field_confidence:
                         if frame_lines == 625:
                             first_field = 0
                         else:
@@ -803,10 +731,7 @@ def get_line0_fallback(
                     and abs(lineP_avg - lineN_avg) / (lineP_avg + lineN_avg) > 0.15
                     and lineI_std * 2 > lineP_std
                 ):
-                    if (
-                        line_0 != filtered_pulses[i].start
-                        or 20 > first_field_confidence
-                    ):
+                    if line_0 != filtered_pulses[i].start or 20 > first_field_confidence:
                         if frame_lines == 625:
                             first_field = 0
                         else:
@@ -833,11 +758,15 @@ def get_line0_fallback(
         first_field_confidence = first_field_confidence_backup - 20
     elif line_0 is not None and line_0 > (linelen * (frame_lines - 1) / 2):
         # Check if we have a backup that is valid (within first half of frame)
-        if relaxed and line_0_backup is not None and line_0_backup < (linelen * (frame_lines - 1) / 2):
-             ldd.logger.info("Switching to backup line0 estimation as primary is out of range.")
-             line_0 = line_0_backup
-             first_field = first_field_backup
-             first_field_confidence = first_field_confidence_backup - 20
+        if (
+            relaxed
+            and line_0_backup is not None
+            and line_0_backup < (linelen * (frame_lines - 1) / 2)
+        ):
+            ldd.logger.info("Switching to backup line0 estimation as primary is out of range.")
+            line_0 = line_0_backup
+            first_field = first_field_backup
+            first_field_confidence = first_field_confidence_backup - 20
         else:
             if expected_line0 is None:
                 ldd.logger.info(
@@ -852,8 +781,10 @@ def get_line0_fallback(
         first_field = first_field_backup
         first_field_confidence = first_field_confidence_backup - 20
 
-    if (line_0 is None or line_0 > (linelen * (frame_lines - 1) / 2)) and expected_line0 is not None:
-        limit = (linelen * (frame_lines - 1) / 2)
+    if (
+        line_0 is None or line_0 > (linelen * (frame_lines - 1) / 2)
+    ) and expected_line0 is not None:
+        limit = linelen * (frame_lines - 1) / 2
         if expected_line0 < limit and expected_line0 > -5 * linelen:
             if DEBUG_PRINT:
                 print(f"Attempting to use predicted line0 from previous field: {expected_line0}")
@@ -872,26 +803,31 @@ def get_line0_fallback(
                         best_p = p
             if best_p:
                 if DEBUG_PRINT:
-                    print(f"Found pulse near prediction: {best_p.start} (diff {min_diff/linelen:.2f} lines)")
+                    print(
+                        f"Found pulse near prediction: {best_p.start} (diff {min_diff/linelen:.2f} lines)"
+                    )
                 line_0 = best_p.start
                 if expected_first_field is not None:
                     first_field = expected_first_field
                     first_field_confidence = 50
             elif relaxed and expected_line0 > 0:
                 if DEBUG_PRINT:
-                    print(f"No pulse found near prediction, forcing expected location: {expected_line0}")
+                    print(
+                        f"No pulse found near prediction, forcing expected location: {expected_line0}"
+                    )
                 line_0 = expected_line0
                 if expected_first_field is not None:
                     first_field = expected_first_field
                     first_field_confidence = 40
             else:
                 if DEBUG_PRINT:
-                    print("Prediction available but no matching pulse found and relaxed mode disabled.")
+                    print(
+                        "Prediction available but no matching pulse found and relaxed mode disabled."
+                    )
                 if line_0 is not None and line_0 > (linelen * (frame_lines - 1) / 2):
                     ldd.logger.info(
                         "WARNING, line0 hsync not found for current field, probably skipping one field."
                     )
-
 
     if line_0 is not None:
         if DEBUG_PLOT:
@@ -910,9 +846,7 @@ def get_line0_fallback(
 
     # TODO: get max len from field.
     long_pulses = list(
-        filter(
-            lambda p: inrange(p[PULSE_LEN], lt_vsync[0], lt_vsync[1] * 10), raw_pulses
-        )
+        filter(lambda p: inrange(p[PULSE_LEN], lt_vsync[0], lt_vsync[1] * 10), raw_pulses)
     )
 
     if long_pulses:
@@ -948,8 +882,7 @@ def get_line0_fallback(
         last_lineloc = (
             long_pulses[3][PULSE_START] - offset
             if len(long_pulses) == 6
-            and long_pulses[3][PULSE_START] - long_pulses[2][PULSE_START]
-            > (lt_vsync[1] * 10)
+            and long_pulses[3][PULSE_START] - long_pulses[2][PULSE_START] > (lt_vsync[1] * 10)
             else None
         )
         if DEBUG_PLOT:
@@ -1089,32 +1022,66 @@ class FieldShared:
                 return input.astype(np.single)
             else:
                 ire0 = self.rf.DecoderParams["ire0"]
-                if (
-                    self.rf.options.ire0_adjust
-                    and input.size == self.outlinecount * self.outlinelen
-                ):
-                    hsync_start, hsync_end = self.ire0_backporch
+                hz_ire = self.rf.DecoderParams["hz_ire"]
 
-                    ire0_adjust_padding = 4 # 4fsc, prevents noise around the hsync transition from interfering with this measurement
-                    hsync_start += ire0_adjust_padding
-                    hsync_end -= ire0_adjust_padding
+                if input.size == self.outlinecount * self.outlinelen:
+                    ire0_adjust_padding = 4  # 4fsc, prevents noise around the hsync transitions from interfering with this measurement
 
-                    blank_levels = np.sort([
-                        np.median(input[i * self.outlinelen + hsync_start :
-                                        i * self.outlinelen + hsync_end])
-                        for i in range(0, self.outlinecount)
-                    ])
-                    ire0 = np.mean(blank_levels[self.outlinecount // 3 : (self.outlinecount * 2) // 3])
+                    if "backporch" in self.rf.options.ire0_adjust:
+                        backporch_start = self.ire0_backporch[0] + ire0_adjust_padding
+                        backporch_end = self.ire0_backporch[1] - ire0_adjust_padding
+                        blank_levels = np.sort(
+                            [
+                                np.median(
+                                    input[
+                                        i * self.outlinelen
+                                        + backporch_start : i * self.outlinelen
+                                        + backporch_end
+                                    ]
+                                )
+                                for i in range(0, self.outlinecount)
+                            ]
+                        )
+                        ire0 = np.mean(
+                            blank_levels[self.outlinecount // 3 : (self.outlinecount * 2) // 3]
+                        )
 
-                    ldd.logger.debug("calculated ire0: %.02f", ire0)
+                        ldd.logger.debug("calculated ire0: %.02f", ire0)
+
+                    if "hsync" in self.rf.options.ire0_adjust:
+                        # measure the hsync pulse level
+                        hsync_start = ire0_adjust_padding
+                        hsync_end = self.ire0_backporch[0] - ire0_adjust_padding
+                        hsync_levels = np.sort(
+                            [
+                                np.median(
+                                    input[
+                                        i * self.outlinelen
+                                        + hsync_start : i * self.outlinelen
+                                        + hsync_end
+                                    ]
+                                )
+                                for i in range(0, self.outlinecount)
+                            ]
+                        )
+                        hsync_level = np.mean(
+                            hsync_levels[self.outlinecount // 3 : (self.outlinecount * 2) // 3]
+                        )
+
+                        # calculate scaling based difference between hsync pulse and ire0
+                        hz_ire = (ire0 - hsync_level) / -self.rf.DecoderParams["vsync_ire"]
+
+                        ldd.logger.debug("calculated hz_ire: %.02f", hz_ire)
 
                 if self.rf.track_phase is not None:
-                    ire0 += self.rf.DecoderParams["track_ire0_offset"][self.rf.track_phase ^ (self.field_number % 2)]
+                    ire0 += self.rf.DecoderParams["track_ire0_offset"][
+                        self.rf.track_phase ^ (self.field_number % 2)
+                    ]
 
                 return hz_to_output_array(
                     input,
                     ire0,
-                    self.rf.DecoderParams["hz_ire"],
+                    hz_ire,
                     self.rf.SysParams["outputZero"],
                     self.rf.DecoderParams["vsync_ire"],
                     self.out_scale,
@@ -1126,32 +1093,33 @@ class FieldShared:
             return np.single(input)
 
         # Since this is just used for converting a value for the whole file don't do the track compensation here.
-        reduced = (input - self.rf.DecoderParams["ire0"]) / self.rf.DecoderParams[
-            "hz_ire"
-        ]
+        reduced = (input - self.rf.DecoderParams["ire0"]) / self.rf.DecoderParams["hz_ire"]
         reduced -= self.rf.DecoderParams["vsync_ire"]
 
         return np.uint16(
-            np.clip(
-                (reduced * self.out_scale) + self.rf.SysParams["outputZero"], 0, 65535
-            )
-            + 0.5
+            np.clip((reduced * self.out_scale) + self.rf.SysParams["outputZero"], 0, 65535) + 0.5
         )
 
     def lock_to_burst(self, linelocs):
         self.chroma_tbc_buffer = None
-        self.rf.track_phase, self.phase_sequence, self.burst_detected_line, self.burst_magnitude_avg, self.burst_phase_avg, self.even_burst_phase_avg, self.odd_burst_phase_avg = decode_chroma_phase_rotation(
+        (
+            self.rf.track_phase,
+            self.phase_sequence,
+            self.burst_detected_line,
+            self.burst_magnitude_avg,
+            self.burst_phase_avg,
+            self.even_burst_phase_avg,
+            self.odd_burst_phase_avg,
+        ) = decode_chroma_phase_rotation(
             self,
             linelocs,
             chroma_rotation=self.rf.DecoderParams.get("chroma_rotation", None),
-            detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase
+            detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase,
         )
         self.track_phase_set = True
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldShared, self).downscale(
-            final=False, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldShared, self).downscale(final=False, *args, **kwargs)
 
         # hpf = utils.filter_simple(dsout, self.rf.Filters["NLHighPass"])
         # dsout = ynr(dsout, hpf, self.outlinelen)
@@ -1201,9 +1169,7 @@ class FieldShared:
 
     def run_vblank_state_machine(self, pulses, LT):
         """Determines if a pulse set is a valid vblank by running a state machine"""
-        a = _run_vblank_state_machine(
-            pulses, LT, self.rf.SysParams["numPulses"], self.inlinelen
-        )
+        a = _run_vblank_state_machine(pulses, LT, self.rf.SysParams["numPulses"], self.inlinelen)
         return a
 
     def refinepulses(self):
@@ -1282,10 +1248,7 @@ class FieldShared:
             # when no pulses are found and there has not been a previous sync location and fallback vsync is not enabled
             (
                 len(self.rawpulses) == 0
-                and (
-                    not hasattr(self.rf, "prev_first_hsync_loc")
-                    or self.rf.options.fallback_vsync
-                )
+                and (not hasattr(self.rf, "prev_first_hsync_loc") or self.rf.options.fallback_vsync)
             )
         ):
             return NO_PULSES_FOUND
@@ -1306,9 +1269,7 @@ class FieldShared:
                 self.rf.prev_first_field = -1
 
             if hasattr(self.prevfield, "isProgressiveField"):
-                self.rf.prev_progressive_field = (
-                    1 if self.prevfield.isProgressiveField else 0
-                )
+                self.rf.prev_progressive_field = 1 if self.prevfield.isProgressiveField else 0
             else:
                 self.rf.prev_progressive_field = -1
 
@@ -1416,9 +1377,7 @@ class FieldShared:
             ldd.logger.error("Unable to find any sync pulses, jumping 100 ms")
             return None, None, int(self.rf.freq_hz / 10)
 
-        line0loc, first_hsync_loc, first_hsync_loc_line, meanlinelen, vblank_pulses = (
-            res
-        )
+        line0loc, first_hsync_loc, first_hsync_loc_line, meanlinelen, vblank_pulses = res
         validpulses = self.validpulses
 
         # TODO: This is set here for NTSC, but in the PAL base class for PAL in process() it seems..
@@ -1461,7 +1420,9 @@ class FieldShared:
                     meanlinelen,
                     line0loc,
                 )
-                ldd.logger.info("Did not find the expected number of lines (lastline < proclines) , skipping a tiny bit")
+                ldd.logger.info(
+                    "Did not find the expected number of lines (lastline < proclines) , skipping a tiny bit"
+                )
             return None, None, max(line0loc - (meanlinelen * 20), self.inlinelen)
 
         linelocs, lineloc_errs, last_validpulse = sync.valid_pulses_to_linelocs(
@@ -1509,9 +1470,7 @@ class FieldShared:
         if np.count_nonzero(lineloc_errs) < 30:
             self.rf.compute_linelocs_issues = False
         elif self.rf.options.saved_levels:
-            ldd.logger.debug(
-                "Possible sync issues, re-running level detection on next field!"
-            )
+            ldd.logger.debug("Possible sync issues, re-running level detection on next field!")
 
         return linelocs, lineloc_errs, nextfield
 
@@ -1532,12 +1491,8 @@ class FieldShared:
 
             linebad = self.linebad.copy()
             linebad_b = self.linebad.copy()
-            time = timeit.timeit(
-                lambda: sync.refine_linelocs_hsync(self, linebad), number=100
-            )
-            time2 = timeit.timeit(
-                lambda: self._refine_linelocs_hsync(linebad_b), number=100
-            )
+            time = timeit.timeit(lambda: sync.refine_linelocs_hsync(self, linebad), number=100)
+            time2 = timeit.timeit(lambda: self._refine_linelocs_hsync(linebad_b), number=100)
             print("time", time)
             print("time2", time2)
             linebad1 = self.linebad.copy()
@@ -1596,9 +1551,7 @@ class FieldShared:
                 linelocs2[i] = zc
 
                 # The hsync area, burst, and porches should not leave -50 to 30 IRE (on PAL or NTSC)
-                hsync_area = demod_05[
-                    int(zc - (one_usec * 0.75)) : int(zc + (one_usec * 8))
-                ]
+                hsync_area = demod_05[int(zc - (one_usec * 0.75)) : int(zc + (one_usec * 8))]
                 if lddu.nb_min(hsync_area) < self.rf.iretohz(-55) or lddu.nb_max(
                     hsync_area
                 ) > self.rf.iretohz(30):
@@ -1638,21 +1591,15 @@ class FieldShared:
                 zc_fr = right_cross - normal_hsync_length
 
                 # The hsync area, burst, and porches should not leave -50 to 30 IRE (on PAL or NTSC)
-                hsync_area = demod_05[
-                    int(zc_fr - (one_usec * 0.75)) : int(zc_fr + (one_usec * 8))
-                ]
+                hsync_area = demod_05[int(zc_fr - (one_usec * 0.75)) : int(zc_fr + (one_usec * 8))]
                 if lddu.nb_min(hsync_area) > self.rf.iretohz(-55) and lddu.nb_max(
                     hsync_area
                 ) < self.rf.iretohz(30):
                     porch_level = lddu.nb_median(
-                        demod_05[
-                            int(zc_fr + (one_usec * 8)) : int(zc_fr + (one_usec * 9))
-                        ]
+                        demod_05[int(zc_fr + (one_usec * 8)) : int(zc_fr + (one_usec * 9))]
                     )
                     sync_level = lddu.nb_median(
-                        demod_05[
-                            int(zc_fr + (one_usec * 1)) : int(zc_fr + (one_usec * 2.5))
-                        ]
+                        demod_05[int(zc_fr + (one_usec * 1)) : int(zc_fr + (one_usec * 2.5))]
                     )
 
                     # Re-calculate the crossing point using the mid point between the measured sync
@@ -1671,9 +1618,7 @@ class FieldShared:
                         right_cross_refined = True
 
             if linebad[i]:
-                linelocs2[i] = self.linelocs1[
-                    i
-                ]  # don't use the computed value here if it's bad
+                linelocs2[i] = self.linelocs1[i]  # don't use the computed value here if it's bad
 
             if right_cross is not None:
                 # right_locs[i] = right_cross
@@ -1802,9 +1747,7 @@ class FieldShared:
                         guess_len = linelocs[prevgood] - linelocs[prevgood - 1]
                         linelocs[l] = linelocs[l - 1] + guess_len
                 else:
-                    gap = (linelocs[nextgood] - linelocs[prevgood]) / (
-                        nextgood - prevgood
-                    )
+                    gap = (linelocs[nextgood] - linelocs[prevgood]) / (nextgood - prevgood)
                     linelocs[l] = (gap * (l - prevgood)) + linelocs[prevgood]
 
         return linelocs
@@ -1817,7 +1760,7 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
         self.ire0_backporch = (96, 160)
         self.burst_detected_line = 0
         self.fsc_ratio = self.rf.SysParams["outfreq"] / self.rf.SysParams["fsc_mhz"]
-    
+
     @staticmethod
     def _sync_to_burst(
         linelocs,
@@ -1826,11 +1769,13 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
         even_burst_avg_phase,
         odd_burst_avg_phase,
         phase_sequence,
-        burst_detected_line
+        burst_detected_line,
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
-        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[burst_tbc_start:]:
+        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[
+            burst_tbc_start:
+        ]:
             target_phase = odd_burst_avg_phase if line_number % 2 else even_burst_avg_phase
 
             phase_delta = (target_phase - burst_phase + burst_phase_offset + 180) % 360 - 180
@@ -1842,7 +1787,9 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
             scale = line_length / outlinelen
 
             line_adjust = phase_delta / 360.0 * fsc_ratio
-            linelocs[line_number] += line_adjust * scale # 4fsc, then scaled up to the input line length
+            linelocs[line_number] += (
+                line_adjust * scale
+            )  # 4fsc, then scaled up to the input line length
 
     def refine_linelocs_pilot(self, linelocs=None):
         if linelocs is None:
@@ -1857,7 +1804,7 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
             if (
                 not self.rf.options.disable_burst_hsync
                 and self.phase_sequence is not None
-                and self.burst_detected_line != -1 # color killer not active for entire field
+                and self.burst_detected_line != -1  # color killer not active for entire field
             ):
                 FieldPALShared._sync_to_burst(
                     linelocs,
@@ -1866,7 +1813,7 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
                     self.even_burst_phase_avg,
                     self.odd_burst_phase_avg,
                     self.phase_sequence,
-                    self.burst_detected_line
+                    self.burst_detected_line,
                 )
 
         return linelocs
@@ -1888,16 +1835,13 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
 
     @staticmethod
     def _sync_to_burst(
-        linelocs,
-        outlinelen,
-        fsc_ratio,
-        burst_avg_phase,
-        phase_sequence,
-        burst_detected_line
+        linelocs, outlinelen, fsc_ratio, burst_avg_phase, phase_sequence, burst_detected_line
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
-        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[burst_tbc_start:]:
+        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[
+            burst_tbc_start:
+        ]:
             phase_delta = (burst_avg_phase - burst_phase + burst_phase_offset + 180) % 360 - 180
 
             # scale up burst fsc for each line
@@ -1907,7 +1851,9 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
             scale = line_length / outlinelen
 
             line_adjust = phase_delta / 360.0 * fsc_ratio
-            linelocs[line_number] += line_adjust * scale # 4fsc, then scaled up to the input line length
+            linelocs[line_number] += (
+                line_adjust * scale
+            )  # 4fsc, then scaled up to the input line length
 
     def refine_linelocs_burst(self, linelocs=None):
         if linelocs is None:
@@ -1922,7 +1868,7 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
             if (
                 not self.rf.options.disable_burst_hsync
                 and self.phase_sequence is not None
-                and self.burst_detected_line != -1 # color killer not active for entire field
+                and self.burst_detected_line != -1  # color killer not active for entire field
             ):
                 if self.rf.color_system == "NTSC":
                     FieldNTSCShared._sync_to_burst(
@@ -1931,7 +1877,7 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
                         self.fsc_ratio,
                         self.burst_phase_avg,
                         self.phase_sequence,
-                        self.burst_detected_line
+                        self.burst_detected_line,
                     )
                 elif self.rf.color_system == "NLINHA":
                     # NLINHA uses pal
@@ -1942,7 +1888,7 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
                         self.even_burst_phase_avg,
                         self.odd_burst_phase_avg,
                         self.phase_sequence,
-                        self.burst_detected_line
+                        self.burst_detected_line,
                     )
 
         return linelocs
@@ -1953,9 +1899,7 @@ class FieldPALVHS(FieldPALShared):
         super(FieldPALVHS, self).__init__(*args, **kwargs)
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldPALVHS, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldPALVHS, self).downscale(final=final, *args, **kwargs)
         dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
@@ -1973,9 +1917,7 @@ class FieldPALUMatic(FieldPALShared):
         super(FieldPALUMatic, self).__init__(*args, **kwargs)
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldPALUMatic, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldPALUMatic, self).downscale(final=final, *args, **kwargs)
         dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
@@ -1986,9 +1928,7 @@ class FieldPALBetamax(FieldPALShared):
         super(FieldPALBetamax, self).__init__(*args, **kwargs)
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldPALBetamax, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldPALBetamax, self).downscale(final=final, *args, **kwargs)
 
         dschroma = decode_chroma(self)
 
@@ -2000,14 +1940,9 @@ class FieldPALVideo8(FieldPALShared):
         super(FieldPALVideo8, self).__init__(*args, **kwargs)
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldPALVideo8, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldPALVideo8, self).downscale(final=final, *args, **kwargs)
 
-        dschroma = decode_chroma(
-            self,
-            do_chroma_deemphasis=True
-        )
+        dschroma = decode_chroma(self, do_chroma_deemphasis=True)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -2017,9 +1952,7 @@ class FieldPALTypeC(FieldPALShared, ldd.FieldPAL):
         super(FieldPALTypeC, self).__init__(*args, **kwargs)
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldPALTypeC, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldPALTypeC, self).downscale(final=final, *args, **kwargs)
 
         return (dsout, None), dsaudio, dsefm
 
@@ -2030,9 +1963,7 @@ class FieldNTSCVHS(FieldNTSCShared):
 
     def downscale(self, final=False, *args, **kwargs):
         """Downscale the channels and upconvert chroma to standard color carrier frequency."""
-        dsout, dsaudio, dsefm = super(FieldNTSCVHS, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldNTSCVHS, self).downscale(final=final, *args, **kwargs)
 
         dschroma = decode_chroma(self)
 
@@ -2070,22 +2001,18 @@ class FieldNTSCUMatic(FieldNTSCShared):
         super(FieldNTSCUMatic, self).__init__(*args, **kwargs)
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldNTSCUMatic, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldNTSCUMatic, self).downscale(final=final, *args, **kwargs)
         dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
 
 
-class FieldNTSCTypeC(FieldShared, ldd.FieldNTSC):
+class FieldNTSCTypeC(FieldNTSCShared, ldd.FieldNTSC):
     def __init__(self, *args, **kwargs):
         super(FieldNTSCTypeC, self).__init__(*args, **kwargs)
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldNTSCTypeC, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldNTSCTypeC, self).downscale(final=final, *args, **kwargs)
 
         return (dsout, None), dsaudio, dsefm
 
@@ -2096,13 +2023,9 @@ class FieldNTSCVideo8(FieldNTSCShared):
 
     def downscale(self, final=False, *args, **kwargs):
         """Downscale the channels and upconvert chroma to standard color carrier frequency."""
-        dsout, dsaudio, dsefm = super(FieldNTSCVideo8, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldNTSCVideo8, self).downscale(final=final, *args, **kwargs)
 
-        dschroma = decode_chroma(
-            self, do_chroma_deemphasis=True
-        )
+        dschroma = decode_chroma(self, do_chroma_deemphasis=True)
 
         return (dsout, dschroma), dsaudio, dsefm
 
@@ -2112,9 +2035,7 @@ class FieldMESECAMVHS(FieldPALShared):
         super(FieldMESECAMVHS, self).__init__(*args, **kwargs)
 
     def downscale(self, final=False, *args, **kwargs):
-        dsout, dsaudio, dsefm = super(FieldMESECAMVHS, self).downscale(
-            final=final, *args, **kwargs
-        )
+        dsout, dsaudio, dsefm = super(FieldMESECAMVHS, self).downscale(final=final, *args, **kwargs)
         dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm

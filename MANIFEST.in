@@ -15,10 +15,10 @@ exclude .flake8
 exclude vcpkg*
 exclude ld-ldf-reader.c
 prune .github
-prune filter_tune
 prune tools
 prune notebooks
 prune scripts
+include scripts/cx-expander
 prune vhs_scripts
 prune cmake_modules
 prune docs

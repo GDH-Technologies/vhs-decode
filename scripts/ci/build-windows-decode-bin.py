@@ -66,6 +66,8 @@ PyInstaller.__main__.run(
         "vhsd_rust",
         "--add-data",
         "vhsdecode/format_defs;vhsdecode/format_defs",
+        "--collect-data",
+        "lddecode",
         "--collect-all",
         "PyQt6",
         "--collect-all",

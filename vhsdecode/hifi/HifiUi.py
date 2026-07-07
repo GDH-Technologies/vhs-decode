@@ -1,9 +1,12 @@
 import os.path
 import sys
 import math
+from multiprocessing import cpu_count
 from pathlib import Path
 
 import numpy as np
+
+from vhsdecode.hifi.utils import parse_flac_streaminfo
 
 try:
     from PyQt6.QtGui import QIcon
@@ -107,8 +110,9 @@ from vhsdecode.hifi.constants import (
     ui_to_doc_mode,
     ui_to_expander_env_detection
 )
-from vhsdecode.hifi.afe import get_standard
-
+from vhsdecode.hifi.HiFiDecode import (
+    get_standard
+)
 _PLOT_DEEMPHASIS = None
 _PLOT_EXPANDER = None
 
@@ -129,6 +133,51 @@ PLAY_STATE = 1
 PAUSE_STATE = 2
 PREVIEW_STATE = 3
 
+_SPINBOX_ARROW_CACHE = {}
+
+
+def _spinbox_arrow_icon_path(direction: str, color: str = "#eeeeee") -> str:
+    """Render a small arrow to a PNG for use in the stylesheet.
+
+    Qt's stylesheet engine has no reliable way to draw triangles, so the
+    up/down spin box arrows are rendered to temp images once per process.
+    Requires a QApplication to exist.
+    """
+    cache_key = (direction, color)
+    cached = _SPINBOX_ARROW_CACHE.get(cache_key)
+    if cached and os.path.isfile(cached):
+        return cached
+
+    import tempfile
+
+    width, height = 8, 5
+    pixmap = QtGui.QPixmap(width, height)
+    pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    painter.setBrush(QtGui.QColor(color))
+    painter.setPen(QtCore.Qt.PenStyle.NoPen)
+    if direction == "up":
+        points = [
+            QtCore.QPoint(0, height),
+            QtCore.QPoint(width, height),
+            QtCore.QPoint(width // 2, 0),
+        ]
+    else:
+        points = [
+            QtCore.QPoint(0, 0),
+            QtCore.QPoint(width, 0),
+            QtCore.QPoint(width // 2, height),
+        ]
+    painter.drawPolygon(QtGui.QPolygon(points))
+    painter.end()
+
+    fd, path = tempfile.mkstemp(prefix=f"hifi_spin_{direction}_", suffix=".png")
+    os.close(fd)
+    pixmap.save(path, "PNG")
+    _SPINBOX_ARROW_CACHE[cache_key] = path
+    return path
+
 
 class MainUIParameters:
     def __init__(self):
@@ -136,7 +185,11 @@ class MainUIParameters:
         self.normalize = False
         self.expander_gain: float = DEFAULT_VHS_EXPANDER_GAIN
         self.expander_ratio: float = DEFAULT_VHS_EXPANDER_RATIO
-        self.expander_env_detection = DEFAULT_ENV_DETECTION
+        # UI label, not the internal constant (the combos and the
+        # ui_to_* lookups in ui_parameters_to_decode_options expect labels)
+        self.expander_env_detection = expander_env_detection_to_ui[
+            DEFAULT_ENV_DETECTION
+        ]
         self.expander_attack_tau: float = DEFAULT_VHS_EXPANDER_ATTACK_TAU
         self.expander_hold_tau: float = DEFAULT_VHS_EXPANDER_HOLD_TAU
         self.expander_release_tau: float = DEFAULT_VHS_EXPANDER_RELEASE_TAU
@@ -148,7 +201,8 @@ class MainUIParameters:
         self.deemphasis_high_tau: float = DEFAULT_VHS_DEEMPHASIS_TAU_2
         self.nr_deemphasis_low_tau: float = DEFAULT_VHS_NR_DEEMPHASIS_TAU_1
         self.nr_deemphasis_high_tau: float = DEFAULT_VHS_NR_DEEMPHASIS_TAU_2
-        self.afe_vco_deviation = 0
+        self.afe_left_carrier_deviation = 0
+        self.afe_right_carrier_deviation = 0
         self.afe_left_carrier = 0
         self.afe_right_carrier = 0
         self.spectral_nr_amount = DEFAULT_SPECTRAL_NR_AMOUNT
@@ -163,11 +217,15 @@ class MainUIParameters:
         self.audio_mode: str = audio_mode_to_ui[DEFAULT_VHS_AUDIO_MODE]
         self.resampler_quality = DEFAULT_RESAMPLER_QUALITY
         self.demod_type: str = DEFAULT_DEMOD.capitalize()
-        self.input_sample_rate: float = 40.0
+        # in Hz: setValues() converts to MHz for display (matches the
+        # decode_options "input_rate" value this field mirrors)
+        self.input_sample_rate: float = 40.0e6
         self.input_file: str = ""
         self.output_file: str = ""
-        self.head_switching_interpolation = "on"
-        self.doc = DEFAULT_DOC_MODE
+        # bool: setChecked() requires a bool (PyQt6 rejects the old "on" str)
+        self.head_switching_interpolation = True
+        self.doc = doc_mode_to_ui[DEFAULT_DOC_MODE]
+        self.threads: int = cpu_count()
 
 
 def decode_options_to_ui_parameters(decode_options):
@@ -190,7 +248,8 @@ def decode_options_to_ui_parameters(decode_options):
     values.deemphasis_high_tau = decode_options["deemphasis_high_tau"]
     values.nr_deemphasis_low_tau = decode_options["nr_deemphasis_low_tau"]
     values.nr_deemphasis_high_tau = decode_options["nr_deemphasis_high_tau"]
-    values.afe_vco_deviation = decode_options["afe_vco_deviation"]
+    values.afe_left_carrier_deviation = decode_options["afe_left_carrier_deviation"]
+    values.afe_right_carrier_deviation = decode_options["afe_right_carrier_deviation"]
     values.afe_left_carrier = decode_options["afe_left_carrier"]
     values.afe_right_carrier = decode_options["afe_right_carrier"]
     values.spectral_nr_amount = decode_options["spectral_nr_amount"]
@@ -207,12 +266,14 @@ def decode_options_to_ui_parameters(decode_options):
     values.output_file = decode_options["output_file"]
     values.head_switching_interpolation = decode_options["head_switching_interpolation"]
     values.doc = doc_mode_to_ui[decode_options["doc"]]
+    values.threads = decode_options.get("threads", values.threads)
     return values
 
 
 def ui_parameters_to_decode_options(values: MainUIParameters):
     decode_options = {
         "input_rate": float(values.input_sample_rate) * 1e6,
+        "input_format_override": None,
         "standard": "p" if values.standard == "PAL" else "n",
         "format": "vhs" if values.format == "VHS" else "8mm",
         "demod_type": values.demod_type.lower(),
@@ -234,7 +295,8 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
         "deemphasis_high_tau": values.deemphasis_high_tau,
         "nr_deemphasis_low_tau": values.nr_deemphasis_low_tau,
         "nr_deemphasis_high_tau": values.nr_deemphasis_high_tau,
-        "afe_vco_deviation": values.afe_vco_deviation,
+        "afe_left_carrier_deviation": values.afe_left_carrier_deviation,
+        "afe_right_carrier_deviation": values.afe_right_carrier_deviation,
         "afe_left_carrier": values.afe_left_carrier,
         "afe_right_carrier": values.afe_right_carrier,
         "spectral_nr_amount": values.spectral_nr_amount,
@@ -247,7 +309,8 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
         "resampler_quality": values.resampler_quality,
         "head_switching_interpolation": values.head_switching_interpolation,
         "doc": ui_to_doc_mode[values.doc],
-        "mode": ui_to_audio_mode[values.audio_mode]
+        "mode": ui_to_audio_mode[values.audio_mode],
+        "threads": max(1, int(values.threads)),
     }
     return decode_options
 
@@ -378,13 +441,12 @@ class HifiUi(QMainWindow):
         self.build_plot_window()
 
         # Apply dark theme with improved text visibility
-        self.setStyleSheet(
-            """
+        stylesheet = """
             QMainWindow {
                 background-color: #333;
                 color: #eee;
             }
-            QDial, QLineEdit, QCheckBox, QComboBox, QPushButton {
+            QDial, QLineEdit, QCheckBox, QComboBox, QPushButton, QSpinBox {
                 background-color: #555;
                 color: #eee;
                 border: 1px solid #777;
@@ -402,10 +464,34 @@ class HifiUi(QMainWindow):
                 background-color: #555;
                 color: #eee;
             }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #666;
+                border: 1px solid #777;
+                width: 14px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #777;
+            }
+            QSpinBox::up-arrow {
+                image: url(__UP_ARROW__);
+                width: 8px;
+                height: 5px;
+            }
+            QSpinBox::down-arrow {
+                image: url(__DOWN_ARROW__);
+                width: 8px;
+                height: 5px;
+            }
             QLabel {
                 color: #eee;
             }
         """
+        up_arrow = _spinbox_arrow_icon_path("up").replace("\\", "/")
+        down_arrow = _spinbox_arrow_icon_path("down").replace("\\", "/")
+        self.setStyleSheet(
+            stylesheet.replace("__UP_ARROW__", up_arrow).replace(
+                "__DOWN_ARROW__", down_arrow
+            )
         )
         self.change_button_color(self.stop_button, "#eee")
         # disables maximize button
@@ -528,6 +614,20 @@ class HifiUi(QMainWindow):
         )
         input_options_frame.inner_layout.addLayout(input_samplerate_layout)
 
+        # decode thread count
+        threads_layout = QHBoxLayout()
+        threads_label = QLabel("Decode Threads")
+        self.threads_spinbox = QSpinBox(self)
+        self.threads_spinbox.setMinimum(1)
+        self.threads_spinbox.setMaximum(256)
+        self.threads_spinbox.setValue(cpu_count())
+        self.threads_spinbox.setToolTip(
+            f"Number of CPU threads to use for decoding ({cpu_count()} available on this machine)"
+        )
+        threads_layout.addWidget(threads_label)
+        threads_layout.addWidget(self.threads_spinbox)
+        input_options_frame.inner_layout.addLayout(threads_layout)
+
         return layout
 
     def build_format_options_section(self):
@@ -588,6 +688,21 @@ class HifiUi(QMainWindow):
         afe_left_carrier_layout.addWidget(self.afe_left_carrier_spinbox)
         advanced_format_options_frame.inner_layout.addLayout(afe_left_carrier_layout)
 
+        # left vco deviation adjustment
+        afe_left_carrier_deviation_layout = QHBoxLayout()
+        afe_left_carrier_deviation_spinbox_label = QLabel("Left Carrier Deviation (Hz)")
+        self.afe_left_carrier_deviation_spinbox = QSpinBox(self)
+        self.afe_left_carrier_deviation_spinbox.setGroupSeparatorShown(True)
+        self.afe_left_carrier_deviation_spinbox.setMinimum(int(10e3))
+        self.afe_left_carrier_deviation_spinbox.setMaximum(int(10e5))
+        self.afe_left_carrier_deviation_spinbox.setSingleStep(10)
+        self.afe_left_carrier_deviation_spinbox.setToolTip(
+            "Maximum frequency offset + or - from the center frequency"
+        )
+        afe_left_carrier_deviation_layout.addWidget(afe_left_carrier_deviation_spinbox_label)
+        afe_left_carrier_deviation_layout.addWidget(self.afe_left_carrier_deviation_spinbox)
+        advanced_format_options_frame.inner_layout.addLayout(afe_left_carrier_deviation_layout)
+
         # right carrier adjustment
         afe_right_carrier_layout = QHBoxLayout()
         afe_right_carrier_spinbox_label = QLabel("Right Carrier (Hz)")
@@ -601,20 +716,21 @@ class HifiUi(QMainWindow):
         afe_right_carrier_layout.addWidget(self.afe_right_carrier_spinbox)
         advanced_format_options_frame.inner_layout.addLayout(afe_right_carrier_layout)
 
-        # vco deviation adjustment
-        afe_vco_deviation_layout = QHBoxLayout()
-        afe_vco_deviation_spinbox_label = QLabel("VCO Deviation")
-        self.afe_vco_deviation_spinbox = QSpinBox(self)
-        self.afe_vco_deviation_spinbox.setGroupSeparatorShown(True)
-        self.afe_vco_deviation_spinbox.setMinimum(int(10e3))
-        self.afe_vco_deviation_spinbox.setMaximum(int(10e5))
-        self.afe_vco_deviation_spinbox.setSingleStep(10)
-        self.afe_vco_deviation_spinbox.setToolTip(
+        # right vco deviation adjustment
+        afe_right_carrier_deviation_layout = QHBoxLayout()
+        afe_right_carrier_deviation_spinbox_label = QLabel("Right Carrier Deviation (Hz)")
+        self.afe_right_carrier_deviation_spinbox = QSpinBox(self)
+        self.afe_right_carrier_deviation_spinbox.setGroupSeparatorShown(True)
+        self.afe_right_carrier_deviation_spinbox.setMinimum(int(10e3))
+        self.afe_right_carrier_deviation_spinbox.setMaximum(int(10e5))
+        self.afe_right_carrier_deviation_spinbox.setSingleStep(10)
+        self.afe_right_carrier_deviation_spinbox.setToolTip(
             "Maximum frequency offset + or - from the center frequency"
         )
-        afe_vco_deviation_layout.addWidget(afe_vco_deviation_spinbox_label)
-        afe_vco_deviation_layout.addWidget(self.afe_vco_deviation_spinbox)
-        advanced_format_options_frame.inner_layout.addLayout(afe_vco_deviation_layout)
+        afe_right_carrier_deviation_layout.addWidget(afe_right_carrier_deviation_spinbox_label)
+        afe_right_carrier_deviation_layout.addWidget(self.afe_right_carrier_deviation_spinbox)
+        advanced_format_options_frame.inner_layout.addLayout(afe_right_carrier_deviation_layout)
+
         return layout
 
     def build_demodulation_options_section(self):
@@ -1019,6 +1135,8 @@ class HifiUi(QMainWindow):
             self.demod_type_combo.findText(values.demod_type)
         )
 
+        self.threads_spinbox.setValue(max(1, int(values.threads)))
+
         self.input_sample_rate = values.input_sample_rate / 1e6
         found_rate = False
         for i, rate in enumerate(self._input_combo_rates):
@@ -1033,7 +1151,8 @@ class HifiUi(QMainWindow):
         self.update_afe_values(
             values.format,
             values.standard,
-            values.afe_vco_deviation,
+            values.afe_left_carrier_deviation,
+            values.afe_right_carrier_deviation,
             values.afe_left_carrier,
             values.afe_right_carrier,
         )
@@ -1068,7 +1187,8 @@ class HifiUi(QMainWindow):
         values.deemphasis_high_tau = self.deemphasis_high_tau_dial_control.value()
         values.nr_deemphasis_low_tau = self.nr_deemphasis_low_tau_dial_control.value()
         values.nr_deemphasis_high_tau = self.nr_deemphasis_high_tau_dial_control.value()
-        values.afe_vco_deviation = self.afe_vco_deviation_spinbox.value()
+        values.afe_left_carrier_deviation = self.afe_left_carrier_deviation_spinbox.value()
+        values.afe_right_deviation = self.afe_right_carrier_deviation_spinbox.value()
         values.afe_left_carrier = self.afe_left_carrier_spinbox.value()
         values.afe_right_carrier = self.afe_right_carrier_spinbox.value()
         values.spectral_nr_amount = float(
@@ -1092,24 +1212,28 @@ class HifiUi(QMainWindow):
         values.input_sample_rate = self.input_sample_rate
         values.input_file = self.input_file
         values.output_file = self.output_file
+        values.threads = self.threads_spinbox.value()
         return values
 
     def update_afe_values(
         self,
         format,
         standard,
-        afe_vco_deviation=0,
+        afe_left_carrier_deviation=0,
+        afe_right_carrier_deviation=0,
         afe_left_carrier=0,
         afe_right_carrier=0,
     ):
         standard, _ = get_standard(
             "vhs" if format == "VHS" else "8mm",
             "p" if standard == "PAL" else "n",
-            afe_vco_deviation,
+            afe_left_carrier_deviation,
+            afe_right_carrier_deviation,
             afe_left_carrier,
             afe_right_carrier,
         )
-        self.afe_vco_deviation_spinbox.setValue(int(standard.VCODeviation))
+        self.afe_left_carrier_deviation_spinbox.setValue(int(standard.LCarrierDeviation))
+        self.afe_right_carrier_deviation_spinbox.setValue(int(standard.RCarrierDeviation))
         self.afe_left_carrier_spinbox.setValue(int(standard.LCarrierRef))
         self.afe_right_carrier_spinbox.setValue(int(standard.RCarrierRef))
 
@@ -1254,7 +1378,24 @@ class HifiUi(QMainWindow):
         print("[STOP] Stop command issued.")
         self._transport_state = STOP_STATE
 
+    def set_input_sample_rate_mhz(self, mhz: float):
+        """Set the input sample rate, selecting a matching preset when one
+        exists, otherwise showing it as "Other (X)"."""
+        self.input_sample_rate = mhz
+        for i, rate in enumerate(self._input_combo_rates):
+            if abs((rate - mhz) * 1e6) < 5000:
+                self.input_samplerate_combo.setCurrentIndex(i)
+                # use the preset value so the displayed selection and the
+                # rate used for decoding always match
+                self.input_sample_rate = rate
+                return
+        self.input_samplerate_combo.setPlaceholderText(f"Other ({mhz:g})")
+        self.input_samplerate_combo.setCurrentIndex(-1)
+
     def on_input_samplerate_changed(self):
+        if self.input_samplerate_combo.currentIndex() < 0:
+            # placeholder ("Other (X)") is showing, rate was set directly
+            return
         print("Input sample rate changed.")
         if "Other" in self.input_samplerate_combo.currentText():
             input_dialog = InputDialog(
@@ -1514,6 +1655,8 @@ class CollapsableSection(QVBoxLayout):
 
 
 class FileIODialogUI(HifiUi):
+    OUTPUT_FILE_SUFFIX = "_HiFi_Decoded.flac"
+
     def __init__(
         self,
         params: MainUIParameters,
@@ -1521,11 +1664,23 @@ class FileIODialogUI(HifiUi):
         main_layout_callback=None,
     ):
         super(FileIODialogUI, self).__init__(params, title, self._layout_callback)
+        # accept files dragged from a file manager anywhere on the window
+        self.setAcceptDrops(True)
 
     def _layout_callback(self, main_layout):
         # Add file input widgets
         self.file_input_label = QLabel("Input file")
         self.file_input_textbox = QLineEdit(self)
+        self.file_input_textbox.setPlaceholderText(
+            "Select, type or drag && drop the RF capture file here"
+        )
+        # let drops fall through to the window-level drop handler instead of
+        # QLineEdit pasting a file:// url as plain text
+        self.file_input_textbox.setAcceptDrops(False)
+        self.file_input_textbox.editingFinished.connect(
+            self.on_input_editing_finished
+        )
+        self._last_input_path = ""
         self.file_input_button = QPushButton("Browse", self)
         self.file_input_button.clicked.connect(self.on_file_input_button_clicked)
         self.file_input_layout = QHBoxLayout()
@@ -1566,6 +1721,74 @@ class FileIODialogUI(HifiUi):
         self.file_input_label.setMinimumWidth(max_label_width)
         self.file_output_label.setMinimumWidth(max_label_width)
 
+    @staticmethod
+    def derive_output_file(input_path: str) -> str:
+        """Build <input dir>/<input basename>_HiFi_Decoded.flac"""
+        root, _ = os.path.splitext(input_path)
+        return f"{root}{FileIODialogUI.OUTPUT_FILE_SUFFIX}"
+
+    def auto_populate_output_file(self, input_path: str):
+        if not input_path:
+            return
+        derived = FileIODialogUI.derive_output_file(input_path)
+        if self.file_output_textbox.text() != derived:
+            self.file_output_textbox.setText(derived)
+            print(f"Output file auto set to: {derived}")
+
+    def auto_set_input_frequency(self, input_path: str):
+        """Initialize the input sample rate from a FLAC capture's header.
+
+        RF FLAC captures store the capture rate in kHz (e.g. MISRC writes
+        40000 for 40 MSps) because the STREAMINFO field cannot hold MHz
+        rates.
+        """
+        if not input_path.lower().endswith(".flac"):
+            return
+        streaminfo = parse_flac_streaminfo(input_path)
+        if streaminfo is None or streaminfo["sample_rate"] <= 0:
+            return
+        mhz = streaminfo["sample_rate"] / 1000.0
+        if not 1.0 <= mhz <= 200.0:
+            # does not look like an RF capture rate, leave the setting alone
+            return
+        self.set_input_sample_rate_mhz(mhz)
+        print(f"Input sample rate auto set to {mhz:g} MHz from the FLAC header")
+
+    def set_input_file(self, file_name: str):
+        self.file_input_textbox.setText(file_name)
+        self._last_input_path = file_name
+        self.auto_populate_output_file(file_name)
+        self.auto_set_input_frequency(file_name)
+
+    def on_input_editing_finished(self):
+        # auto fill the output when the user typed/pasted a new input path
+        text = self.file_input_textbox.text()
+        if text and text != self._last_input_path:
+            self._last_input_path = text
+            self.auto_populate_output_file(text)
+            self.auto_set_input_frequency(text)
+
+    def dragEnterEvent(self, event):
+        mime_data = event.mimeData()
+        if mime_data.hasUrls() and any(
+            url.isLocalFile() for url in mime_data.urls()
+        ):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if os.path.isfile(path):
+                self.set_input_file(path)
+                print(f"Input file set by drag and drop: {path}")
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
     def on_file_input_button_clicked(self):
         qdialog = QFileDialog(self)
         qdialog.setFileMode(QFileDialog.FileMode.AnyFile)
@@ -1576,7 +1799,7 @@ class FileIODialogUI(HifiUi):
         )
 
         if os.path.exists(file_name):
-            self.file_input_textbox.setText(file_name)
+            self.set_input_file(file_name)
         print("Input browse button clicked.")
 
     def on_file_output_button_clicked(self):
@@ -1600,7 +1823,11 @@ class FileIODialogUI(HifiUi):
     def setValues(self, values: MainUIParameters):
         super(FileIODialogUI, self).setValues(values)
         self.file_input_textbox.setText(values.input_file)
+        self._last_input_path = values.input_file
         self.file_output_textbox.setText(values.output_file)
+        # an input was provided without an output: derive the output name
+        if values.input_file and not values.output_file:
+            self.auto_populate_output_file(values.input_file)
 
     def on_decode_finished(self, decoded_filename: str = "input stream"):
         decoded_filename = os.path.basename(self.file_input_textbox.text())
