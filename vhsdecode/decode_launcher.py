@@ -1235,15 +1235,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Decode Launcher (Qt) for starting decode/tools commands"
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "input_file",
+        nargs="?",
+        metavar="FILE",
+        help="RF input file to pre-load (optional)",
+    )
+    args = parser.parse_args(argv)
 
     app = QApplication(sys.argv)
+    app.setApplicationName("io.github.vhs-decode.decode-launcher")
+    if hasattr(app, "setApplicationDisplayName"):
+        app.setApplicationDisplayName("Decode Launcher")
+    if hasattr(app, "setDesktopFileName"):
+        app.setDesktopFileName("io.github.vhs-decode.decode-launcher")
     icon = _load_app_icon()
     if icon is not None and not icon.isNull():
         app.setWindowIcon(icon)
     _apply_fusion_dark_mode(app)
     window = DecodeLauncherWindow()
     window.show()
+    if args.input_file:
+        window.input_edit.setText(str(Path(args.input_file).resolve()))
     return app.exec() if hasattr(app, "exec") else app.exec_()
 
 

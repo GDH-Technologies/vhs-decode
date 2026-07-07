@@ -32,7 +32,12 @@ from vhsdecode.cmdcommons import (
     test_output_file,
 )
 from vhsdecode.formats import TAPE_SPEEDS
-from vhsd_rust import check_debug
+
+try:
+    from vhsd_rust import check_debug
+except Exception:
+    def check_debug():
+        return False
 
 supported_tape_formats = {
     "VHS",
@@ -469,6 +474,20 @@ def main(args=None, use_gui=False):
         default=False,
         help="export a raw TBC without deemphasis applied for filter tuning",
     )
+    debug_group.add_argument(
+        "--use-gpu",
+        dest="use_gpu",
+        action="store_true",
+        default=False,
+        help="Enable CUDA acceleration when supported.",
+    )
+    debug_group.add_argument(
+        "--force-cpu",
+        dest="force_cpu",
+        action="store_true",
+        default=False,
+        help="Force CPU backend even when CUDA is available.",
+    )
     dodgroup = parser.add_argument_group("Dropout detection options")
     dodgroup.add_argument(
         "--noDOD",
@@ -617,6 +636,8 @@ def main(args=None, use_gui=False):
     rf_options["disable_burst_hsync"] = args.disable_burst_hsync
     rf_options["disable_phase_correction"] = args.disable_phase_correction
     rf_options["gnrc_afe"] = args.gnrc_afe
+    rf_options["use_gpu"] = args.use_gpu
+    rf_options["force_cpu"] = args.force_cpu
 
     extra_options = get_extra_options(args, not use_gui)
     extra_options["params_file"] = args.params_file
@@ -626,7 +647,7 @@ def main(args=None, use_gui=False):
     # allowing SIGINT/control-C's to be handled cleanly
     original_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    logger = init_logging(outname + ".log")
+    logger = init_logging(outname + ".log", debug=args.debug)
 
     tape_format = args.tape_format.upper()
     if tape_format not in supported_tape_formats:
@@ -660,6 +681,12 @@ def main(args=None, use_gui=False):
         debug_plot=debug_plot,
         field_order_action=args.field_order_action,
     )
+    backend = vhsd.rf.gpu_backend
+    if backend.active:
+        gpu_desc = f" ({backend.gpu_name})" if backend.gpu_name else ""
+        logger.info("Using GPU backend: %s%s", backend.name, gpu_desc)
+    else:
+        logger.info("Using CPU backend: %s (%s)", backend.name, backend.reason)
 
     if check_debug():
         logger.warning("Rust modules are compiled in debug mode! vhs-decode will run slower.")

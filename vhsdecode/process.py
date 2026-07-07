@@ -9,10 +9,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import lddecode.core as ldd
 
-# from lddecode.core import npfft
-# Use numpy fft rather than scipy fft as is imported in lddecode core as it seems to be slightly faster.
-import numpy.fft as npfft
-
 import lddecode.utils as lddu
 import vhsdecode.utils as utils
 from vhsdecode.utils import StackableMA, filtfft
@@ -48,8 +44,16 @@ from vhsdecode.compute_video_filters import (
 from vhsdecode import compute_video_filters as cvf
 from vhsdecode.demodcache import DemodCacheTape
 from vhsdecode.rust_utils import sosfiltfilt_rust
+from vhsdecode.gpu_backend import (
+    create_backend,
+    fft,
+    ifft,
+    irfft,
+    rfft,
+    to_backend_array,
+    to_numpy_if_needed,
+)
 from vhsdecode.dbwriter import DBWriter
-
 
 def is_secam(system: str):
     return system == "SECAM" or system == "MESECAM"
@@ -383,14 +387,19 @@ class VHSDecode(ldd.LDdecode):
         if "audioSamples" in fi:
             del fi["audioSamples"]
 
-        self.fieldinfo.append(fi)
-
         if self._db_writer:
+            fi_out = fi.copy()
+            fi_out["seqNo"] = len(self.fieldinfo) + 1
             if not self.capture_id:
                 self.build_sqlite_metadata()
-            self._db_writer.write_field(fi, self.doDOD, self.capture_id)
+            self.fieldinfo.append(fi_out)
+            self._db_writer.write_field(
+                fi_out, self.dbconn, self.capture_id, self.doDOD
+            )
             # NOTE: this calls commit so we don't call it in dbwriter.write_field.
             self.build_sqlite_metadata()
+        else:
+            self.fieldinfo.append(fi)
 
         self.outfile_video.write(picturey)
         if self.rf.options.write_chroma:
@@ -667,6 +676,10 @@ class VHSRFDecode(ldd.RFDecode):
         self._disable_diff_demod = rf_options.get("disable_diff_demod", False)
         self.useAGC = extra_options.get("useAGC", False)
         self.debug = extra_options.get("debug", False)
+        self._gpu_backend = create_backend(
+            use_gpu=rf_options.get("use_gpu", False),
+            force_cpu=rf_options.get("force_cpu", False),
+        )
 
         # Enable cafc for betamax until proper track detection for it is implemented.
         self._do_cafc = (
@@ -995,6 +1008,10 @@ class VHSRFDecode(ldd.RFDecode):
         return self._dod_options
 
     @property
+    def gpu_backend(self):
+        return self._gpu_backend
+
+    @property
     def field_averages(self):
         return self._field_averages
 
@@ -1259,15 +1276,23 @@ class VHSRFDecode(ldd.RFDecode):
         rv = {}
         demod_block_debug = False
         demod_start_time = time.time()
+        backend = self._gpu_backend
+        backend_filter_cache = {}
+
+        def _get_backend_filter(name):
+            if name not in backend_filter_cache:
+                backend_filter_cache[name] = to_backend_array(self.Filters[name], backend)
+            return backend_filter_cache[name]
+
         if fftdata is not None:
-            indata_fft = fftdata
+            indata_fft = to_backend_array(fftdata, backend)
         elif data is not None:
-            indata_fft = npfft.fft(data[: self.blocklen])
+            indata_fft = fft(to_backend_array(data[: self.blocklen], backend), backend)
         else:
             raise Exception("demodblock called without raw or FFT data")
 
         if data is None:
-            data = npfft.ifft(indata_fft).real
+            data = to_numpy_if_needed(ifft(indata_fft, backend).real, backend)
 
         if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
             demod_block_debug = True
@@ -1276,12 +1301,14 @@ class VHSRFDecode(ldd.RFDecode):
             indata_fft_copy = indata_fft.copy()
 
         if self._notch is not None:
-            indata_fft *= self.Filters["FVideoNotchF"]
+            indata_fft *= _get_backend_filter("FVideoNotchF")
 
         # Applies RF filters
-        indata_fft *= self.Filters["RFVideo"]
+        indata_fft *= _get_backend_filter("RFVideo")
 
-        raw_filtered = npfft.ifft(indata_fft * self.Filters["hilbert"]).real.astype(
+        raw_filtered = to_numpy_if_needed(
+            ifft(indata_fft * _get_backend_filter("hilbert"), backend).real, backend
+        ).astype(
             np.single
         )
 
@@ -1301,16 +1328,20 @@ class VHSRFDecode(ldd.RFDecode):
         # on sharp transitions. Using filtfilt to avoid phase issues.
         if len(np.where(env == 0)[0]) == 0:  # checks for zeroes on env
             if self._high_boost is not None:
-                data_filtered = npfft.ifft(indata_fft).real
+                data_filtered = to_numpy_if_needed(ifft(indata_fft, backend).real, backend)
                 high_part = sosfiltfilt_rust(self.Filters["RFTop"], data_filtered) * (
                     (env_mean * 0.9) / env
                 )
                 del data_filtered
-                indata_fft += npfft.fft(high_part * self._high_boost)
+                indata_fft += fft(
+                    to_backend_array(high_part * self._high_boost, backend), backend
+                )
         else:
             ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
 
-        hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
+        hilbert = to_numpy_if_needed(
+            ifft(indata_fft * _get_backend_filter("hilbert"), backend), backend
+        )
 
         if not demod_block_debug:
             del indata_fft
@@ -1353,13 +1384,16 @@ class VHSRFDecode(ldd.RFDecode):
             demod = self.chromaTrap.work(demod)
 
         # applies main deemphasis filter
-        demod_fft = npfft.rfft(demod)
-        out_video_fft = demod_fft * self.Filters["FVideo"]
-        out_video = npfft.irfft(out_video_fft).real
+        demod_fft = rfft(to_backend_array(demod, backend), backend)
+        out_video_fft = demod_fft * _get_backend_filter("FVideo")
+        out_video = to_numpy_if_needed(irfft(out_video_fft, backend).real, backend)
 
         if self.options.nldeemp:
             # Extract the high frequency part of the signal
-            hf_part = npfft.irfft(out_video_fft * self.Filters["NLHighPassF"])
+            hf_part = to_numpy_if_needed(
+                irfft(out_video_fft * _get_backend_filter("NLHighPassF"), backend),
+                backend,
+            )
             # Limit it to preserve sharp transitions
             np.clip(
                 hf_part,
@@ -1372,9 +1406,10 @@ class VHSRFDecode(ldd.RFDecode):
             out_video -= hf_part
 
         if self.options.subdeemp:
+            out_video_fft_cpu = to_numpy_if_needed(out_video_fft, backend)
             out_video = sub_deemphasis(
                 out_video,
-                out_video_fft,
+                out_video_fft_cpu,
                 self.Filters,
                 self._sub_emphasis_params.deviation,
                 self._sub_emphasis_params.exponential_scaling,
@@ -1392,7 +1427,9 @@ class VHSRFDecode(ldd.RFDecode):
                 self.Filters["fsc_notch"][0], self.Filters["fsc_notch"][1], out_video
             )
 
-        out_video05 = npfft.irfft(demod_fft * self.Filters["FVideo05"]).real
+        out_video05 = to_numpy_if_needed(
+            irfft(demod_fft * _get_backend_filter("FVideo05"), backend).real, backend
+        )
         out_video05 = np.roll(out_video05, -self.Filters["F05_offset"])
 
         # Filter out the color-under signal from the raw data.
@@ -1418,7 +1455,7 @@ class VHSRFDecode(ldd.RFDecode):
 
             plot_magnitude_density(
                 raw_data=data[: self.blocklen],
-                filtered_data=npfft.ifft(indata_fft).real,
+                filtered_data=to_numpy_if_needed(ifft(indata_fft, backend).real, backend),
                 rfdecode=self,
             )
 
@@ -1427,11 +1464,11 @@ class VHSRFDecode(ldd.RFDecode):
 
             plot_input_data(
                 raw_data=data,
-                filtered_data=npfft.ifft(indata_fft).real,
+                filtered_data=to_numpy_if_needed(ifft(indata_fft, backend).real, backend),
                 env=env,
                 env_mean=env_mean,
-                raw_fft=indata_fft_copy,
-                filtered_fft=indata_fft,
+                raw_fft=to_numpy_if_needed(indata_fft_copy, backend),
+                filtered_fft=to_numpy_if_needed(indata_fft, backend),
                 demod_video=demod,
                 filtered_video=out_video,
                 chroma=out_chroma,

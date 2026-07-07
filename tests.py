@@ -1,4 +1,7 @@
 import unittest
+import os
+import subprocess
+import sys
 
 import numpy as np
 
@@ -249,4 +252,11 @@ class LevelDetect(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if "--benchmark-gpu" in sys.argv:
+        sys.argv.remove("--benchmark-gpu")
+        benchmark_path = os.path.join(
+            os.path.dirname(__file__), "vhs_scripts", "benchmark_gpu_phase1.py"
+        )
+        result = subprocess.run([sys.executable, benchmark_path] + sys.argv[1:])
+        raise SystemExit(result.returncode)
     unittest.main()

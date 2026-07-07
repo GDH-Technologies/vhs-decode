@@ -12,7 +12,7 @@ import warnings
 
 import threading
 from queue import Queue
-from math import tau
+from concurrent.futures import ThreadPoolExecutor
 
 from numba import njit
 import numba
@@ -113,33 +113,48 @@ sinc_phase_count = 2**16
 
 
 # https://ccrma.stanford.edu/~jos/sasp/Kaiser_Windows_Transforms.html
-# def build_kaiser_lut(beta, taps, phases):
-#     a = taps // 2
-#
-#     offsets = np.arange(a - 1, -a - 1, -1)
-#     offsets_len = len(offsets)
-#
-#     table = np.zeros((phases + 1, taps), dtype=np.float32)
-#     weights = np.empty(offsets_len, dtype=np.float32)
-#     i0_beta = i0(beta)
-#
-#     for i in range(phases):
-#         phase = i / phases
-#
-#         s = 0.0
-#         for j in range(offsets_len):
-#             x = offsets[j] + phase
-#             weight = sinc(x) * kaiser_window(x, a, beta, i0_beta)
-#
-#             weights[j] = weight
-#             s += weight
-#
-#         table[i, :] = weights / s
-#
-#     # copy the last phase to avoid bounds checking later on when we do linear interpolation
-#     table[phases] = table[phases - 1]
-#
-#     return table
+def build_kaiser_lut(beta, taps, phases):
+    a = taps // 2
+
+    offsets = np.arange(a - 1, -a - 1, -1)
+    offsets_len = len(offsets)
+
+    table = np.zeros((phases + 1, taps), dtype=np.float32)
+    weights = np.empty(offsets_len, dtype=np.float32)
+    i0_beta = i0(beta)
+
+    for i in range(phases):
+        phase = i / phases
+
+        s = 0.0
+        for j in range(offsets_len):
+            x = offsets[j] + phase
+            weight = sinc(x) * kaiser_window(x, a, beta, i0_beta)
+
+            weights[j] = weight
+            s += weight
+
+        table[i, :] = weights / s
+
+    # copy the last phase to avoid bounds checking later on when we do linear interpolation
+    table[phases] = table[phases - 1]
+
+    return table
+
+# Kaiser Beta parameter controls trade-off between sharpness and ringing
+# Small Beta = more sharpness / more ringing (narrow main lobe (more sharp), less side lobe cutoff (more ringing))
+# Large Beta = less sharpness / less ringing (wide main lobe (less sharp), more side lobe cutoff (less ringing))
+kaiser_beta = 5
+sinc_tap_count = 16 # must be multiple of 2
+sinc_phase_count = 2**16
+
+# Build sinc LUT in a background thread so import does not block.
+# ProcessPoolExecutor at import time breaks under Python 3.14+ (forkserver/spawn
+# re-imports the CLI entrypoint; see "Safe importing of main module").
+_sinc_lut_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lddecode_kaiser")
+sinc_lut_future = _sinc_lut_executor.submit(
+    build_kaiser_lut, kaiser_beta, sinc_tap_count, sinc_phase_count
+)
 
 
 @njit(nogil=True, fastmath=True)

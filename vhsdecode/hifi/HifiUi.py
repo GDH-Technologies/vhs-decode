@@ -31,6 +31,11 @@ try:
         QGridLayout,
     )
     from PyQt6 import QtGui, QtCore
+    import matplotlib
+
+    matplotlib.use("QtAgg")  # Must come before importing pyplot; QtAgg supports PyQt6
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 except ImportError:
     from PyQt5.QtGui import QIcon
     from PyQt5.QtWidgets import (
@@ -54,6 +59,13 @@ except ImportError:
         QGridLayout,
     )
     from PyQt5 import QtGui, QtCore
+    import matplotlib
+
+    matplotlib.use("Qt5Agg")  # Must come before importing pyplot
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+
+import matplotlib.pyplot as plt
 
 from vhsdecode.hifi.constants import (
     DEFAULT_8MM_AUDIO_MODE,

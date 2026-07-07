@@ -1774,15 +1774,12 @@ def run_decoder(args, decode_options, ui_t: Optional[AppWindow] = None):
 
     if sample_freq is not None:
         with ThreadPoolExecutor(4) as async_executor:
-            # work around for Windows not creating an event loop for the main thread
+            # Python 3.14 can raise here when no loop is set for main thread.
             try:
                 loop = asyncio.get_event_loop()
-            except RuntimeError as e:
-                if str(e).startswith('There is no current event loop in thread'):
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                else:
-                    raise
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
 
             loop.set_default_executor(async_executor)
             loop.run_until_complete(
