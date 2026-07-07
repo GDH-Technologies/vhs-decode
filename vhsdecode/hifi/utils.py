@@ -97,6 +97,8 @@ class NUMA:
             ("maskp", ctypes.POINTER(ctypes.c_ulong)),
         ]
 
+    BitmaskPtr = ctypes.POINTER(Bitmask)
+
     @classmethod
     def _load_libnuma(cls):
         if cls._libnuma is not None:
@@ -105,17 +107,26 @@ class NUMA:
         try:
             libnuma = ctypes.CDLL("libnuma.so.1")
 
-            libnuma.numa_available.restype = ctypes.c_int
-            libnuma.numa_max_node.restype = ctypes.c_int
-            libnuma.numa_node_to_cpus.argtypes = [ctypes.c_int, ctypes.c_void_p]
-            libnuma.numa_node_to_cpus.restype = ctypes.c_int
-            libnuma.numa_run_on_node.argtypes = [ctypes.c_int]
-            libnuma.numa_set_preferred.argtypes = [ctypes.c_int]
-            libnuma.numa_tonode_memory.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_int,
-            ]
+            # Configure required NUMA symbols in one place to keep this loader concise.
+            signatures = {
+                "numa_available": (None, ctypes.c_int),
+                "numa_max_node": (None, ctypes.c_int),
+                "numa_node_to_cpus": ([ctypes.c_int, ctypes.c_void_p], ctypes.c_int),
+                "numa_run_on_node": ([ctypes.c_int], ctypes.c_int),
+                "numa_set_preferred": ([ctypes.c_int], None),
+                "numa_allocate_nodemask": ([], cls.BitmaskPtr),
+                "numa_bitmask_free": ([cls.BitmaskPtr], None),
+                "numa_bitmask_clearall": ([cls.BitmaskPtr], cls.BitmaskPtr),
+                "numa_bitmask_setbit": ([cls.BitmaskPtr, ctypes.c_uint], cls.BitmaskPtr),
+                "numa_run_on_node_mask": ([cls.BitmaskPtr], ctypes.c_int),
+                "numa_tonode_memory": ([ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int], ctypes.c_long),
+            }
+
+            for symbol_name, (argtypes, restype) in signatures.items():
+                symbol = getattr(libnuma, symbol_name)
+                if argtypes is not None:
+                    symbol.argtypes = argtypes
+                symbol.restype = restype
 
             cls._libnuma = libnuma
             return libnuma
@@ -201,12 +212,16 @@ class NUMA:
         if not cpus:
             return False
 
+        mask = None
         try:
             cpus = cls._cpus_for_node(node)
             if cpus:
                 os.sched_setaffinity(0, cpus)
 
             mask = cls._libnuma.numa_allocate_nodemask()
+            if not mask:
+                return False
+
             cls._libnuma.numa_bitmask_clearall(mask)
             cls._libnuma.numa_bitmask_setbit(mask, node)
 
@@ -215,6 +230,12 @@ class NUMA:
             return True
         except Exception:
             return False
+        finally:
+            try:
+                if mask:
+                    cls._libnuma.numa_bitmask_free(mask)
+            except Exception:
+                pass
 
     @classmethod
     def get_shared_memory(

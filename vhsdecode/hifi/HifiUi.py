@@ -261,6 +261,7 @@ def decode_options_to_ui_parameters(decode_options):
 def ui_parameters_to_decode_options(values: MainUIParameters):
     decode_options = {
         "input_rate": float(values.input_sample_rate) * 1e6,
+        "input_format_override": None,
         "standard": "p" if values.standard == "PAL" else "n",
         "format": "vhs" if values.format == "VHS" else "8mm",
         "demod_type": values.demod_type.lower(),

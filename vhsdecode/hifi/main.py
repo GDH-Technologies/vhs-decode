@@ -1346,7 +1346,7 @@ async def decode_parallel(
         guess_bias(decoder, decode_options["input_file"], int(decode_options["input_rate"]))
 
     input_file = decode_options["input_file"]
-    input_format_override = decode_options["input_format_override"]
+    input_format_override = decode_options.get("input_format_override")
     output_file = decode_options["output_file"]
 
     channel_1_suffix = DEFAULT_CHANNEL_SUFFIX + "_1"
@@ -1741,10 +1741,29 @@ def guess_bias(decoder, input_file, block_size, blocks_limits=10):
     blocks = list()
 
     with as_soundfile(input_file) as f:
-        while f.tell() < f.frames and len(blocks) <= blocks_limits:
+        # Some reader backends (for example AsyncReader) do not expose tell().
+        # Track consumed frames ourselves so this works uniformly across all
+        # as_soundfile() return types.
+        frames_read_total = 0
+        while len(blocks) <= blocks_limits:
+            # Guard against known-length inputs before attempting another read.
+            if f.frames and frames_read_total >= f.frames:
+                break
+
             block_buffer = np.empty(block_size, dtype=f.dtype, order="C")
-            f.buffer_read_into_sync(block_buffer)
+            frames_read = f.buffer_read_into_sync(block_buffer)
+
+            # A non-positive read indicates EOF (or failed read); stop sampling.
+            if frames_read <= 0:
+                break
+
+            # Keep only valid samples from the final short read so bias
+            # estimation never consumes uninitialized tail data.
+            if frames_read < len(block_buffer):
+                block_buffer = block_buffer[0:frames_read]
+
             blocks.append(block_buffer)
+            frames_read_total += frames_read
 
     decoder.guessBiases(blocks)
     print("\ndone!")
