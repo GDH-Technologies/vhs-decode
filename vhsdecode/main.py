@@ -5,6 +5,7 @@ import signal
 import traceback
 import json
 import shutil
+import tempfile
 import time
 import faulthandler
 import math
@@ -335,6 +336,22 @@ def main(args=None, use_gui=False):
         help="Disables using the color burst phase to refine hsync.",
     )
     chroma_group.add_argument(
+        "--secam_servo_passes",
+        dest="secam_servo_passes",
+        type=int,
+        choices=[0, 1, 2],
+        default=1,
+        help="SECAM carrier servo mode: 0 disables measuring the rest carrier pair to fine-tune the chroma up-conversion, 1 measures and adapts during the decode (default), 2 runs a short calibration decode first and applies the converged LO trim from the first field. (ME-SECAM only; method 1 SECAM has no conversion crystal to correct for)",
+    )
+    chroma_group.add_argument(
+        "--secam_lo_trim",
+        dest="secam_lo_trim",
+        type=float,
+        default=None,
+        metavar="hz",
+        help="Seeds the SECAM chroma conversion LO trim in Hz (e.g. a converged servo value from a previous run) so it applies from the first field. With --secam_servo_passes 0 the value is used as a fixed trim. (ME-SECAM only)",
+    )
+    chroma_group.add_argument(
         "--ck",
         "--enable_color_killer",
         dest="enable_color_killer",
@@ -570,16 +587,20 @@ def main(args=None, use_gui=False):
     if not args.no_resample:
         sample_freq = 40
 
+    def build_loader():
+        made_loader = lddu.make_loader(filename, loader_input_freq)
+
+        # Note: Fallback to ffmpeg, not .lds format
+        # Temporary workaround until this is sorted upstream.
+        if made_loader is lddu.load_packed_data_4_40 and not filename.endswith(".lds"):
+            made_loader = lddu.LoadFFmpeg()
+        return made_loader
+
     try:
-        loader = lddu.make_loader(filename, loader_input_freq)
+        loader = build_loader()
     except ValueError as e:
         print(e)
         sys.exit(1)
-
-    # Note: Fallback to ffmpeg, not .lds format
-    # Temporary workaround until this is sorted upstream.
-    if loader is lddu.load_packed_data_4_40 and not filename.endswith(".lds"):
-        loader = lddu.LoadFFmpeg()
 
     dod_threshold_p = f.DEFAULT_THRESHOLD_P_DDD
     # Guesstimate a sample rate of around 28 is cx card and use different doc threshold
@@ -616,6 +637,8 @@ def main(args=None, use_gui=False):
     rf_options["enable_color_killer"] = args.enable_color_killer
     rf_options["disable_burst_hsync"] = args.disable_burst_hsync
     rf_options["disable_phase_correction"] = args.disable_phase_correction
+    rf_options["secam_carrier_servo"] = args.secam_servo_passes >= 1
+    rf_options["secam_lo_trim"] = args.secam_lo_trim
     rf_options["gnrc_afe"] = args.gnrc_afe
 
     extra_options = get_extra_options(args, not use_gui)
@@ -640,6 +663,71 @@ def main(args=None, use_gui=False):
 
     if args.cxadc:
         logger.warning("--cxadc is deprecated! use -f 8fsc instead!")
+
+    if (
+        args.secam_servo_passes == 2
+        and system == "MESECAM"
+        and rf_options.get("secam_lo_trim") is None
+    ):
+        # First pass: decode a bounded stretch to converge the SECAM carrier
+        # servo, then seed the real decode with the converged LO trim so it
+        # applies from the very first field.
+        calib_frames = int(min(req_frames, 30))
+        calib_dir = tempfile.mkdtemp(prefix="vhs_decode_secam_calib_")
+        logger.info(
+            "SECAM servo two-pass: calibration decode of %d frame(s)...",
+            calib_frames,
+        )
+        try:
+            # The loader can hold streaming decode state (ffmpeg/flac), so the
+            # calibration instance gets its own rather than sharing the main one.
+            calib = VHSDecode(
+                filename,
+                os.path.join(calib_dir, "calibration"),
+                build_loader(),
+                logger,
+                system=system,
+                tape_format=tape_format,
+                doDOD=False,
+                threads=args.threads,
+                inputfreq=sample_freq,
+                level_adjust=args.level_adjust,
+                rf_options=rf_options,
+                extra_options=extra_options,
+                field_order_action=args.field_order_action,
+            )
+            if args.start_fileloc != -1:
+                calib.roughseek(args.start_fileloc, False)
+            else:
+                calib.roughseek(firstframe * 2)
+
+            while calib.fields_written < (calib_frames * 2):
+                f = calib.readfield()
+                if f is None:
+                    break
+                f.prevfield = None
+
+            lo_trim = calib.rf.secam_servo_avg.pull()
+            calib.close()
+
+            if lo_trim is not None:
+                rf_options["secam_lo_trim"] = lo_trim
+                logger.info(
+                    "SECAM servo two-pass: converged LO trim %.0f Hz, starting decode",
+                    lo_trim,
+                )
+            else:
+                logger.warning(
+                    "SECAM servo two-pass: no usable carrier measurements, "
+                    "starting decode without a seeded trim"
+                )
+        except KeyboardInterrupt:
+            print("\nTerminated during servo calibration, exiting")
+            sys.exit(1)
+        except Exception as err:
+            logger.warning("SECAM servo two-pass calibration failed: %s", err)
+        finally:
+            shutil.rmtree(calib_dir, ignore_errors=True)
 
     # Initialize VHS decoder
     # Note, we pass 40 as sample frequency, as any other will be resampled by the

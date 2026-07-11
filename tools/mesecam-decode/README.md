@@ -28,7 +28,7 @@ Download the Graph & Script here:
 ## Graphs
 
 
-Colour values are set to properly decode colour of TBC files who were decoded by using the MESECAM option in vhs-decode. 
+The Color Blue/Red values default to the studio SECAM subcarrier rest frequencies (foB = 4.25 MHz, foR = 4.40625 MHz, i.e. 4.25e6/350e3 and 4.40625e6/350e3), matching TBC files decoded with the MESECAM option in current vhs-decode. For TBC files made with older vhs-decode versions, whose restored carriers sat about 108 kHz high, use the previous values of 12.45 and 12.90 instead.
 
 Also MESECAM option should be the preferred one for decoding, as there are less colour streaks in the decoded video.
 

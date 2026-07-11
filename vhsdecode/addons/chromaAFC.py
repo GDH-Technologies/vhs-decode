@@ -26,11 +26,23 @@ class ChromaAFC:
         tape_format="VHS",
         do_cafc=False,
         chroma_bpf_lower=60000,
+        conversion_lo_freq=None,
     ):
         self.tape_format = tape_format
         self.fv = sys_params["FPS"] * 2
         self.fh = sys_params["FPS"] * sys_params["frame_lines"]
         self.color_under = color_under_carrier_f
+        # Explicit colour-under conversion LO (Hz). When set (ME-SECAM), the
+        # up-conversion mixes against this frequency instead of
+        # fsc + color under carrier, referenced to the true TBC output rate
+        # so the restored carriers land exactly on their studio frequencies.
+        self.conversion_lo = conversion_lo_freq
+        self.conversion_lo_trim = 0.0
+        self.het_sample_offset = 0
+        # The rate the TBC output is actually clocked at (outlinelen samples
+        # per line period), as opposed to samp_rate = 4 * fsc which outlinelen
+        # only approximates after rounding to whole samples.
+        self.true_samp_rate = sys_params["outlinelen"] * self.fh
         self.cc_phase = 0
         self.power_threshold = 1 / 3
         self.transition_expand = 12
@@ -166,6 +178,22 @@ class ChromaAFC:
         Which is a -cosine of fcc + fsc frequency, and
         phase_cc phase, assuming phase_sc = 0
         """
+        if self.conversion_lo is not None:
+            # ME-SECAM: mix against the recorder's conversion LO directly.
+            # The heterodyne phases are never rotated for SECAM, so a single
+            # wave is generated and reused for all four phase slots.
+            het_wave_scale = (
+                self.conversion_lo + self.conversion_lo_trim
+            ) / self.true_samp_rate
+            # Continue the carrier phase from where the previous fields left
+            # off so the restored FM carrier has no phase step (heard by a
+            # SECAM decoder as a chroma click) at field boundaries.
+            phase_offset = twopi * ((het_wave_scale * self.het_sample_offset) % 1.0)
+            wave = -np.cos(
+                (twopi * het_wave_scale * self.samples) + phase_offset
+            ).astype(np.float32)
+            return np.array([wave, wave, wave, wave])
+
         het_freq = self.fsc_mhz + self.cc_freq_mhz
         het_wave_scale = het_freq / self.out_sample_rate_mhz
 
@@ -231,6 +259,21 @@ class ChromaAFC:
     #                sps.sosfiltfilt(het_filter, cc_wave_270 * self.fsc_wave),
     #            ]
     #        )
+
+    # Updates the conversion LO trim (Hz) and the absolute output sample
+    # position of the start of the current field, regenerating the heterodyne
+    # table when either changed. Only used when conversion_lo is set (ME-SECAM).
+    def updateConversion(self, lo_trim_hz, het_sample_offset):
+        if (
+            lo_trim_hz != self.conversion_lo_trim
+            or het_sample_offset != self.het_sample_offset
+        ):
+            self.conversion_lo_trim = lo_trim_hz
+            self.het_sample_offset = het_sample_offset
+            self.genHetC()
+
+    def getConversionTrim(self):
+        return self.conversion_lo_trim
 
     # Returns the chroma heterodyning wave table/array computed after genHetC()
     def getChromaHet(self):

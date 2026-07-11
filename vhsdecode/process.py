@@ -668,11 +668,21 @@ class VHSRFDecode(ldd.RFDecode):
         self.useAGC = extra_options.get("useAGC", False)
         self.debug = extra_options.get("debug", False)
 
+        # cafc measures a single carrier peak, which doesn't exist in the
+        # line-alternating two-carrier SECAM FM chroma signal.
+        requested_cafc = rf_options.get("cafc", False)
+        if requested_cafc and is_secam(system):
+            ldd.logger.warning(
+                "cafc is not supported for SECAM systems, ignoring. "
+                "(For ME-SECAM, the carrier servo tunes the conversion LO instead.)"
+            )
+            requested_cafc = False
+
         # Enable cafc for betamax until proper track detection for it is implemented.
         self._do_cafc = (
             True
             if (tape_format == "BETAMAX" and system != "NTSC")
-            else rf_options.get("cafc", False)
+            else requested_cafc
         )
 
         self.track_phase = None
@@ -758,6 +768,7 @@ class VHSRFDecode(ldd.RFDecode):
                 "enable_color_killer",
                 "disable_burst_hsync",
                 "disable_phase_correction",
+                "secam_carrier_servo",
             ],
         )(
             self.iretohz(100) * 2,
@@ -798,8 +809,12 @@ class VHSRFDecode(ldd.RFDecode):
             rf_options.get("relaxed_line0", False),
             rf_options.get("detect_chroma_track_phase", False),
             rf_options.get("enable_color_killer", False),
-            rf_options.get("disable_burst_hsync", False),
+            # SECAM has no phase-locked burst; the "burst" is an FM carrier
+            # whose phase carries no timing information, so locking hsync to
+            # it just injects sub-pixel jitter into both planes.
+            rf_options.get("disable_burst_hsync", False) or is_secam(system),
             rf_options.get("disable_phase_correction", False),
+            rf_options.get("secam_carrier_servo", True),
         )
 
         # As agc can alter these sysParams values, store a copy to then
@@ -853,6 +868,7 @@ class VHSRFDecode(ldd.RFDecode):
             tape_format=tape_format,
             do_cafc=self._do_cafc,
             chroma_bpf_lower=self.DecoderParams.get("chroma_bpf_lower", 60000),
+            conversion_lo_freq=self.DecoderParams.get("chroma_conversion_lo", None),
         )
 
         self.Filters["FVideoBurst"] = (
@@ -916,6 +932,17 @@ class VHSRFDecode(ldd.RFDecode):
         if is_color_under:
             self.chroma_heterodyne = self._chroma_afc.getChromaHet()
             self.fsc_wave, self.fsc_cos_wave = self._chroma_afc.getFSCWaves()
+
+        # Long-term average of the measured ME-SECAM rest carrier pair offset,
+        # used to trim the chroma up-conversion LO.
+        self.secam_servo_avg = utils.StackableMA(min_watermark=2, window_average=60)
+        lo_trim_seed = rf_options.get("secam_lo_trim", None)
+        if lo_trim_seed is not None and system == "MESECAM":
+            # Seed with a known trim (e.g. from a two-pass calibration decode)
+            # so it applies from the first field. With the servo enabled it
+            # keeps adapting from here; with it disabled this is a fixed trim.
+            for _ in range(3):
+                self.secam_servo_avg.push(float(lo_trim_seed))
 
         # Increase the cutoff at the end of blocks to avoid edge distortion from filters
         # making it through.

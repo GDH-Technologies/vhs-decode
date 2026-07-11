@@ -3,6 +3,7 @@ import numpy as np
 import lddecode.utils as lddu
 import lddecode.core as ldd
 import scipy.signal as sps
+import scipy.fft as sps_fft
 from vhsdecode.rust_utils import sosfiltfilt_rust
 
 from numba import njit
@@ -647,6 +648,86 @@ def decode_chroma_phase_rotation(
 
     return track_phase, phase_sequence, burst_detected_line, burst_magnitude_avg, burst_phase_avg, even_burst_phase_avg, odd_burst_phase_avg
 
+
+def measure_secam_under_carrier_offset(
+    chroma,
+    linesout,
+    outwidth,
+    window,
+    samp_rate,
+    pair_center,
+):
+    """Measure how far the ME-SECAM colour-under rest carrier pair sits from
+    its nominal position, using the undeviated subcarrier on the late back
+    porch of each line (the early porch is still sweeping from the previous
+    line's carrier switch). This picks up the recording VCR's down-conversion
+    crystal error, which otherwise ends up as an offset of both restored
+    subcarriers. (SECAM method 1 has no conversion crystal, so this only
+    applies to the heterodyne method.)
+
+    Returns the offset in Hz of the measured pair midpoint from pair_center,
+    or None if no reliable measurement could be made. Single-field accuracy
+    is on the order of +-100 Hz (ringing from the per-line carrier switch
+    beats across the short porch window); averaging across fields washes
+    this out. Crystal errors being chased are in the kHz range.
+    """
+    # Stay clear of the vertical interval and head switch area.
+    SKIP_LINES = 20
+    MIN_LINES_PER_CLUSTER = 8
+    # The carriers are nominally 156.25 kHz apart; reject measurements where
+    # the two clusters land somewhere else entirely.
+    MIN_SEPARATION = 90e3
+    MAX_SEPARATION = 230e3
+
+    window_start, window_end = window
+    freq_scale = samp_rate / (2 * np.pi)
+
+    # Analytic signal over the whole field so the short per-line windows are
+    # free of transform edge effects (a windowed transform of just the porch
+    # would bias the frequency estimate by hundreds of Hz).
+    n_fft = sps_fft.next_fast_len(len(chroma))
+    analytic = sps.hilbert(chroma, N=n_fft)[: len(chroma)]
+
+    freqs = []
+    envs = []
+
+    for linenumber in range(SKIP_LINES, linesout - SKIP_LINES):
+        line_start = linenumber * outwidth
+        start = line_start + window_start
+        end = line_start + window_end
+        if start < 0 or end > len(chroma):
+            continue
+
+        window_analytic = analytic[start:end]
+        # Instantaneous frequency; median rejects FM clicks and noise spikes.
+        f_inst = np.diff(np.unwrap(np.angle(window_analytic))) * freq_scale
+        freqs.append(np.median(f_inst))
+        envs.append(np.median(np.abs(window_analytic)))
+
+    if not freqs:
+        return None
+
+    freqs = np.asarray(freqs)
+    envs = np.asarray(envs)
+
+    # Ignore lines where the porch carrier is too weak to measure
+    # (dropouts, colour killed lines).
+    valid = envs > (np.median(envs) * 0.25)
+    low = freqs[valid & (freqs < pair_center)]
+    high = freqs[valid & (freqs >= pair_center)]
+
+    if len(low) < MIN_LINES_PER_CLUSTER or len(high) < MIN_LINES_PER_CLUSTER:
+        return None
+
+    low_carrier = np.median(low)
+    high_carrier = np.median(high)
+    separation = high_carrier - low_carrier
+    if separation < MIN_SEPARATION or separation > MAX_SEPARATION:
+        return None
+
+    return ((low_carrier + high_carrier) / 2) - pair_center
+
+
 ntsc_color_framing_phase_shift = 33
 ntsc_color_framing_map = {
     # Color Frame I
@@ -723,6 +804,29 @@ def process_chroma(
                     % (meas / 1e3, offset, cphase * 360 / (2 * np.pi))
                 )
 
+        if (
+            field.rf.color_system == "MESECAM"
+            and field.rf.options.secam_carrier_servo
+        ):
+            # Measure the rest carrier pair on the late back porch,
+            # 3.7 to 0.3 us before active video starts.
+            active_start_px = field.usectooutpx(field.rf.SysParams["activeVideoUS"][0])
+            porch_window = (int(active_start_px) - 65, int(active_start_px) - 5)
+
+            carrier_offset = measure_secam_under_carrier_offset(
+                chroma,
+                linesout,
+                outwidth,
+                porch_window,
+                field.rf.chroma_afc.true_samp_rate,
+                field.rf.chroma_afc.color_under,
+            )
+            if carrier_offset is not None:
+                field.rf.secam_servo_avg.push(carrier_offset)
+                ldd.logger.debug(
+                    "SECAM carrier servo: measured offset %.02f Hz" % carrier_offset
+                )
+
         field.rf.chroma_tbc_buffer = chroma
         field.chroma_tbc_buffer = chroma
     else:
@@ -767,12 +871,32 @@ def process_chroma(
             target_phase_odd
         )
     else:
-        chroma_heterodyne = (
-            field.rf.chroma_afc.getChromaHet()
-            if (field.rf.do_cafc and not disable_tracking_cafc)
-            else field.rf.chroma_heterodyne
-        )
-    
+        if field.rf.chroma_afc.conversion_lo is not None:
+            # Explicit conversion LO (ME-SECAM): trim it by the smoothed
+            # measured carrier offset (cancelling the recording VCR's
+            # converter crystal error), and keep the heterodyne phase
+            # continuous across fields.
+            lo_trim = 0.0
+            # Holds either live servo measurements or a seeded/fixed trim
+            # (secam_lo_trim); with the servo disabled and no seed it's empty.
+            if field.rf.secam_servo_avg.has_values():
+                # Quantize so measurement noise doesn't dither the LO.
+                lo_trim = np.clip(
+                    round(field.rf.secam_servo_avg.pull() / 10.0) * 10.0,
+                    -10e3,
+                    10e3,
+                )
+            field.rf.chroma_afc.updateConversion(
+                lo_trim, field.field_number * linesout * outwidth
+            )
+            chroma_heterodyne = field.rf.chroma_afc.getChromaHet()
+        else:
+            chroma_heterodyne = (
+                field.rf.chroma_afc.getChromaHet()
+                if (field.rf.do_cafc and not disable_tracking_cafc)
+                else field.rf.chroma_heterodyne
+            )
+
         upconvert_chroma(
             chroma,
             uphet,

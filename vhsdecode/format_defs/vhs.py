@@ -430,9 +430,18 @@ def get_sysparams_palm_vhs(sysparams_ntsc: dict, tape_speed: int = 0) -> dict:
 def get_rfparams_mesecam_vhs(rfparams_pal: dict, tape_speed: int = 0) -> dict:
     params = get_rfparams_pal_vhs(rfparams_pal, tape_speed)
 
-    # Average of the two carriers specified, need to check if this works correctly
-    # and calculate exact value
-    params["color_under_carrier"] = (654300 + 810500) / 2
+    # ME-SECAM records the SECAM FM chroma block the same way as PAL colour-under
+    # (IEC 60774-1 Annex E / 6.3.1) but without carrier phase rotation and with the
+    # APC disabled: an inverting mix against the PAL converter LO of
+    # fsc + (40 * fh + 1953) = 4433618.75 + 626953.125 = 5060571.875 Hz.
+    # That puts the rest carriers on tape at:
+    #   D'r: 5060571.875 - 4406250 = 654321.875 Hz
+    #   D'b: 5060571.875 - 4250000 = 810571.875 Hz
+    # color_under_carrier is only used for band-pass centering; the up-conversion
+    # mixes against chroma_conversion_lo so the restored carriers land back on the
+    # studio frequencies (ITU-R BT.470: foR 4406250 Hz, foB 4250000 Hz).
+    params["color_under_carrier"] = (654321.875 + 810571.875) / 2
+    params["chroma_conversion_lo"] = 5060571.875
     params["chroma_rotation"] = None
 
     return params
@@ -441,13 +450,8 @@ def get_rfparams_mesecam_vhs(rfparams_pal: dict, tape_speed: int = 0) -> dict:
 def get_sysparams_mesecam_vhs(sysparams_pal: dict, tape_speed: int = 0) -> dict:
     """Get system params for MESECAM VHS"""
 
-    # This will be the same as PAL other than chroma
-    sysparams = get_sysparams_pal_vhs(sysparams_pal, tape_speed)
-
-    # FSC specified in Panasonic NV-F55/95 handbook, need to check if this is correct
-    # This differs from normal SECAM, possibly it's done like this to put the upconverted
-    # subcarriers at the correct frequencies.
-    # TODO: Needs testing
-    sysparams["fsc_mhz"] = 4.406
-
-    return sysparams
+    # Same as PAL, including fsc_mhz, so the TBC output stays at standard PAL 4fsc
+    # and stays consistent with outlinelen (which is derived from the PAL fsc before
+    # this function runs). The restored SECAM subcarriers are placed by
+    # chroma_conversion_lo rather than by fsc + color under carrier.
+    return get_sysparams_pal_vhs(sysparams_pal, tape_speed)
