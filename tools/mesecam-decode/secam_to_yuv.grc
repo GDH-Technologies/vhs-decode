@@ -630,9 +630,9 @@ blocks:
       \ndf0B = 230 \xB17kHz [nominal deviation of B-Y subcarrier]"
     decim: '1'
     gain: '1'
-    high_cutoff_freq: 4250000+1000000
+    high_cutoff_freq: 4250000+750000
     interp: '1'
-    low_cutoff_freq: 4250000-1000000
+    low_cutoff_freq: 4250000-750000
     maxoutbuf: '0'
     minoutbuf: '0'
     samp_rate: round(samp_rate*1.0009)
@@ -656,9 +656,9 @@ blocks:
       \ndf0R = 280 \xB19kHz [nominal deviation of R-Y subcarrier]"
     decim: '1'
     gain: '1'
-    high_cutoff_freq: 4406250+1000000
+    high_cutoff_freq: 4406250+750000
     interp: '1'
-    low_cutoff_freq: 4406250-1000000
+    low_cutoff_freq: 4406250-750000
     maxoutbuf: '0'
     minoutbuf: '0'
     samp_rate: round(samp_rate*1.0009)

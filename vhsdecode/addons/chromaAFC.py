@@ -512,20 +512,29 @@ class ChromaAFC:
     # Needs tweaking.
     # Note: order will be doubled since we use filtfilt.
     def get_chroma_bandpass_final(self, color_under_format=True):
-        if color_under_format:
-            lower = (self.color_under / 1e6) * 0.9
-            upper = (self.color_under / 1e6) * 0.75
+        if color_under_format and self.conversion_lo is not None:
+            # ME-SECAM: place the band around the restored chroma block
+            # rather than around fsc. A tight top edge matters: it suppresses
+            # high-side FM splatter from saturated transitions, which
+            # otherwise reaches downstream discriminators with wide take-off
+            # filters and turns into clicks/streaks at color edges.
+            center = (self.conversion_lo - self.color_under) / 1e6
+            band_low = center - 0.67
+            band_high = center + 0.55
+        elif color_under_format:
+            band_low = self.fsc_mhz - (self.color_under / 1e6) * 0.9
+            band_high = self.fsc_mhz + (self.color_under / 1e6) * 0.75
         else:
             # Using a narrow filter atm as this is just used for
             # picking out burst signal in this case.
-            lower = 0.1
-            upper = 0.1
+            band_low = self.fsc_mhz - 0.1
+            band_high = self.fsc_mhz + 0.1
 
         return sps.butter(
             4,
             [
-                (self.fsc_mhz - lower) / self.out_frequency_half,
-                (self.fsc_mhz + upper) / self.out_frequency_half,
+                band_low / self.out_frequency_half,
+                band_high / self.out_frequency_half,
             ],
             btype="bandpass",
             output="sos",
