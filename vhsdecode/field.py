@@ -1764,6 +1764,7 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
     def _sync_to_burst(
         linelocs,
         outlinelen,
+        fsc,
         fsc_ratio,
         even_burst_avg_phase,
         odd_burst_avg_phase,
@@ -1806,6 +1807,7 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
                 FieldPALShared._sync_to_burst(
                     linelocs,
                     self.outlinelen,
+                    self.rf.SysParams["fsc_mhz"] * 1e6,
                     self.fsc_ratio,
                     self.even_burst_phase_avg,
                     self.odd_burst_phase_avg,
@@ -1832,23 +1834,42 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
 
     @staticmethod
     def _sync_to_burst(
-        linelocs, outlinelen, fsc_ratio, burst_avg_phase, phase_sequence, burst_detected_line
+        linelocs, outlinelen, fsc, fsc_ratio, burst_avg_phase, phase_sequence, burst_detected_line
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
         for burst in phase_sequence[burst_tbc_start:]:
+            # Phase difference at the burst center
             phase_delta = (burst_avg_phase - burst.phase_deg + 180) % 360 - 180
 
             line_start = linelocs[burst.line_number]
             line_end = linelocs[burst.line_number + 1]
             line_length = line_end - line_start
 
-            # move the hsync location relative to the color burst center position
+            # Move the hsync location relative to the color burst center position
             burst_center_distance = burst.center - line_start
             scale = burst_center_distance / (outlinelen * (burst_center_distance / line_length))
 
+            # Base phase adjustment
             line_adjust = (phase_delta / 360.0) * fsc_ratio
-            linelocs[burst.line_number] += line_adjust * scale
+
+            # --- New Frequency Drift Compensation ---
+            # Calculate the subcarrier cycle drift per sample:
+            # f_offset = burst.frequency - fsc (e.g., +0.15 Hz)
+            # Drift in cycles per sample = f_offset / sample_rate
+            # (Sample rate can be approximated via fsc * fsc_ratio)
+            f_offset = burst.frequency - fsc
+            print("offset", f_offset, fsc, burst.frequency)
+            sample_rate = fsc * fsc_ratio
+            drift_cycles_per_sample = f_offset / sample_rate
+
+            # Total drift accumulated over this line segment up to the burst center
+            accumulated_drift_samples = (drift_cycles_per_sample * burst_center_distance) * fsc_ratio
+
+            # Subtract the frequency drift component to prevent it from pulling on the static phase TBC
+            corrected_adjust = line_adjust - accumulated_drift_samples
+
+            linelocs[burst.line_number] += corrected_adjust * scale
 
     def refine_linelocs_burst(self, linelocs=None):
         if linelocs is None:
@@ -1869,6 +1890,7 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
                     FieldNTSCShared._sync_to_burst(
                         linelocs,
                         self.outlinelen,
+                        self.rf.SysParams["fsc_mhz"] * 1e6,
                         self.fsc_ratio,
                         self.burst_phase_avg,
                         self.phase_sequence,
@@ -1879,6 +1901,7 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
                     FieldPALShared._sync_to_burst(
                         linelocs,
                         self.outlinelen,
+                        self.rf.SysParams["fsc_mhz"] * 1e6,
                         self.fsc_ratio,
                         self.even_burst_phase_avg,
                         self.odd_burst_phase_avg,
