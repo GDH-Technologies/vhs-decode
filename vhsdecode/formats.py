@@ -418,6 +418,17 @@ def get_format_params(system: str, tape_format: str, tape_speed: int, logger) ->
         return get_sysparams_mesecam_vhs(SysParams_PAL, tape_speed), get_rfparams_mesecam_vhs(
             FilterParams_PAL, tape_speed
         )
+    elif system == "SECAM":
+        if tape_format != "VHS":
+            logger.warning('Tape format "%s" not supported for SECAM yet', tape_format)
+        from vhsdecode.format_defs.vhs import (
+            get_rfparams_secam_vhs,
+            get_sysparams_secam_vhs,
+        )
+
+        return get_sysparams_secam_vhs(SysParams_PAL, tape_speed), get_rfparams_secam_vhs(
+            FilterParams_PAL, tape_speed
+        )
     elif system == "405":
         if tape_format == "BETAMAX":
             from vhsdecode.format_defs.betamax import (

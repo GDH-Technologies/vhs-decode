@@ -697,12 +697,12 @@ Changes the [TV System](https://github.com/oyvindln/vhs-decode/wiki/TV-Systems) 
 
 > [!NOTE]  
 > - Support for PAL-M is **experimental**.
-> - [MESECAM](https://github.com/oyvindln/vhs-decode/wiki/Decoding-SECAM-&-MESECAM) (requires extra GNUradio script for decoding colour after the TBCs currently)
+> - [SECAM & MESECAM](https://github.com/oyvindln/vhs-decode/wiki/Decoding-SECAM-&-MESECAM) (requires an extra SECAM colour decoder after the TBCs currently). Use `SECAM` for tapes recorded on SECAM machines (the standard method used in France: ¼ carrier count-down, IEC 60774-1 6.4.1) and `MESECAM` for tapes recorded on PAL-circuitry machines (Middle East etc.); the two are mutually incompatible in colour, and a warning is logged if a SECAM decode looks like an ME-SECAM tape.
 
 
 `--system` followed by the TV System 
 
-Options are: `NTSC`, `PAL`, `PAL-M`, `NTSC-J` & `MESECAM`
+Options are: `NTSC`, `PAL`, `PAL-M`, `NTSC-J`, `SECAM` & `MESECAM`
 
 For example: `--system NTSC`
 
