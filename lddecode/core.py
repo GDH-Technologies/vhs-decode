@@ -4460,7 +4460,8 @@ class LDdecode:
                     - int(self.rf.delays["video_white"]) : rawslice.stop
                     - int(self.rf.delays["video_white"])
                 ]
-                metrics["whiteRFLevel"] = np.std(rawdata)
+                if rawdata.size:
+                    metrics["whiteRFLevel"] = np.std(rawdata)
 
                 break
 
@@ -4469,18 +4470,28 @@ class LDdecode:
 
         delay = int(f.rf.delays["video_sync"])
         bl_sliceraw = slice(bl_slice.start - delay, bl_slice.stop - delay)
-        metrics["blackLineRFLevel"] = np.std(f.rawdata[bl_sliceraw])
+        # On badly degraded fields the detected location of the black snr line
+        # can land outside the demodulated buffer, leaving these slices empty.
+        # The metrics are meaningless there, so skip them rather than have
+        # numpy warn about mean/std over empty arrays.
+        if (
+            bl_sliceraw.start >= 0
+            and bl_sliceraw.stop <= len(f.rawdata)
+            and bl_slice.start >= 0
+            and bl_slice.stop <= len(f.data["video"]["demod"])
+        ):
+            metrics["blackLineRFLevel"] = np.std(f.rawdata[bl_sliceraw])
 
-        metrics["blackLinePreTBCIRE"] = f.rf.hztoire(
-            np.mean(f.data["video"]["demod"][bl_slice])
-        )
+            metrics["blackLinePreTBCIRE"] = f.rf.hztoire(
+                np.mean(f.data["video"]["demod"][bl_slice])
+            )
         metrics["blackLinePostTBCIRE"] = f.output_to_ire(
             np.mean(f.dspicture[bl_slicetbc])
         )
 
         metrics["bPSNR"] = self.calcpsnr(f, bl_slicetbc)
 
-        if "whiteRFLevel" in metrics:
+        if "whiteRFLevel" in metrics and "blackLineRFLevel" in metrics:
             metrics["blackToWhiteRFRatio"] = (
                 metrics["blackLineRFLevel"] / metrics["whiteRFLevel"]
             )

@@ -45,8 +45,11 @@ from vhsdecode import compute_video_filters as cvf
 from vhsdecode.demodcache import DemodCacheTape
 from vhsdecode.rust_utils import sosfiltfilt_rust
 from vhsdecode.gpu_backend import (
+    StageTimer,
+    complex_ediff1d_xp,
     create_backend,
     fft,
+    unwrap_hilbert_xp,
     ifft,
     irfft,
     rfft,
@@ -1068,9 +1071,37 @@ class VHSRFDecode(ldd.RFDecode):
         self.computedelays()
 
     def computevideofilters(self):
+        # The device-side filter cache must not outlive a filter recompute.
+        # Created here (not __init__) since the base constructor triggers
+        # computefilters before this subclass finishes initializing.
+        self._backend_filters = {}
+        if not hasattr(self, "_backend_filters_lock"):
+            self._backend_filters_lock = threading.Lock()
+        # Which SOS filters run via cupyx on the device instead of on the CPU.
+        # Default all-CPU: filtfilt of a single 32k block measured 4-9x slower
+        # on GPU than scipy/rust on CPU (launch/orchestration bound), so the
+        # round-trip is the faster topology. Flip per-name to re-measure.
+        if not hasattr(self, "_gpu_iir_steps"):
+            self._gpu_iir_steps = {}
         self.Filters = {}
         # Needs to be defined here as it's referenced in constructor.
         self.Filters["F05_offset"] = 32
+
+    def _get_backend_filter(self, name):
+        """Per-decoder cache of filters on the active backend (uploaded to the
+        GPU once, not per block). Synced on fill so the arrays are safe to read
+        from any worker thread/stream afterwards."""
+        entry = self._backend_filters.get(name)
+        if entry is None:
+            backend = self._gpu_backend
+            with self._backend_filters_lock:
+                entry = self._backend_filters.get(name)
+                if entry is None:
+                    entry = to_backend_array(self.Filters[name], backend)
+                    if backend.active:
+                        backend.xp.cuda.get_current_stream().synchronize()
+                    self._backend_filters[name] = entry
+        return entry
 
     def _computevideofilters_b(self):
         # Use some shorthand to compact the code.
@@ -1309,101 +1340,134 @@ class VHSRFDecode(ldd.RFDecode):
         self.delays["video_sync"] = 0
         self.delays["video_white"] = 0
 
-    def demodblock(
-        self, data=None, mtf_level=0, fftdata=None, cut=False, thread_benchmark=False
-    ):
-        rv = {}
-        demod_block_debug = False
-        demod_start_time = time.time()
-        backend = self._gpu_backend
-        backend_filter_cache = {}
+    # The demodulation hot path is split into per-stage helpers below. They
+    # share one xp-generic code path for CPU and GPU: `backend.xp` is numpy or
+    # cupy, and host/device boundaries only happen via to_backend_array /
+    # to_numpy_if_needed.
 
-        def _get_backend_filter(name):
-            if name not in backend_filter_cache:
-                backend_filter_cache[name] = to_backend_array(self.Filters[name], backend)
-            return backend_filter_cache[name]
-
+    def _db_input_fft(self, data, fftdata, backend):
         if fftdata is not None:
             indata_fft = to_backend_array(fftdata, backend)
         elif data is not None:
-            indata_fft = fft(to_backend_array(data[: self.blocklen], backend), backend)
+            # On the GPU the whole chain runs float64, so upload as such once
+            # (integer captures promote to complex128 on the CPU path too).
+            indata_fft = fft(
+                to_backend_array(
+                    data[: self.blocklen],
+                    backend,
+                    dtype=np.float64 if backend.active else None,
+                ),
+                backend,
+            )
         else:
             raise Exception("demodblock called without raw or FFT data")
 
         if data is None:
             data = to_numpy_if_needed(ifft(indata_fft, backend).real, backend)
+        return indata_fft, data
 
-        if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
-            demod_block_debug = True
-            # If we're doing a plot make a copy of the input to be able to plot it since we
-            # are modifying the data in place.
-            indata_fft_copy = indata_fft.copy()
-
+    def _db_rf_filter(self, indata_fft):
         if self._notch is not None:
-            indata_fft *= _get_backend_filter("FVideoNotchF")
+            indata_fft *= self._get_backend_filter("FVideoNotchF")
 
         # Applies RF filters
-        indata_fft *= _get_backend_filter("RFVideo")
+        indata_fft *= self._get_backend_filter("RFVideo")
+        return indata_fft
 
-        raw_filtered = to_numpy_if_needed(
-            ifft(indata_fft * _get_backend_filter("hilbert"), backend).real, backend
-        ).astype(
-            np.single
+    def _db_sosfiltfilt(self, filter_name, x, backend):
+        """Zero-phase SOS filter of one block; always returns a host array.
+        The _gpu_iir_steps table selects, per filter, cupyx-on-device vs the
+        CPU implementation with a transfer round-trip."""
+        if (
+            backend.active
+            and backend.has_cupyx_signal
+            and self._gpu_iir_steps.get(filter_name, False)
+        ):
+            import cupyx.scipy.signal as cpx_signal
+
+            return backend.xp.asnumpy(
+                cpx_signal.sosfiltfilt(
+                    to_backend_array(
+                        np.atleast_2d(self.Filters[filter_name]), backend
+                    ),
+                    to_backend_array(x, backend),
+                )
+            )
+        return sosfiltfilt_rust(
+            self.Filters[filter_name], to_numpy_if_needed(x, backend)
         )
+
+    def _db_envelope(self, indata_fft, backend):
+        xp = backend.xp
+        raw_filtered = ifft(
+            indata_fft * self._get_backend_filter("hilbert"), backend
+        ).real.astype(np.single)
 
         # Calculate an evelope with signal strength using absolute of hilbert transform.
         # Roll this a bit to compensate for filter delay, value eyballed for now.
-        np.abs(raw_filtered, out=raw_filtered)
-        raw_env = np.roll(raw_filtered, 4)
+        xp.abs(raw_filtered, out=raw_filtered)
+        raw_env = xp.roll(raw_filtered, 4)
         del raw_filtered
         # Downconvert to single precision for some possible speedup since we don't need
         # super high accuracy for the dropout detection.
-        env = sosfiltfilt_rust(self.Filters["FEnvPost"], raw_env)
+        env = self._db_sosfiltfilt("FEnvPost", raw_env, backend)
 
         del raw_env
         env_mean = np.mean(env)
+        return env, env_mean
 
+    def _db_high_boost(self, indata_fft, env, env_mean, backend):
         # Boost high frequencies in areas where the signal is weak to reduce missed zero crossings
         # on sharp transitions. Using filtfilt to avoid phase issues.
         if len(np.where(env == 0)[0]) == 0:  # checks for zeroes on env
             if self._high_boost is not None:
-                data_filtered = to_numpy_if_needed(ifft(indata_fft, backend).real, backend)
-                high_part = sosfiltfilt_rust(self.Filters["RFTop"], data_filtered) * (
-                    (env_mean * 0.9) / env
+                data_filtered = to_numpy_if_needed(
+                    ifft(indata_fft, backend).real, backend
                 )
+                high_part = self._db_sosfiltfilt(
+                    "RFTop", data_filtered, backend
+                ) * ((env_mean * 0.9) / env)
                 del data_filtered
                 indata_fft += fft(
                     to_backend_array(high_part * self._high_boost, backend), backend
                 )
         else:
             ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
+        return indata_fft
 
-        hilbert = to_numpy_if_needed(
-            ifft(indata_fft * _get_backend_filter("hilbert"), backend), backend
-        )
-
-        if not demod_block_debug:
-            del indata_fft
-
-        # FM demodulator
-        # test1 = np.angle(hilbert)
-        # from vhsd_rust import complex_angle_py
-        # test2 = hilbert
-        # print(test1 - test2)
-        # np.savez_compressed("hilbert_data", data=hilbert)
-        demod = unwrap_hilbert(hilbert, self.freq_hz)
+    def _db_fm_demod(self, hilbert, backend):
+        xp = backend.xp
+        # FM demodulator; hilbert stays on the active backend throughout.
+        if backend.active:
+            demod = unwrap_hilbert_xp(hilbert, self.freq_hz, xp)
+        else:
+            demod = unwrap_hilbert(hilbert, self.freq_hz)
 
         # If there are obviously out of bounds values, do an extra demod on a diffed waveform and
         # replace the spikes with data from the diffed demod. (Which in practice is an extra EQed signal)
         if not self._disable_diff_demod:
             check_value = self.options.diff_demod_check_value
 
-            if np.max(demod[20:-20]) > check_value:
-                demod_b = unwrap_hilbert(
-                    np.ediff1d(hilbert, to_begin=0), self.freq_hz
-                ).real
+            if float(xp.max(demod[20:-20])) > check_value:
+                if backend.active:
+                    demod_b = unwrap_hilbert_xp(
+                        complex_ediff1d_xp(hilbert, xp), self.freq_hz, xp
+                    ).real
+                    # replace_spikes is an ordered in-place repair; round-trip
+                    # through the exact numba implementation (spike blocks are
+                    # rare enough that the transfer does not matter).
+                    demod = to_backend_array(
+                        replace_spikes(
+                            xp.asnumpy(demod), xp.asnumpy(demod_b), check_value
+                        ),
+                        backend,
+                    )
+                else:
+                    demod_b = unwrap_hilbert(
+                        np.ediff1d(hilbert, to_begin=0), self.freq_hz
+                    ).real
 
-                demod = replace_spikes(demod, demod_b, check_value)
+                    demod = replace_spikes(demod, demod_b, check_value)
                 del demod_b
                 # Not used yet, needs more testing.
                 # 2.2 seems to be a sweet spot between reducing spikes and not causing
@@ -1414,27 +1478,32 @@ class VHSRFDecode(ldd.RFDecode):
         # Disabled if sharpness level is zero (default).
         # TODO: This should be done after the deemphasis steps
         if self._video_eq:
-            # applies the video EQ
+            # applies the video EQ (stateful native code, host only)
+            demod = to_numpy_if_needed(demod, backend)
             demod = self._video_eq.filter_video(demod)
 
         # TODO: This should be done after the deemphasis steps
         if self._chroma_trap:
-            # applies the Subcarrier trap
+            # applies the Subcarrier trap (host only)
+            demod = to_numpy_if_needed(demod, backend)
             demod = self.chromaTrap.work(demod)
+        return demod
 
-        # applies main deemphasis filter
+    def _db_deemphasis(self, demod, backend):
+        xp = backend.xp
+        # applies main deemphasis filter; the chain stays on the backend and
+        # only the gated amplitude low-pass in sub_deemphasis round-trips.
         demod_fft = rfft(to_backend_array(demod, backend), backend)
-        out_video_fft = demod_fft * _get_backend_filter("FVideo")
-        out_video = to_numpy_if_needed(irfft(out_video_fft, backend).real, backend)
+        out_video_fft = demod_fft * self._get_backend_filter("FVideo")
+        out_video = irfft(out_video_fft, backend).real
 
         if self.options.nldeemp:
             # Extract the high frequency part of the signal
-            hf_part = to_numpy_if_needed(
-                irfft(out_video_fft * _get_backend_filter("NLHighPassF"), backend),
-                backend,
+            hf_part = irfft(
+                out_video_fft * self._get_backend_filter("NLHighPassF"), backend
             )
             # Limit it to preserve sharp transitions
-            np.clip(
+            xp.clip(
                 hf_part,
                 self.DecoderParams["nonlinear_highpass_limit_l"],
                 self.DecoderParams["nonlinear_highpass_limit_h"],
@@ -1445,11 +1514,22 @@ class VHSRFDecode(ldd.RFDecode):
             out_video -= hf_part
 
         if self.options.subdeemp:
-            out_video_fft_cpu = to_numpy_if_needed(out_video_fft, backend)
+            if backend.active:
+                sub_filters = {
+                    "NLHighPassF": self._get_backend_filter("NLHighPassF"),
+                    "NLAmplitudeLPF": self.Filters["NLAmplitudeLPF"],
+                }
+
+                def sub_sosfiltfilt(x):
+                    return self._db_sosfiltfilt("NLAmplitudeLPF", x, backend)
+
+            else:
+                sub_filters = self.Filters
+                sub_sosfiltfilt = None
             out_video = sub_deemphasis(
                 out_video,
-                out_video_fft_cpu,
-                self.Filters,
+                out_video_fft,
+                sub_filters,
                 self._sub_emphasis_params.deviation,
                 self._sub_emphasis_params.exponential_scaling,
                 self._sub_emphasis_params.scaling_1,
@@ -1457,23 +1537,35 @@ class VHSRFDecode(ldd.RFDecode):
                 self._sub_emphasis_params.logistic_mid,
                 self._sub_emphasis_params.logistic_rate,
                 self._sub_emphasis_params.static_factor,
+                backend=backend,
+                sosfiltfilt_fn=sub_sosfiltfilt,
             )
 
         del out_video_fft
 
         if self._use_fsc_notch_filter:
             out_video = sps.filtfilt(
-                self.Filters["fsc_notch"][0], self.Filters["fsc_notch"][1], out_video
+                self.Filters["fsc_notch"][0],
+                self.Filters["fsc_notch"][1],
+                to_numpy_if_needed(out_video, backend),
             )
+        return out_video, demod_fft
 
-        out_video05 = to_numpy_if_needed(
-            irfft(demod_fft * _get_backend_filter("FVideo05"), backend).real, backend
+    def _db_video05(self, demod_fft, backend):
+        xp = backend.xp
+        out_video05 = irfft(
+            demod_fft * self._get_backend_filter("FVideo05"), backend
+        ).real
+        return xp.roll(out_video05, -self.Filters["F05_offset"])
+
+    def _db_chroma(self, data, out_video, backend):
+        # Filter out the color-under signal from the raw data (host-side).
+        chroma_source = (
+            data
+            if self.options.color_under
+            else to_numpy_if_needed(out_video, backend)
         )
-        out_video05 = np.roll(out_video05, -self.Filters["F05_offset"])
-
-        # Filter out the color-under signal from the raw data.
-        chroma_source = data if self.options.color_under else out_video
-        out_chroma = (
+        return (
             chroma_color_under_filter(
                 chroma_source,
                 self.Filters["FVideoBurst"],
@@ -1488,6 +1580,56 @@ class VHSRFDecode(ldd.RFDecode):
             if not self._do_cafc
             else data[: self.blocklen]
         )
+
+    def demodblock(
+        self,
+        data=None,
+        mtf_level=0,
+        fftdata=None,
+        cut=False,
+        thread_benchmark=False,
+        profile=None,
+    ):
+        rv = {}
+        demod_block_debug = False
+        demod_start_time = time.time()
+        backend = self._gpu_backend
+        timer = StageTimer(profile, backend)
+
+        indata_fft, data = self._db_input_fft(data, fftdata, backend)
+        timer.mark("input_fft")
+
+        if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
+            demod_block_debug = True
+            # If we're doing a plot make a copy of the input to be able to plot it since we
+            # are modifying the data in place.
+            indata_fft_copy = indata_fft.copy()
+
+        indata_fft = self._db_rf_filter(indata_fft)
+        timer.mark("rf_filter")
+
+        env, env_mean = self._db_envelope(indata_fft, backend)
+        timer.mark("envelope")
+
+        indata_fft = self._db_high_boost(indata_fft, env, env_mean, backend)
+        timer.mark("high_boost")
+
+        hilbert = ifft(indata_fft * self._get_backend_filter("hilbert"), backend)
+
+        if not demod_block_debug:
+            del indata_fft
+
+        demod = self._db_fm_demod(hilbert, backend)
+        timer.mark("fm_demod")
+
+        out_video, demod_fft = self._db_deemphasis(demod, backend)
+        timer.mark("deemphasis")
+
+        out_video05 = self._db_video05(demod_fft, backend)
+        timer.mark("video05")
+
+        out_chroma = self._db_chroma(data, out_video, backend)
+        timer.mark("chroma")
 
         if self.debug_plot and self.debug_plot.is_plot_requested("magdens"):
             from vhsdecode.debug_plot import plot_magnitude_density
@@ -1508,8 +1650,8 @@ class VHSRFDecode(ldd.RFDecode):
                 env_mean=env_mean,
                 raw_fft=to_numpy_if_needed(indata_fft_copy, backend),
                 filtered_fft=to_numpy_if_needed(indata_fft, backend),
-                demod_video=demod,
-                filtered_video=out_video,
+                demod_video=to_numpy_if_needed(demod, backend),
+                filtered_video=to_numpy_if_needed(out_video, backend),
                 chroma=out_chroma,
                 rf_filter=self.Filters["RFVideo"],
                 rfdecode=self,
@@ -1517,7 +1659,21 @@ class VHSRFDecode(ldd.RFDecode):
             )
 
         if self.options.export_raw_tbc:
-            out_video = demod
+            out_video = to_numpy_if_needed(demod, backend)
+
+        # One download for the device-resident outputs instead of one each.
+        if (
+            backend.active
+            and hasattr(out_video, "__cuda_array_interface__")
+            and hasattr(out_video05, "__cuda_array_interface__")
+        ):
+            stacked = backend.xp.asnumpy(
+                backend.xp.stack([out_video, out_video05])
+            )
+            out_video, out_video05 = stacked[0], stacked[1]
+        else:
+            out_video = to_numpy_if_needed(out_video, backend)
+            out_video05 = to_numpy_if_needed(out_video05, backend)
 
         # demod_burst is a bit misleading, but keeping the naming for compatability.
         video_out = np.rec.array(
@@ -1528,6 +1684,7 @@ class VHSRFDecode(ldd.RFDecode):
         rv["video"] = (
             video_out[self.blockcut : -self.blockcut_end] if cut else video_out
         )
+        timer.mark("pack")
 
         demod_end_time = time.time()
         if thread_benchmark:

@@ -819,6 +819,8 @@ def ac3_pipe(outname: str):
 
 # Essential (or at least useful) standalone routines and lambdas
 
+tau = np.pi * 2
+
 # https://stackoverflow.com/questions/20924085/python-conversion-between-coordinates
 polar2z = lambda r, θ: r * np.exp(1j * θ)
 

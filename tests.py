@@ -7,7 +7,19 @@ import numpy as np
 
 import vhsdecode.process as process
 import vhsdecode.utils as utils
-from vhsdecode.sync import calczc as c_calczc
+
+try:
+    from vhsdecode.sync import calczc as c_calczc
+except ImportError:
+    # calczc became cdef-only when sync was ported to Cython upstream.
+    c_calczc = None
+
+try:
+    import vhsd_rust
+
+    _HAS_VHSD_RUST = True
+except ImportError:
+    _HAS_VHSD_RUST = False
 
 
 class DemodTest(unittest.TestCase):
@@ -158,6 +170,7 @@ class SyncTest(unittest.TestCase):
         test_find_pulses("PAL_GOOD.txt.gz", 458)
 
 
+@unittest.skipIf(c_calczc is None, "calczc is not exported from vhsdecode.sync")
 class ZCTest(unittest.TestCase):
     def test_calczc(self):
         data = np.array([8.0, 4.0, 1.0, 8.0, 1.0, 4.0, 8.0])
@@ -181,6 +194,7 @@ class ZCTest(unittest.TestCase):
         # plt.show()
 
 
+@unittest.skipIf(not _HAS_VHSD_RUST, "vhsd_rust extension not installed")
 class RustNumpyMath(unittest.TestCase):
     def test_rust_angle(self):
         from vhsd_rust import complex_angle_py
