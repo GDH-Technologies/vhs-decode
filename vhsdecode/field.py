@@ -1773,21 +1773,38 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
-        for burst in phase_sequence[burst_tbc_start:]:
+        inv_outlinelen = 1.0 / outlinelen
+        inv_fsc = 1.0 / fsc
+        phase_to_samples_factor = fsc_ratio / 360.0
+
+        for idx in range(burst_tbc_start, len(phase_sequence)):
+            burst = phase_sequence[idx]
+
+            # Select PAL target phase based on line polarity (even/odd)
             target_phase = odd_burst_avg_phase if burst.line_number % 2 else even_burst_avg_phase
 
-            phase_delta = (target_phase - burst.phase_deg + burst.phase_offset_deg + 180) % 360 - 180
+            # Calculate phase delta including the PAL line offset
+            phase_delta = (target_phase - burst.phase_deg + burst.phase_offset_deg + 180.0) % 360.0 - 180.0
 
-            # scale up burst fsc for each line
             line_start = linelocs[burst.line_number]
             line_end = linelocs[burst.line_number + 1]
             line_length = line_end - line_start
-            scale = line_length / outlinelen
+            
+            scale = line_length * inv_outlinelen
 
-            line_adjust = phase_delta / 360.0 * fsc_ratio
-            linelocs[burst.line_number] += (
-                line_adjust * scale
-            )  # 4fsc, then scaled up to the input line length
+            # Base phase adjustment
+            line_adjust = phase_delta * phase_to_samples_factor
+
+            # Frequency Drift Tracking
+            f_offset = burst.frequency - fsc
+            burst_center_distance = burst.center - line_start
+            accumulated_drift_samples = (f_offset * burst_center_distance) * inv_fsc
+
+            # Combine phase offset and subcarrier drift adjustments
+            corrected_adjust = line_adjust - accumulated_drift_samples
+
+            # Shift the HSync location 
+            linelocs[burst.line_number] += corrected_adjust * scale
 
     def refine_linelocs_pilot(self, linelocs=None):
         if linelocs is None:
