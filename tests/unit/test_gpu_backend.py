@@ -209,6 +209,27 @@ class TestDeemphasisXp:
         assert diff <= 1.0
 
 
+class TestVideo05Xp:
+    @pytest.mark.skipif(not _cuda_device_available(), reason="no CUDA device")
+    def test_gpu_video05_stays_on_device_and_matches_cpu(self):
+        import cupy as cp
+
+        cpu = _make_decoder(use_gpu=False)
+        gpu = _make_decoder(use_gpu=True)
+        if not gpu.gpu_backend.active:
+            pytest.skip(f"GPU backend inactive: {gpu.gpu_backend.reason}")
+
+        rng = np.random.default_rng(3)
+        demod = 4.0e6 + 2.0e5 * np.cumsum(rng.normal(0.0, 0.02, cpu.blocklen))
+        cpu_fft = np.fft.rfft(demod)
+
+        cpu_out = cpu._db_video05(cpu_fft, cpu.gpu_backend)
+        gpu_out = gpu._db_video05(cp.asarray(cpu_fft), gpu.gpu_backend)
+
+        assert hasattr(gpu_out, "__cuda_array_interface__")
+        assert float(np.max(np.abs(cp.asnumpy(gpu_out) - cpu_out))) <= 5.0
+
+
 class TestSpikeRepairEquivalence:
     """The GPU decode path must repair diff-demod spikes index-for-index
     like the numba replace_spikes it round-trips through."""

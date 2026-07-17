@@ -1552,11 +1552,11 @@ class VHSRFDecode(ldd.RFDecode):
         return out_video, demod_fft
 
     def _db_video05(self, demod_fft, backend):
-        out_video05 = to_numpy_if_needed(
-            irfft(demod_fft * self._get_backend_filter("FVideo05"), backend).real,
-            backend,
-        )
-        return np.roll(out_video05, -self.Filters["F05_offset"])
+        xp = backend.xp
+        out_video05 = irfft(
+            demod_fft * self._get_backend_filter("FVideo05"), backend
+        ).real
+        return xp.roll(out_video05, -self.Filters["F05_offset"])
 
     def _db_chroma(self, data, out_video, backend):
         # Filter out the color-under signal from the raw data (host-side).
@@ -1665,7 +1665,7 @@ class VHSRFDecode(ldd.RFDecode):
         video_out = np.rec.array(
             [
                 to_numpy_if_needed(out_video, backend),
-                out_video05,
+                to_numpy_if_needed(out_video05, backend),
                 out_chroma,
                 env,
             ],
