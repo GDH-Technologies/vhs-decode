@@ -1490,21 +1490,20 @@ class VHSRFDecode(ldd.RFDecode):
         return demod
 
     def _db_deemphasis(self, demod, backend):
-        # applies main deemphasis filter
+        xp = backend.xp
+        # applies main deemphasis filter; the chain stays on the backend and
+        # only the gated amplitude low-pass in sub_deemphasis round-trips.
         demod_fft = rfft(to_backend_array(demod, backend), backend)
         out_video_fft = demod_fft * self._get_backend_filter("FVideo")
-        out_video = to_numpy_if_needed(irfft(out_video_fft, backend).real, backend)
+        out_video = irfft(out_video_fft, backend).real
 
         if self.options.nldeemp:
             # Extract the high frequency part of the signal
-            hf_part = to_numpy_if_needed(
-                irfft(
-                    out_video_fft * self._get_backend_filter("NLHighPassF"), backend
-                ),
-                backend,
+            hf_part = irfft(
+                out_video_fft * self._get_backend_filter("NLHighPassF"), backend
             )
             # Limit it to preserve sharp transitions
-            np.clip(
+            xp.clip(
                 hf_part,
                 self.DecoderParams["nonlinear_highpass_limit_l"],
                 self.DecoderParams["nonlinear_highpass_limit_h"],
@@ -1515,11 +1514,22 @@ class VHSRFDecode(ldd.RFDecode):
             out_video -= hf_part
 
         if self.options.subdeemp:
-            out_video_fft_cpu = to_numpy_if_needed(out_video_fft, backend)
+            if backend.active:
+                sub_filters = {
+                    "NLHighPassF": self._get_backend_filter("NLHighPassF"),
+                    "NLAmplitudeLPF": self.Filters["NLAmplitudeLPF"],
+                }
+
+                def sub_sosfiltfilt(x):
+                    return self._db_sosfiltfilt("NLAmplitudeLPF", x, backend)
+
+            else:
+                sub_filters = self.Filters
+                sub_sosfiltfilt = None
             out_video = sub_deemphasis(
                 out_video,
-                out_video_fft_cpu,
-                self.Filters,
+                out_video_fft,
+                sub_filters,
                 self._sub_emphasis_params.deviation,
                 self._sub_emphasis_params.exponential_scaling,
                 self._sub_emphasis_params.scaling_1,
@@ -1527,13 +1537,17 @@ class VHSRFDecode(ldd.RFDecode):
                 self._sub_emphasis_params.logistic_mid,
                 self._sub_emphasis_params.logistic_rate,
                 self._sub_emphasis_params.static_factor,
+                backend=backend,
+                sosfiltfilt_fn=sub_sosfiltfilt,
             )
 
         del out_video_fft
 
         if self._use_fsc_notch_filter:
             out_video = sps.filtfilt(
-                self.Filters["fsc_notch"][0], self.Filters["fsc_notch"][1], out_video
+                self.Filters["fsc_notch"][0],
+                self.Filters["fsc_notch"][1],
+                to_numpy_if_needed(out_video, backend),
             )
         return out_video, demod_fft
 
@@ -1544,9 +1558,13 @@ class VHSRFDecode(ldd.RFDecode):
         )
         return np.roll(out_video05, -self.Filters["F05_offset"])
 
-    def _db_chroma(self, data, out_video):
-        # Filter out the color-under signal from the raw data.
-        chroma_source = data if self.options.color_under else out_video
+    def _db_chroma(self, data, out_video, backend):
+        # Filter out the color-under signal from the raw data (host-side).
+        chroma_source = (
+            data
+            if self.options.color_under
+            else to_numpy_if_needed(out_video, backend)
+        )
         return (
             chroma_color_under_filter(
                 chroma_source,
@@ -1610,7 +1628,7 @@ class VHSRFDecode(ldd.RFDecode):
         out_video05 = self._db_video05(demod_fft, backend)
         timer.mark("video05")
 
-        out_chroma = self._db_chroma(data, out_video)
+        out_chroma = self._db_chroma(data, out_video, backend)
         timer.mark("chroma")
 
         if self.debug_plot and self.debug_plot.is_plot_requested("magdens"):
@@ -1633,7 +1651,7 @@ class VHSRFDecode(ldd.RFDecode):
                 raw_fft=to_numpy_if_needed(indata_fft_copy, backend),
                 filtered_fft=to_numpy_if_needed(indata_fft, backend),
                 demod_video=to_numpy_if_needed(demod, backend),
-                filtered_video=out_video,
+                filtered_video=to_numpy_if_needed(out_video, backend),
                 chroma=out_chroma,
                 rf_filter=self.Filters["RFVideo"],
                 rfdecode=self,
@@ -1645,7 +1663,12 @@ class VHSRFDecode(ldd.RFDecode):
 
         # demod_burst is a bit misleading, but keeping the naming for compatability.
         video_out = np.rec.array(
-            [out_video, out_video05, out_chroma, env],
+            [
+                to_numpy_if_needed(out_video, backend),
+                out_video05,
+                out_chroma,
+                env,
+            ],
             names=["demod", "demod_05", "demod_burst", "envelope"],
         )
 

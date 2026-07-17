@@ -174,6 +174,41 @@ class TestGatedIIR:
         assert demod_diff <= 5.0
 
 
+class TestDeemphasisXp:
+    @pytest.mark.skipif(not _cuda_device_available(), reason="no CUDA device")
+    def test_gpu_deemphasis_stays_on_device_and_matches_cpu(self):
+        import cupy as cp
+
+        opts = {"nldeemp": True, "subdeemp": True}
+        cpu = process.VHSRFDecode(
+            inputfreq=40,
+            system="PAL",
+            tape_format="VHS",
+            rf_options={"force_cpu": True, **opts},
+        )
+        gpu = process.VHSRFDecode(
+            inputfreq=40,
+            system="PAL",
+            tape_format="VHS",
+            rf_options={"use_gpu": True, **opts},
+        )
+        if not gpu.gpu_backend.active:
+            pytest.skip(f"GPU backend inactive: {gpu.gpu_backend.reason}")
+
+        rng = np.random.default_rng(11)
+        # Demod-scale signal: a few MHz baseline with video-ish structure.
+        demod = 4.0e6 + 2.0e5 * np.cumsum(rng.normal(0.0, 0.02, cpu.blocklen))
+
+        cpu_out, _ = cpu._db_deemphasis(demod.copy(), cpu.gpu_backend)
+        gpu_out, _ = gpu._db_deemphasis(demod.copy(), gpu.gpu_backend)
+
+        # The whole deemphasis chain must stay device-resident on GPU...
+        assert hasattr(gpu_out, "__cuda_array_interface__")
+        # ...and match the CPU chain to float64 rounding on Hz-scale data.
+        diff = float(np.max(np.abs(cp.asnumpy(gpu_out) - cpu_out)))
+        assert diff <= 1.0
+
+
 class TestSpikeRepairEquivalence:
     """The GPU decode path must repair diff-demod spikes index-for-index
     like the numba replace_spikes it round-trips through."""

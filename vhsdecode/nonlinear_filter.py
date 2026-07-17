@@ -4,6 +4,13 @@ import scipy.signal as sps
 import numpy as np
 import math
 from vhsdecode.rust_utils import sosfiltfilt_rust
+from vhsdecode.gpu_backend import (
+    create_backend,
+    to_backend_array,
+    to_numpy_if_needed,
+)
+
+_NUMPY_BACKEND = create_backend(use_gpu=False)
 
 
 def _sub_deemphasis_debug(
@@ -44,6 +51,8 @@ def sub_deemphasis_inner(
     logistic_rate=0,
     static_factor=None,
     debug_const_amplitude=False,
+    backend=None,
+    sosfiltfilt_fn=None,
 ):
     """Apply non-linear de-emphasis filter to input signal
 
@@ -56,11 +65,20 @@ def sub_deemphasis_inner(
         linear_scale_1 (_type_, optional): linear scaling factor applied before exponential scaling. Defaults to None.
         linear_scale_2 (_type_, optional): linear scaling factor applied before exponential scaling. Defaults to None.
         debug_const_amplitude (bool, optional): Set constant amplitude instead of using video signal for testing response. Defaults to False.
+        backend (BackendContext, optional): backend the signal arrays live on;
+            defaults to numpy. When a CUDA backend is passed, everything but
+            the amplitude low-pass stays on the device.
+        sosfiltfilt_fn (callable, optional): override for the amplitude
+            low-pass; takes and returns a host array. Defaults to
+            sosfiltfilt_rust with filters["NLAmplitudeLPF"].
 
     Returns:
         _type_: video signal with filtering applied
     """
-    hf_part = npfft.irfft(out_video_fft * filters["NLHighPassF"])
+    ctx = backend if backend is not None else _NUMPY_BACKEND
+    xp = ctx.xp
+
+    hf_part = xp.fft.irfft(out_video_fft * filters["NLHighPassF"])
     # hf_part = sps.filtfilt(filters["NLHighPassFB"][0], filters["NLHighPassFB"][1], out_video)
 
     deviation /= 2
@@ -71,16 +89,29 @@ def sub_deemphasis_inner(
 
     # Get the instantaneous amplitude of the signal using the hilbert transform
     # and divide by the formats specified deviation so we get a amplitude compared to the specifications references.
-    amplitude = abs(sps.hilbert(hf_part)) / deviation
+    if ctx.active and ctx.has_cupyx_signal:
+        import cupyx.scipy.signal as cpx_signal
+
+        amplitude = abs(cpx_signal.hilbert(hf_part)) / deviation
+    else:
+        amplitude = (
+            abs(sps.hilbert(to_numpy_if_needed(hf_part, ctx))) / deviation
+        )
+    if sosfiltfilt_fn is None:
+        filtered = sosfiltfilt_rust(
+            filters["NLAmplitudeLPF"], to_numpy_if_needed(amplitude, ctx)
+        )
+    else:
+        filtered = sosfiltfilt_fn(to_numpy_if_needed(amplitude, ctx))
     # Clip the value after filtering to make sure we don't go negative
-    amplitude = np.clip(sosfiltfilt_rust(filters["NLAmplitudeLPF"], amplitude), 0, None)
+    amplitude = xp.clip(to_backend_array(filtered, ctx), 0, None)
     if debug_const_amplitude:
         amplitude = debug_const_amplitude
 
     if linear_scale_1 is not None:
         amplitude *= linear_scale_1
     # Scale the amplitude by a exponential factore (typically less than 1 so it ends up being a root function of sorts)
-    amplitude = np.power(amplitude, exponential_scale)
+    amplitude = xp.power(amplitude, exponential_scale)
     if linear_scale_2 is not None:
         amplitude *= linear_scale_2
 
@@ -107,6 +138,8 @@ def sub_deemphasis(
     logistic_rate=0,
     static_factor=None,
     debug_const_amplitude=False,
+    backend=None,
+    sosfiltfilt_fn=None,
 ):
     """Apply non-linear de-emphasis filter to input signal
 
@@ -119,6 +152,7 @@ def sub_deemphasis(
         linear_scale_1 (_type_, optional): linear scaling factor applied before exponential scaling. Defaults to None.
         linear_scale_2 (_type_, optional): linear scaling factor applied before exponential scaling. Defaults to None.
         debug_const_amplitude (bool, optional): Set constant amplitude instead of using video signal for testing response. Defaults to False.
+        backend / sosfiltfilt_fn: see sub_deemphasis_inner.
 
     Returns:
         _type_: video signal with filtering applied
@@ -135,6 +169,8 @@ def sub_deemphasis(
         logistic_rate,
         static_factor,
         debug_const_amplitude,
+        backend,
+        sosfiltfilt_fn,
     )
 
     # And subtract it from the output signal.
