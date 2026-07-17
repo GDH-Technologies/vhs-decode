@@ -1,7 +1,10 @@
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
+
+_DEFAULT_CUDA_PATH = "/usr/local/cuda"
 
 
 @dataclass(frozen=True)
@@ -11,6 +14,27 @@ class BackendContext:
     xp: Any
     reason: str = ""
     gpu_name: Optional[str] = None
+    has_cupyx_signal: bool = False
+
+
+def _ensure_cuda_path():
+    """cupyx kernels are NVRTC-compiled at runtime and need the CUDA headers,
+    located via CUDA_PATH/CUDA_HOME. Point at the system toolkit if unset."""
+    if "CUDA_PATH" in os.environ or "CUDA_HOME" in os.environ:
+        return
+    if os.path.isdir(_DEFAULT_CUDA_PATH):
+        os.environ.setdefault("CUDA_PATH", _DEFAULT_CUDA_PATH)
+
+
+def _probe_cupyx_signal(cp):
+    try:
+        import cupyx.scipy.signal as cpx_signal
+
+        sos = np.array([[0.5, 0.5, 0.0, 1.0, 0.0, 0.0]])
+        cpx_signal.sosfiltfilt(cp.asarray(sos), cp.arange(16, dtype=cp.float64))
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def create_backend(use_gpu: bool = False, force_cpu: bool = False) -> BackendContext:
@@ -24,6 +48,10 @@ def create_backend(use_gpu: bool = False, force_cpu: bool = False) -> BackendCon
 
     if not use_gpu:
         return BackendContext(active=False, name="numpy", xp=np, reason="GPU not requested")
+
+    # Must happen before the first cupy import/use: cupy resolves and caches
+    # its CUDA toolkit path (used for NVRTC header lookup) on first touch.
+    _ensure_cuda_path()
 
     try:
         import cupy as cp
@@ -61,12 +89,21 @@ def create_backend(use_gpu: bool = False, force_cpu: bool = False) -> BackendCon
                 reason=f"CuPy FFT unavailable: {fft_exc}",
             )
 
+        has_cupyx_signal, probe_error = _probe_cupyx_signal(cp)
+        reason = "CUDA backend active"
+        if not has_cupyx_signal:
+            reason += (
+                " (cupyx.scipy.signal unavailable, IIR filters stay on CPU: "
+                f"{probe_error})"
+            )
+
         return BackendContext(
             active=True,
             name="cupy",
             xp=cp,
-            reason="CUDA backend active",
+            reason=reason,
             gpu_name=gpu_name,
+            has_cupyx_signal=has_cupyx_signal,
         )
     except Exception as exc:
         return BackendContext(
