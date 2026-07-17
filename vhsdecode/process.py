@@ -1068,9 +1068,31 @@ class VHSRFDecode(ldd.RFDecode):
         self.computedelays()
 
     def computevideofilters(self):
+        # The device-side filter cache must not outlive a filter recompute.
+        # Created here (not __init__) since the base constructor triggers
+        # computefilters before this subclass finishes initializing.
+        self._backend_filters = {}
+        if not hasattr(self, "_backend_filters_lock"):
+            self._backend_filters_lock = threading.Lock()
         self.Filters = {}
         # Needs to be defined here as it's referenced in constructor.
         self.Filters["F05_offset"] = 32
+
+    def _get_backend_filter(self, name):
+        """Per-decoder cache of filters on the active backend (uploaded to the
+        GPU once, not per block). Synced on fill so the arrays are safe to read
+        from any worker thread/stream afterwards."""
+        entry = self._backend_filters.get(name)
+        if entry is None:
+            backend = self._gpu_backend
+            with self._backend_filters_lock:
+                entry = self._backend_filters.get(name)
+                if entry is None:
+                    entry = to_backend_array(self.Filters[name], backend)
+                    if backend.active:
+                        backend.xp.cuda.get_current_stream().synchronize()
+                    self._backend_filters[name] = entry
+        return entry
 
     def _computevideofilters_b(self):
         # Use some shorthand to compact the code.
@@ -1316,17 +1338,21 @@ class VHSRFDecode(ldd.RFDecode):
         demod_block_debug = False
         demod_start_time = time.time()
         backend = self._gpu_backend
-        backend_filter_cache = {}
-
-        def _get_backend_filter(name):
-            if name not in backend_filter_cache:
-                backend_filter_cache[name] = to_backend_array(self.Filters[name], backend)
-            return backend_filter_cache[name]
+        _get_backend_filter = self._get_backend_filter
 
         if fftdata is not None:
             indata_fft = to_backend_array(fftdata, backend)
         elif data is not None:
-            indata_fft = fft(to_backend_array(data[: self.blocklen], backend), backend)
+            # On the GPU the whole chain runs float64, so upload as such once
+            # (integer captures promote to complex128 on the CPU path too).
+            indata_fft = fft(
+                to_backend_array(
+                    data[: self.blocklen],
+                    backend,
+                    dtype=np.float64 if backend.active else None,
+                ),
+                backend,
+            )
         else:
             raise Exception("demodblock called without raw or FFT data")
 
