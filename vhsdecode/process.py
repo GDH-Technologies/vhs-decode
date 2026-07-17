@@ -1077,6 +1077,12 @@ class VHSRFDecode(ldd.RFDecode):
         self._backend_filters = {}
         if not hasattr(self, "_backend_filters_lock"):
             self._backend_filters_lock = threading.Lock()
+        # Which SOS filters run via cupyx on the device instead of on the CPU.
+        # Default all-CPU: filtfilt of a single 32k block measured 4-9x slower
+        # on GPU than scipy/rust on CPU (launch/orchestration bound), so the
+        # round-trip is the faster topology. Flip per-name to re-measure.
+        if not hasattr(self, "_gpu_iir_steps"):
+            self._gpu_iir_steps = {}
         self.Filters = {}
         # Needs to be defined here as it's referenced in constructor.
         self.Filters["F05_offset"] = 32
@@ -1368,22 +1374,43 @@ class VHSRFDecode(ldd.RFDecode):
         indata_fft *= self._get_backend_filter("RFVideo")
         return indata_fft
 
-    def _db_envelope(self, indata_fft, backend):
-        raw_filtered = to_numpy_if_needed(
-            ifft(indata_fft * self._get_backend_filter("hilbert"), backend).real,
-            backend,
-        ).astype(
-            np.single
+    def _db_sosfiltfilt(self, filter_name, x, backend):
+        """Zero-phase SOS filter of one block; always returns a host array.
+        The _gpu_iir_steps table selects, per filter, cupyx-on-device vs the
+        CPU implementation with a transfer round-trip."""
+        if (
+            backend.active
+            and backend.has_cupyx_signal
+            and self._gpu_iir_steps.get(filter_name, False)
+        ):
+            import cupyx.scipy.signal as cpx_signal
+
+            return backend.xp.asnumpy(
+                cpx_signal.sosfiltfilt(
+                    to_backend_array(
+                        np.atleast_2d(self.Filters[filter_name]), backend
+                    ),
+                    to_backend_array(x, backend),
+                )
+            )
+        return sosfiltfilt_rust(
+            self.Filters[filter_name], to_numpy_if_needed(x, backend)
         )
+
+    def _db_envelope(self, indata_fft, backend):
+        xp = backend.xp
+        raw_filtered = ifft(
+            indata_fft * self._get_backend_filter("hilbert"), backend
+        ).real.astype(np.single)
 
         # Calculate an evelope with signal strength using absolute of hilbert transform.
         # Roll this a bit to compensate for filter delay, value eyballed for now.
-        np.abs(raw_filtered, out=raw_filtered)
-        raw_env = np.roll(raw_filtered, 4)
+        xp.abs(raw_filtered, out=raw_filtered)
+        raw_env = xp.roll(raw_filtered, 4)
         del raw_filtered
         # Downconvert to single precision for some possible speedup since we don't need
         # super high accuracy for the dropout detection.
-        env = sosfiltfilt_rust(self.Filters["FEnvPost"], raw_env)
+        env = self._db_sosfiltfilt("FEnvPost", raw_env, backend)
 
         del raw_env
         env_mean = np.mean(env)
@@ -1397,9 +1424,9 @@ class VHSRFDecode(ldd.RFDecode):
                 data_filtered = to_numpy_if_needed(
                     ifft(indata_fft, backend).real, backend
                 )
-                high_part = sosfiltfilt_rust(self.Filters["RFTop"], data_filtered) * (
-                    (env_mean * 0.9) / env
-                )
+                high_part = self._db_sosfiltfilt(
+                    "RFTop", data_filtered, backend
+                ) * ((env_mean * 0.9) / env)
                 del data_filtered
                 indata_fft += fft(
                     to_backend_array(high_part * self._high_boost, backend), backend

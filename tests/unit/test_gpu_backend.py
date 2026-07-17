@@ -127,6 +127,53 @@ class TestComplexEdiff1dXp:
         assert np.array_equal(out, ref)
 
 
+class TestGatedIIR:
+    @pytest.mark.skipif(not _cuda_device_available(), reason="no CUDA device")
+    def test_cupyx_sosfiltfilt_matches_scipy_on_real_filters(self):
+        import cupy as cp
+        import cupyx.scipy.signal as cpx_signal
+        import scipy.signal as sps
+
+        decoder = _make_decoder(use_gpu=True)
+        if not decoder.gpu_backend.has_cupyx_signal:
+            pytest.skip(decoder.gpu_backend.reason)
+        rng = np.random.default_rng(7)
+        x = rng.normal(0.0, 1.0, decoder.blocklen)
+        for name in ["FEnvPost", "RFTop"]:
+            sos = np.atleast_2d(decoder.Filters[name])
+            ref = sps.sosfiltfilt(sos, x)
+            out = cp.asnumpy(cpx_signal.sosfiltfilt(cp.asarray(sos), cp.asarray(x)))
+            assert float(np.max(np.abs(out - ref))) <= 1e-9, name
+
+    @pytest.mark.skipif(not _cuda_device_available(), reason="no CUDA device")
+    def test_gpu_iir_table_flip_keeps_equivalence(self):
+        gpu = _make_decoder(use_gpu=True)
+        if not gpu.gpu_backend.has_cupyx_signal:
+            pytest.skip(gpu.gpu_backend.reason)
+        cpu = _make_decoder(use_gpu=False)
+        wave = _make_wave(cpu)
+
+        assert gpu._gpu_iir_steps == {}
+        gpu._gpu_iir_steps = {"FEnvPost": True, "RFTop": True}
+
+        cpu_video = cpu.demodblock(data=wave)["video"]
+        gpu_video = gpu.demodblock(data=wave)["video"]
+        env_scale = float(np.mean(np.asarray(cpu_video["envelope"], dtype=np.float64)))
+        env_diff = float(
+            np.max(
+                np.abs(
+                    np.asarray(cpu_video["envelope"], dtype=np.float64)
+                    - np.asarray(gpu_video["envelope"], dtype=np.float64)
+                )
+            )
+        )
+        assert env_diff <= 1e-4 * env_scale
+        demod_diff = float(
+            np.max(np.abs(cpu_video["demod"] - np.asarray(gpu_video["demod"])))
+        )
+        assert demod_diff <= 5.0
+
+
 class TestSpikeRepairEquivalence:
     """The GPU decode path must repair diff-demod spikes index-for-index
     like the numba replace_spikes it round-trips through."""

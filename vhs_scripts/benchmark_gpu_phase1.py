@@ -215,10 +215,22 @@ def main():
         default=0,
         help="Also measure aggregate blocks/sec with N threads sharing a decoder.",
     )
+    parser.add_argument(
+        "--gpu-iir",
+        default="",
+        help="Comma-separated SOS filter names to run via cupyx on the device "
+        "(flips the decoder's _gpu_iir_steps table for A/B measurement).",
+    )
     args = parser.parse_args()
 
     cpu_decoder = _make_decoder(args.system, use_gpu=False, force_cpu=True)
     gpu_decoder = _make_decoder(args.system, use_gpu=True, force_cpu=False)
+
+    if args.gpu_iir:
+        gpu_decoder._gpu_iir_steps = {
+            name: True for name in args.gpu_iir.split(",") if name
+        }
+        print(f"GPU IIR table: {gpu_decoder._gpu_iir_steps}")
 
     _print_backend_info(cpu_decoder, "CPU")
     _print_backend_info(gpu_decoder, "GPU")
