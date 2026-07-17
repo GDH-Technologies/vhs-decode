@@ -156,14 +156,17 @@ def _print_backend_info(decoder, label: str):
             print(f"{label} backend metadata unavailable: {exc}")
 
 
-def _print_profile(profile, label: str):
+def _print_profile(profile, label: str, repeats: int):
     if not profile:
         print(f"{label} stage profile: no data")
         return
     total = sum(profile.values())
-    print(f"{label} stage profile (ms/block, mean over runs):")
+    print(f"{label} stage profile (ms/block, mean over {repeats} runs):")
     for stage, seconds in sorted(profile.items(), key=lambda kv: -kv[1]):
-        print(f"  {stage}: {1000 * seconds:.3f} ({100 * seconds / total:.1f}%)")
+        print(
+            f"  {stage}: {1000 * seconds / repeats:.3f} "
+            f"({100 * seconds / total:.1f}%)"
+        )
 
 
 def _numba_reference_video(system: str, wave):
@@ -248,8 +251,8 @@ def main():
     print(f"Speedup (CPU/GPU): {speedup:.2f}x")
 
     if cpu_profile is not None:
-        _print_profile(cpu_profile, "CPU")
-        _print_profile(gpu_profile, "GPU")
+        _print_profile(cpu_profile, "CPU", args.repeats)
+        _print_profile(gpu_profile, "GPU", args.repeats)
 
     if args.threads > 0:
         cpu_tps = _run_threaded(cpu_decoder, wave, args.threads, args.repeats)

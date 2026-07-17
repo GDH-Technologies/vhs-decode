@@ -45,6 +45,7 @@ from vhsdecode import compute_video_filters as cvf
 from vhsdecode.demodcache import DemodCacheTape
 from vhsdecode.rust_utils import sosfiltfilt_rust
 from vhsdecode.gpu_backend import (
+    StageTimer,
     create_backend,
     fft,
     ifft,
@@ -1331,15 +1332,12 @@ class VHSRFDecode(ldd.RFDecode):
         self.delays["video_sync"] = 0
         self.delays["video_white"] = 0
 
-    def demodblock(
-        self, data=None, mtf_level=0, fftdata=None, cut=False, thread_benchmark=False
-    ):
-        rv = {}
-        demod_block_debug = False
-        demod_start_time = time.time()
-        backend = self._gpu_backend
-        _get_backend_filter = self._get_backend_filter
+    # The demodulation hot path is split into per-stage helpers below. They
+    # share one xp-generic code path for CPU and GPU: `backend.xp` is numpy or
+    # cupy, and host/device boundaries only happen via to_backend_array /
+    # to_numpy_if_needed.
 
+    def _db_input_fft(self, data, fftdata, backend):
         if fftdata is not None:
             indata_fft = to_backend_array(fftdata, backend)
         elif data is not None:
@@ -1358,21 +1356,20 @@ class VHSRFDecode(ldd.RFDecode):
 
         if data is None:
             data = to_numpy_if_needed(ifft(indata_fft, backend).real, backend)
+        return indata_fft, data
 
-        if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
-            demod_block_debug = True
-            # If we're doing a plot make a copy of the input to be able to plot it since we
-            # are modifying the data in place.
-            indata_fft_copy = indata_fft.copy()
-
+    def _db_rf_filter(self, indata_fft):
         if self._notch is not None:
-            indata_fft *= _get_backend_filter("FVideoNotchF")
+            indata_fft *= self._get_backend_filter("FVideoNotchF")
 
         # Applies RF filters
-        indata_fft *= _get_backend_filter("RFVideo")
+        indata_fft *= self._get_backend_filter("RFVideo")
+        return indata_fft
 
+    def _db_envelope(self, indata_fft, backend):
         raw_filtered = to_numpy_if_needed(
-            ifft(indata_fft * _get_backend_filter("hilbert"), backend).real, backend
+            ifft(indata_fft * self._get_backend_filter("hilbert"), backend).real,
+            backend,
         ).astype(
             np.single
         )
@@ -1388,12 +1385,16 @@ class VHSRFDecode(ldd.RFDecode):
 
         del raw_env
         env_mean = np.mean(env)
+        return env, env_mean
 
+    def _db_high_boost(self, indata_fft, env, env_mean, backend):
         # Boost high frequencies in areas where the signal is weak to reduce missed zero crossings
         # on sharp transitions. Using filtfilt to avoid phase issues.
         if len(np.where(env == 0)[0]) == 0:  # checks for zeroes on env
             if self._high_boost is not None:
-                data_filtered = to_numpy_if_needed(ifft(indata_fft, backend).real, backend)
+                data_filtered = to_numpy_if_needed(
+                    ifft(indata_fft, backend).real, backend
+                )
                 high_part = sosfiltfilt_rust(self.Filters["RFTop"], data_filtered) * (
                     (env_mean * 0.9) / env
                 )
@@ -1403,20 +1404,10 @@ class VHSRFDecode(ldd.RFDecode):
                 )
         else:
             ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
+        return indata_fft
 
-        hilbert = to_numpy_if_needed(
-            ifft(indata_fft * _get_backend_filter("hilbert"), backend), backend
-        )
-
-        if not demod_block_debug:
-            del indata_fft
-
+    def _db_fm_demod(self, hilbert):
         # FM demodulator
-        # test1 = np.angle(hilbert)
-        # from vhsd_rust import complex_angle_py
-        # test2 = hilbert
-        # print(test1 - test2)
-        # np.savez_compressed("hilbert_data", data=hilbert)
         demod = unwrap_hilbert(hilbert, self.freq_hz)
 
         # If there are obviously out of bounds values, do an extra demod on a diffed waveform and
@@ -1447,16 +1438,20 @@ class VHSRFDecode(ldd.RFDecode):
         if self._chroma_trap:
             # applies the Subcarrier trap
             demod = self.chromaTrap.work(demod)
+        return demod
 
+    def _db_deemphasis(self, demod, backend):
         # applies main deemphasis filter
         demod_fft = rfft(to_backend_array(demod, backend), backend)
-        out_video_fft = demod_fft * _get_backend_filter("FVideo")
+        out_video_fft = demod_fft * self._get_backend_filter("FVideo")
         out_video = to_numpy_if_needed(irfft(out_video_fft, backend).real, backend)
 
         if self.options.nldeemp:
             # Extract the high frequency part of the signal
             hf_part = to_numpy_if_needed(
-                irfft(out_video_fft * _get_backend_filter("NLHighPassF"), backend),
+                irfft(
+                    out_video_fft * self._get_backend_filter("NLHighPassF"), backend
+                ),
                 backend,
             )
             # Limit it to preserve sharp transitions
@@ -1491,15 +1486,19 @@ class VHSRFDecode(ldd.RFDecode):
             out_video = sps.filtfilt(
                 self.Filters["fsc_notch"][0], self.Filters["fsc_notch"][1], out_video
             )
+        return out_video, demod_fft
 
+    def _db_video05(self, demod_fft, backend):
         out_video05 = to_numpy_if_needed(
-            irfft(demod_fft * _get_backend_filter("FVideo05"), backend).real, backend
+            irfft(demod_fft * self._get_backend_filter("FVideo05"), backend).real,
+            backend,
         )
-        out_video05 = np.roll(out_video05, -self.Filters["F05_offset"])
+        return np.roll(out_video05, -self.Filters["F05_offset"])
 
+    def _db_chroma(self, data, out_video):
         # Filter out the color-under signal from the raw data.
         chroma_source = data if self.options.color_under else out_video
-        out_chroma = (
+        return (
             chroma_color_under_filter(
                 chroma_source,
                 self.Filters["FVideoBurst"],
@@ -1514,6 +1513,58 @@ class VHSRFDecode(ldd.RFDecode):
             if not self._do_cafc
             else data[: self.blocklen]
         )
+
+    def demodblock(
+        self,
+        data=None,
+        mtf_level=0,
+        fftdata=None,
+        cut=False,
+        thread_benchmark=False,
+        profile=None,
+    ):
+        rv = {}
+        demod_block_debug = False
+        demod_start_time = time.time()
+        backend = self._gpu_backend
+        timer = StageTimer(profile, backend)
+
+        indata_fft, data = self._db_input_fft(data, fftdata, backend)
+        timer.mark("input_fft")
+
+        if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
+            demod_block_debug = True
+            # If we're doing a plot make a copy of the input to be able to plot it since we
+            # are modifying the data in place.
+            indata_fft_copy = indata_fft.copy()
+
+        indata_fft = self._db_rf_filter(indata_fft)
+        timer.mark("rf_filter")
+
+        env, env_mean = self._db_envelope(indata_fft, backend)
+        timer.mark("envelope")
+
+        indata_fft = self._db_high_boost(indata_fft, env, env_mean, backend)
+        timer.mark("high_boost")
+
+        hilbert = to_numpy_if_needed(
+            ifft(indata_fft * self._get_backend_filter("hilbert"), backend), backend
+        )
+
+        if not demod_block_debug:
+            del indata_fft
+
+        demod = self._db_fm_demod(hilbert)
+        timer.mark("fm_demod")
+
+        out_video, demod_fft = self._db_deemphasis(demod, backend)
+        timer.mark("deemphasis")
+
+        out_video05 = self._db_video05(demod_fft, backend)
+        timer.mark("video05")
+
+        out_chroma = self._db_chroma(data, out_video)
+        timer.mark("chroma")
 
         if self.debug_plot and self.debug_plot.is_plot_requested("magdens"):
             from vhsdecode.debug_plot import plot_magnitude_density
@@ -1554,6 +1605,7 @@ class VHSRFDecode(ldd.RFDecode):
         rv["video"] = (
             video_out[self.blockcut : -self.blockcut_end] if cut else video_out
         )
+        timer.mark("pack")
 
         demod_end_time = time.time()
         if thread_benchmark:

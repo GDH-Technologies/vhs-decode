@@ -1,4 +1,5 @@
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -112,6 +113,26 @@ def create_backend(use_gpu: bool = False, force_cpu: bool = False) -> BackendCon
             xp=np,
             reason=f"CUDA init failed: {exc}",
         )
+
+
+class StageTimer:
+    """Accumulates per-stage wall time into a dict when profiling is
+    requested; free when it is not. Synchronizes the device at each mark so
+    GPU stage times are honest."""
+
+    def __init__(self, profile, ctx: BackendContext):
+        self._profile = profile
+        self._ctx = ctx
+        self._last = time.perf_counter() if profile is not None else 0.0
+
+    def mark(self, name: str):
+        if self._profile is None:
+            return
+        if self._ctx.active:
+            self._ctx.xp.cuda.get_current_stream().synchronize()
+        now = time.perf_counter()
+        self._profile[name] = self._profile.get(name, 0.0) + (now - self._last)
+        self._last = now
 
 
 def using_gpu(ctx: BackendContext) -> bool:
