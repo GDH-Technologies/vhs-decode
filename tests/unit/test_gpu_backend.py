@@ -74,7 +74,84 @@ class TestBackendCapabilities:
         assert ctx.has_cupyx_signal is True, ctx.reason
 
 
-class TestBackendFilterCache:
+def _analytic_test_signal(n=32768, seed=1234):
+    rng = np.random.default_rng(seed)
+    phase = np.cumsum(rng.uniform(0.3, 1.2, n))
+    amp = 1.0 + 0.1 * np.sin(np.linspace(0.0, 50.0, n))
+    return amp * np.exp(1j * phase)
+
+
+class TestUnwrapHilbertXp:
+    def test_matches_numba_reference_numpy(self):
+        import lddecode.utils as lddu
+
+        from vhsdecode.gpu_backend import unwrap_hilbert_xp
+
+        h = _analytic_test_signal()
+        ref = lddu.unwrap_hilbert(h, 40e6)
+        out = unwrap_hilbert_xp(h, 40e6, np)
+        assert out.dtype == np.float64
+        assert float(np.max(np.abs(out - ref))) <= 1e-6
+
+    @pytest.mark.skipif(not _cuda_device_available(), reason="no CUDA device")
+    def test_matches_numba_reference_cupy(self):
+        import cupy as cp
+        import lddecode.utils as lddu
+
+        from vhsdecode.gpu_backend import unwrap_hilbert_xp
+
+        h = _analytic_test_signal()
+        ref = lddu.unwrap_hilbert(h, 40e6)
+        out = cp.asnumpy(unwrap_hilbert_xp(cp.asarray(h), 40e6, cp))
+        assert float(np.max(np.abs(out - ref))) <= 1e-6
+
+
+class TestComplexEdiff1dXp:
+    def test_matches_ediff1d_numpy(self):
+        from vhsdecode.gpu_backend import complex_ediff1d_xp
+
+        h = _analytic_test_signal(n=4096)
+        ref = np.ediff1d(h, to_begin=0)
+        out = complex_ediff1d_xp(h, np)
+        assert np.array_equal(out, ref)
+
+    @pytest.mark.skipif(not _cuda_device_available(), reason="no CUDA device")
+    def test_matches_ediff1d_cupy(self):
+        import cupy as cp
+
+        from vhsdecode.gpu_backend import complex_ediff1d_xp
+
+        h = _analytic_test_signal(n=4096)
+        ref = np.ediff1d(h, to_begin=0)
+        out = cp.asnumpy(complex_ediff1d_xp(cp.asarray(h), cp))
+        assert np.array_equal(out, ref)
+
+
+class TestSpikeRepairEquivalence:
+    """The GPU decode path must repair diff-demod spikes index-for-index
+    like the numba replace_spikes it round-trips through."""
+
+    @pytest.mark.skipif(not _cuda_device_available(), reason="no CUDA device")
+    def test_gpu_decoder_repairs_spikes_like_cpu(self, monkeypatch):
+        import vhsdecode.demod as demod_mod
+
+        # Compare against the exact-f64 numba demodulator, not the
+        # approximate-f32-atan2 vhsd_rust one.
+        monkeypatch.setattr(demod_mod, "_HAS_VHSD_RUST", False)
+
+        gpu = _make_decoder(use_gpu=True)
+        if not gpu.gpu_backend.active:
+            pytest.skip(f"GPU backend inactive: {gpu.gpu_backend.reason}")
+        cpu = _make_decoder(use_gpu=False)
+        # A wave with a burst of out-of-band garbage triggers the
+        # diff-demod spike branch in both decoders.
+        wave = _make_wave(cpu)
+        rng = np.random.default_rng(42)
+        wave[5000:5100] += rng.uniform(-1.5, 1.5, 100)
+
+        cpu_demod = cpu.demodblock(data=wave)["video"]["demod"]
+        gpu_demod = gpu.demodblock(data=wave)["video"]["demod"]
+        assert float(np.max(np.abs(cpu_demod - gpu_demod))) <= 5.0
     def test_filter_cache_persists_across_blocks(self):
         decoder = _make_decoder(use_gpu=False)
         wave = _make_wave(decoder)

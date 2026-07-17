@@ -46,8 +46,10 @@ from vhsdecode.demodcache import DemodCacheTape
 from vhsdecode.rust_utils import sosfiltfilt_rust
 from vhsdecode.gpu_backend import (
     StageTimer,
+    complex_ediff1d_xp,
     create_backend,
     fft,
+    unwrap_hilbert_xp,
     ifft,
     irfft,
     rfft,
@@ -1406,21 +1408,39 @@ class VHSRFDecode(ldd.RFDecode):
             ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
         return indata_fft
 
-    def _db_fm_demod(self, hilbert):
-        # FM demodulator
-        demod = unwrap_hilbert(hilbert, self.freq_hz)
+    def _db_fm_demod(self, hilbert, backend):
+        xp = backend.xp
+        # FM demodulator; hilbert stays on the active backend throughout.
+        if backend.active:
+            demod = unwrap_hilbert_xp(hilbert, self.freq_hz, xp)
+        else:
+            demod = unwrap_hilbert(hilbert, self.freq_hz)
 
         # If there are obviously out of bounds values, do an extra demod on a diffed waveform and
         # replace the spikes with data from the diffed demod. (Which in practice is an extra EQed signal)
         if not self._disable_diff_demod:
             check_value = self.options.diff_demod_check_value
 
-            if np.max(demod[20:-20]) > check_value:
-                demod_b = unwrap_hilbert(
-                    np.ediff1d(hilbert, to_begin=0), self.freq_hz
-                ).real
+            if float(xp.max(demod[20:-20])) > check_value:
+                if backend.active:
+                    demod_b = unwrap_hilbert_xp(
+                        complex_ediff1d_xp(hilbert, xp), self.freq_hz, xp
+                    ).real
+                    # replace_spikes is an ordered in-place repair; round-trip
+                    # through the exact numba implementation (spike blocks are
+                    # rare enough that the transfer does not matter).
+                    demod = to_backend_array(
+                        replace_spikes(
+                            xp.asnumpy(demod), xp.asnumpy(demod_b), check_value
+                        ),
+                        backend,
+                    )
+                else:
+                    demod_b = unwrap_hilbert(
+                        np.ediff1d(hilbert, to_begin=0), self.freq_hz
+                    ).real
 
-                demod = replace_spikes(demod, demod_b, check_value)
+                    demod = replace_spikes(demod, demod_b, check_value)
                 del demod_b
                 # Not used yet, needs more testing.
                 # 2.2 seems to be a sweet spot between reducing spikes and not causing
@@ -1431,12 +1451,14 @@ class VHSRFDecode(ldd.RFDecode):
         # Disabled if sharpness level is zero (default).
         # TODO: This should be done after the deemphasis steps
         if self._video_eq:
-            # applies the video EQ
+            # applies the video EQ (stateful native code, host only)
+            demod = to_numpy_if_needed(demod, backend)
             demod = self._video_eq.filter_video(demod)
 
         # TODO: This should be done after the deemphasis steps
         if self._chroma_trap:
-            # applies the Subcarrier trap
+            # applies the Subcarrier trap (host only)
+            demod = to_numpy_if_needed(demod, backend)
             demod = self.chromaTrap.work(demod)
         return demod
 
@@ -1547,14 +1569,12 @@ class VHSRFDecode(ldd.RFDecode):
         indata_fft = self._db_high_boost(indata_fft, env, env_mean, backend)
         timer.mark("high_boost")
 
-        hilbert = to_numpy_if_needed(
-            ifft(indata_fft * self._get_backend_filter("hilbert"), backend), backend
-        )
+        hilbert = ifft(indata_fft * self._get_backend_filter("hilbert"), backend)
 
         if not demod_block_debug:
             del indata_fft
 
-        demod = self._db_fm_demod(hilbert)
+        demod = self._db_fm_demod(hilbert, backend)
         timer.mark("fm_demod")
 
         out_video, demod_fft = self._db_deemphasis(demod, backend)
@@ -1585,7 +1605,7 @@ class VHSRFDecode(ldd.RFDecode):
                 env_mean=env_mean,
                 raw_fft=to_numpy_if_needed(indata_fft_copy, backend),
                 filtered_fft=to_numpy_if_needed(indata_fft, backend),
-                demod_video=demod,
+                demod_video=to_numpy_if_needed(demod, backend),
                 filtered_video=out_video,
                 chroma=out_chroma,
                 rf_filter=self.Filters["RFVideo"],
@@ -1594,7 +1614,7 @@ class VHSRFDecode(ldd.RFDecode):
             )
 
         if self.options.export_raw_tbc:
-            out_video = demod
+            out_video = to_numpy_if_needed(demod, backend)
 
         # demod_burst is a bit misleading, but keeping the naming for compatability.
         video_out = np.rec.array(

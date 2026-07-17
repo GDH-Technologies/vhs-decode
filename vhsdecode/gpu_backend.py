@@ -135,6 +135,34 @@ class StageTimer:
         self._last = now
 
 
+_TAU = np.pi * 2
+
+
+def unwrap_hilbert_xp(hilbert, freq_hz, xp):
+    """Conjugate-product FM discriminator, the same algorithm as the numba
+    lddecode.utils.unwrap_hilbert, expressed in xp (numpy or cupy) ops so it
+    can run on whichever backend holds the analytic signal."""
+    out = xp.empty(len(hilbert), dtype=xp.float64)
+    out[0] = 0.0
+
+    # phase increment between consecutive samples = arg(z[n] * conj(z[n-1]))
+    prod = hilbert[1:] * xp.conj(hilbert[:-1])
+    d = xp.arctan2(prod.imag, prod.real)
+
+    # preserve the historical [0, tau) convention (positive frequencies only)
+    out[1:] = xp.where(d < 0.0, d + _TAU, d)
+
+    return out * (freq_hz / _TAU)
+
+
+def complex_ediff1d_xp(arr, xp):
+    """np.ediff1d(arr, to_begin=0) for either backend."""
+    out = xp.empty_like(arr)
+    out[0] = 0
+    out[1:] = arr[1:] - arr[:-1]
+    return out
+
+
 def using_gpu(ctx: BackendContext) -> bool:
     return ctx.active
 
