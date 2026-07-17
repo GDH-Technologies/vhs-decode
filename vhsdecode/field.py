@@ -1832,36 +1832,38 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
         self.burst_detected_line = 0
         self.fsc_ratio = self.rf.SysParams["outfreq"] / self.rf.SysParams["fsc_mhz"]
 
+
     @staticmethod
     def _sync_to_burst(
         linelocs, outlinelen, fsc, fsc_ratio, burst_avg_phase, phase_sequence, burst_detected_line
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
-        for burst in phase_sequence[burst_tbc_start:]:
+        # Precompute loop-invariant multipliers (Eliminates division inside the loop)
+        inv_outlinelen = 1.0 / outlinelen
+        inv_fsc = 1.0 / fsc
+        phase_to_samples_factor = fsc_ratio / 360.0
+
+        for idx in range(burst_tbc_start, len(phase_sequence)):
+            burst = phase_sequence[idx]
+
             # Phase difference at the burst center
-            phase_delta = (burst_avg_phase - burst.phase_deg + 180) % 360 - 180
+            phase_delta = (burst_avg_phase - burst.phase_deg + 180.0) % 360.0 - 180.0
 
             line_start = linelocs[burst.line_number]
             line_end = linelocs[burst.line_number + 1]
             line_length = line_end - line_start
-
-            # Move the hsync location relative to the color burst center position
-            burst_center_distance = burst.center - line_start
-            scale = burst_center_distance / (outlinelen * (burst_center_distance / line_length))
+            scale = line_length * inv_outlinelen
 
             # Base phase adjustment
-            line_adjust = (phase_delta / 360.0) * fsc_ratio
+            line_adjust = phase_delta * phase_to_samples_factor
 
             # Calculate the subcarrier cycle frequency drift as samples:
             f_offset = burst.frequency - fsc
-            sample_rate = fsc * fsc_ratio
-            drift_cycles_per_sample = f_offset / sample_rate
+            burst_center_distance = burst.center - line_start
+            accumulated_drift_samples = (f_offset * burst_center_distance) * inv_fsc
 
-            # Total drift accumulated over this line segment up to the burst center
-            accumulated_drift_samples = (drift_cycles_per_sample * burst_center_distance) * fsc_ratio
-
-            # Subtract the frequency drift component to prevent it from pulling on the static phase TBC
+            # Subtract frequency drift and scale the shift
             corrected_adjust = line_adjust - accumulated_drift_samples
 
             linelocs[burst.line_number] += corrected_adjust * scale
