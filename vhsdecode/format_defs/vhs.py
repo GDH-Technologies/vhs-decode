@@ -456,3 +456,38 @@ def get_sysparams_mesecam_vhs(sysparams_pal: dict, tape_speed: int = 0) -> dict:
     # this function runs). The restored SECAM subcarriers are placed by
     # chroma_conversion_lo rather than by fsc + color under carrier.
     return get_sysparams_pal_vhs(sysparams_pal, tape_speed)
+
+
+def get_rfparams_secam_vhs(rfparams_pal: dict, tape_speed: int = 0) -> dict:
+    params = get_rfparams_pal_vhs(rfparams_pal, tape_speed)
+
+    # SECAM method 1 (IEC 60774-1 6.4.1 / annex E figure E1): the studio SECAM
+    # chroma block is separated with a band-pass centred on 4.32 MHz (-3 dB at
+    # +-800 kHz) and counted down by 4 in a digital divider, so the rest
+    # carriers on tape are exactly foB/4 = 1062500 Hz and foR/4 = 1101562.5 Hz
+    # and the FM deviations are also divided by 4 (max ~+-126.5 kHz).
+    # Playback restores the block by multiplying the carrier phase by 4 again;
+    # there is no conversion crystal anywhere in the chain, so unlike ME-SECAM
+    # there is no LO error to servo out, and tape timebase error scales the
+    # deviation together with the carrier so it self-corrects (JVC video
+    # technical guide 3.1.4).
+    params["color_under_carrier"] = (1062500.0 + 1101562.5) / 2  # 1082031.25
+    params["chroma_rotation"] = None
+    params["chroma_carrier_mult"] = 4
+    # The under carriers sit much higher than PAL colour-under, so raise the
+    # take-off low edge to keep head-switch thump and low-frequency junk out
+    # of the phase measurement. The upper edge (chroma_bpf_upper, 1.3 MHz)
+    # stays below the luma FM lower sideband area and the 1.4 MHz FM audio
+    # carrier.
+    params["chroma_bpf_lower"] = 350000
+
+    return params
+
+
+def get_sysparams_secam_vhs(sysparams_pal: dict, tape_speed: int = 0) -> dict:
+    """Get system params for SECAM (method 1) VHS"""
+
+    # Same as PAL/ME-SECAM: the TBC output stays at standard PAL 4fsc. The
+    # x4 phase multiplication puts the restored subcarriers on the studio
+    # frequencies (ITU-R BT.470: foR 4406250 Hz, foB 4250000 Hz) by itself.
+    return get_sysparams_pal_vhs(sysparams_pal, tape_speed)

@@ -87,6 +87,8 @@ def field_class_from_formats(system: str, tape_format: str) -> ldd.Field:
         field_class = FieldPALMVHS
     elif system == "MESECAM" and tape_format == "VHS":
         field_class = FieldMESECAMVHS
+    elif system == "SECAM" and tape_format == "VHS":
+        field_class = FieldSECAMVHS
     elif system == "405":
         if tape_format == "BETAMAX":
             field_class = FieldPALTypeC
@@ -2068,6 +2070,17 @@ class FieldMESECAMVHS(FieldPALShared):
 
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldMESECAMVHS, self).downscale(final=final, *args, **kwargs)
+        dschroma = decode_chroma(self)
+
+        return (dsout, dschroma), dsaudio, dsefm
+
+
+class FieldSECAMVHS(FieldPALShared):
+    def __init__(self, *args, **kwargs):
+        super(FieldSECAMVHS, self).__init__(*args, **kwargs)
+
+    def downscale(self, final=False, *args, **kwargs):
+        dsout, dsaudio, dsefm = super(FieldSECAMVHS, self).downscale(final=final, *args, **kwargs)
         dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm

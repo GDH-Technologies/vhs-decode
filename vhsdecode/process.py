@@ -869,6 +869,7 @@ class VHSRFDecode(ldd.RFDecode):
             do_cafc=self._do_cafc,
             chroma_bpf_lower=self.DecoderParams.get("chroma_bpf_lower", 60000),
             conversion_lo_freq=self.DecoderParams.get("chroma_conversion_lo", None),
+            carrier_mult=self.DecoderParams.get("chroma_carrier_mult", None),
         )
 
         self.Filters["FVideoBurst"] = (
@@ -932,6 +933,19 @@ class VHSRFDecode(ldd.RFDecode):
         if is_color_under:
             self.chroma_heterodyne = self._chroma_afc.getChromaHet()
             self.fsc_wave, self.fsc_cos_wave = self._chroma_afc.getFSCWaves()
+
+        if self._chroma_afc.carrier_mult is not None:
+            # SECAM method 1: post-TBC band-pass around the under carriers
+            # ahead of the x4 phase multiplication.
+            self.Filters["FSecamUnder"] = self._chroma_afc.get_secam_under_bandpass()
+            # Porch carrier pair sanity check over the first fields, to catch
+            # tapes that were actually recorded with the ME-SECAM method.
+            self.secam_method_diag = {
+                "fields": 0,
+                "method1": 0,
+                "mesecam": 0,
+                "done": False,
+            }
 
         # Long-term average of the measured ME-SECAM rest carrier pair offset,
         # used to trim the chroma up-conversion LO.
