@@ -663,7 +663,7 @@ class CVBSDecode(ldd.LDdecode):
         if self._db_writer:
             if not self.capture_id:
                 self.build_sqlite_metadata()
-            self._db_writer.write_field(fi, self.doDOD, self.capture_id)
+            self._db_writer.write_field(fi, self.capture_id, self.doDOD)
             # NOTE: this calls commit so we don't call it in dbwriter.write_field.
             self.build_sqlite_metadata()
 
