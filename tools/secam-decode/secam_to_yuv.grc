@@ -43,9 +43,9 @@ blocks:
     orient: QtCore.Qt.Horizontal
     rangeType: float
     start: '10'
-    step: '0.05'
+    step: '0.005'
     stop: '14'
-    value: '12.45'
+    value: 4.25e6/350e3
     widget: counter_slider
   states:
     bus_sink: false
@@ -64,9 +64,9 @@ blocks:
     orient: QtCore.Qt.Horizontal
     rangeType: float
     start: '10'
-    step: '0.05'
+    step: '0.005'
     stop: '14'
-    value: '12.90'
+    value: 4.40625e6/350e3
     widget: counter_slider
   states:
     bus_sink: false
@@ -630,9 +630,9 @@ blocks:
       \ndf0B = 230 \xB17kHz [nominal deviation of B-Y subcarrier]"
     decim: '1'
     gain: '1'
-    high_cutoff_freq: 4250000+1000000
+    high_cutoff_freq: 4250000+750000
     interp: '1'
-    low_cutoff_freq: 4250000-1000000
+    low_cutoff_freq: 4250000-750000
     maxoutbuf: '0'
     minoutbuf: '0'
     samp_rate: round(samp_rate*1.0009)
@@ -652,13 +652,13 @@ blocks:
     affinity: ''
     alias: ''
     beta: '0'
-    comment: "Dr = V\nf0R = 4 406 260 \xB12 000Hz [B-Y subcarrier rest frequency]\r\
+    comment: "Dr = V\nf0R = 4 406 250 \xB12 000Hz [R-Y subcarrier rest frequency]\r\
       \ndf0R = 280 \xB19kHz [nominal deviation of R-Y subcarrier]"
     decim: '1'
     gain: '1'
-    high_cutoff_freq: 4406260+1000000
+    high_cutoff_freq: 4406250+750000
     interp: '1'
-    low_cutoff_freq: 4406260-1000000
+    low_cutoff_freq: 4406250-750000
     maxoutbuf: '0'
     minoutbuf: '0'
     samp_rate: round(samp_rate*1.0009)

@@ -26,11 +26,30 @@ class ChromaAFC:
         tape_format="VHS",
         do_cafc=False,
         chroma_bpf_lower=60000,
+        conversion_lo_freq=None,
+        carrier_mult=None,
     ):
         self.tape_format = tape_format
         self.fv = sys_params["FPS"] * 2
         self.fh = sys_params["FPS"] * sys_params["frame_lines"]
         self.color_under = color_under_carrier_f
+        # Explicit colour-under conversion LO (Hz). When set (ME-SECAM), the
+        # up-conversion mixes against this frequency instead of
+        # fsc + color under carrier, referenced to the true TBC output rate
+        # so the restored carriers land exactly on their studio frequencies.
+        self.conversion_lo = conversion_lo_freq
+        self.conversion_lo_trim = 0.0
+        # Carrier restore multiplier. When set (SECAM method 1, recorded via a
+        # divide-by-4 counter per IEC 60774-1 6.4.1), the up-conversion
+        # multiplies the under-carrier phase by this factor instead of mixing
+        # against a heterodyne, and the chroma block sits at
+        # color_under * carrier_mult on the output.
+        self.carrier_mult = carrier_mult
+        self.het_sample_offset = 0
+        # The rate the TBC output is actually clocked at (outlinelen samples
+        # per line period), as opposed to samp_rate = 4 * fsc which outlinelen
+        # only approximates after rounding to whole samples.
+        self.true_samp_rate = sys_params["outlinelen"] * self.fh
         self.cc_phase = 0
         self.power_threshold = 1 / 3
         self.transition_expand = 12
@@ -166,6 +185,22 @@ class ChromaAFC:
         Which is a -cosine of fcc + fsc frequency, and
         phase_cc phase, assuming phase_sc = 0
         """
+        if self.conversion_lo is not None:
+            # ME-SECAM: mix against the recorder's conversion LO directly.
+            # The heterodyne phases are never rotated for SECAM, so a single
+            # wave is generated and reused for all four phase slots.
+            het_wave_scale = (
+                self.conversion_lo + self.conversion_lo_trim
+            ) / self.true_samp_rate
+            # Continue the carrier phase from where the previous fields left
+            # off so the restored FM carrier has no phase step (heard by a
+            # SECAM decoder as a chroma click) at field boundaries.
+            phase_offset = twopi * ((het_wave_scale * self.het_sample_offset) % 1.0)
+            wave = -np.cos(
+                (twopi * het_wave_scale * self.samples) + phase_offset
+            ).astype(np.float32)
+            return np.array([wave, wave, wave, wave])
+
         het_freq = self.fsc_mhz + self.cc_freq_mhz
         het_wave_scale = het_freq / self.out_sample_rate_mhz
 
@@ -231,6 +266,21 @@ class ChromaAFC:
     #                sps.sosfiltfilt(het_filter, cc_wave_270 * self.fsc_wave),
     #            ]
     #        )
+
+    # Updates the conversion LO trim (Hz) and the absolute output sample
+    # position of the start of the current field, regenerating the heterodyne
+    # table when either changed. Only used when conversion_lo is set (ME-SECAM).
+    def updateConversion(self, lo_trim_hz, het_sample_offset):
+        if (
+            lo_trim_hz != self.conversion_lo_trim
+            or het_sample_offset != self.het_sample_offset
+        ):
+            self.conversion_lo_trim = lo_trim_hz
+            self.het_sample_offset = het_sample_offset
+            self.genHetC()
+
+    def getConversionTrim(self):
+        return self.conversion_lo_trim
 
     # Returns the chroma heterodyning wave table/array computed after genHetC()
     def getChromaHet(self):
@@ -469,21 +519,55 @@ class ChromaAFC:
     # Needs tweaking.
     # Note: order will be doubled since we use filtfilt.
     def get_chroma_bandpass_final(self, color_under_format=True):
-        if color_under_format:
-            lower = (self.color_under / 1e6) * 0.9
-            upper = (self.color_under / 1e6) * 0.75
+        if color_under_format and (
+            self.conversion_lo is not None or self.carrier_mult is not None
+        ):
+            # SECAM: place the band around the restored chroma block
+            # rather than around fsc. A tight top edge matters: it suppresses
+            # high-side FM splatter from saturated transitions, which
+            # otherwise reaches downstream discriminators with wide take-off
+            # filters and turns into clicks/streaks at color edges.
+            # Both SECAM variants restore the block to the same place
+            # (centre 4.328125 MHz): ME-SECAM by mixing against the
+            # conversion LO, method 1 by multiplying the carrier by 4.
+            if self.conversion_lo is not None:
+                center = (self.conversion_lo - self.color_under) / 1e6
+            else:
+                center = self.color_under * self.carrier_mult / 1e6
+            band_low = center - 0.67
+            band_high = center + 0.55
+        elif color_under_format:
+            band_low = self.fsc_mhz - (self.color_under / 1e6) * 0.9
+            band_high = self.fsc_mhz + (self.color_under / 1e6) * 0.75
         else:
             # Using a narrow filter atm as this is just used for
             # picking out burst signal in this case.
-            lower = 0.1
-            upper = 0.1
+            band_low = self.fsc_mhz - 0.1
+            band_high = self.fsc_mhz + 0.1
 
         return sps.butter(
             4,
             [
-                (self.fsc_mhz - lower) / self.out_frequency_half,
-                (self.fsc_mhz + upper) / self.out_frequency_half,
+                band_low / self.out_frequency_half,
+                band_high / self.out_frequency_half,
             ],
+            btype="bandpass",
+            output="sos",
+        )
+
+    # Post-TBC band-pass around the SECAM method 1 under carriers, used to
+    # clean the signal ahead of the analytic-signal phase measurement that
+    # the x4 multiplication is derived from (out-of-band noise there turns
+    # directly into phase noise, which the multiplication amplifies by 4).
+    # The band covers the carrier pair (1.0625/1.1015625 MHz) plus the
+    # +-126.5 kHz max deviation and as much sideband room as fits below the
+    # luma FM area.
+    # Note: order will be doubled since we use filtfilt.
+    def get_secam_under_bandpass(self):
+        freq_hz_half = self.true_samp_rate / 2
+        return sps.butter(
+            3,
+            [550e3 / freq_hz_half, 1300e3 / freq_hz_half],
             btype="bandpass",
             output="sos",
         )

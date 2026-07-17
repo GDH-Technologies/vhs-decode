@@ -344,7 +344,8 @@ def get_sysparams_ntsc_vhs(sysparams_ntsc: dict, tape_speed: int = 0) -> dict:
 
     # TODO: LP value is doubled as a workaround for burst emp not being used in LP mode
     # this should be fixed properly by disabling burst deemp in LP mode
-    SysParams_NTSC_VHS["burst_abs_ref"] = [4416, 4416 / 2, 4416][tape_speed]
+    burst_abs_ref = 5730
+    SysParams_NTSC_VHS["burst_abs_ref"] = [burst_abs_ref, burst_abs_ref / 2, burst_abs_ref][tape_speed]
 
     return SysParams_NTSC_VHS
 
@@ -430,9 +431,18 @@ def get_sysparams_palm_vhs(sysparams_ntsc: dict, tape_speed: int = 0) -> dict:
 def get_rfparams_mesecam_vhs(rfparams_pal: dict, tape_speed: int = 0) -> dict:
     params = get_rfparams_pal_vhs(rfparams_pal, tape_speed)
 
-    # Average of the two carriers specified, need to check if this works correctly
-    # and calculate exact value
-    params["color_under_carrier"] = (654300 + 810500) / 2
+    # ME-SECAM records the SECAM FM chroma block the same way as PAL colour-under
+    # (IEC 60774-1 Annex E / 6.3.1) but without carrier phase rotation and with the
+    # APC disabled: an inverting mix against the PAL converter LO of
+    # fsc + (40 * fh + 1953) = 4433618.75 + 626953.125 = 5060571.875 Hz.
+    # That puts the rest carriers on tape at:
+    #   D'r: 5060571.875 - 4406250 = 654321.875 Hz
+    #   D'b: 5060571.875 - 4250000 = 810571.875 Hz
+    # color_under_carrier is only used for band-pass centering; the up-conversion
+    # mixes against chroma_conversion_lo so the restored carriers land back on the
+    # studio frequencies (ITU-R BT.470: foR 4406250 Hz, foB 4250000 Hz).
+    params["color_under_carrier"] = (654321.875 + 810571.875) / 2
+    params["chroma_conversion_lo"] = 5060571.875
     params["chroma_rotation"] = None
 
     return params
@@ -441,13 +451,43 @@ def get_rfparams_mesecam_vhs(rfparams_pal: dict, tape_speed: int = 0) -> dict:
 def get_sysparams_mesecam_vhs(sysparams_pal: dict, tape_speed: int = 0) -> dict:
     """Get system params for MESECAM VHS"""
 
-    # This will be the same as PAL other than chroma
-    sysparams = get_sysparams_pal_vhs(sysparams_pal, tape_speed)
+    # Same as PAL, including fsc_mhz, so the TBC output stays at standard PAL 4fsc
+    # and stays consistent with outlinelen (which is derived from the PAL fsc before
+    # this function runs). The restored SECAM subcarriers are placed by
+    # chroma_conversion_lo rather than by fsc + color under carrier.
+    return get_sysparams_pal_vhs(sysparams_pal, tape_speed)
 
-    # FSC specified in Panasonic NV-F55/95 handbook, need to check if this is correct
-    # This differs from normal SECAM, possibly it's done like this to put the upconverted
-    # subcarriers at the correct frequencies.
-    # TODO: Needs testing
-    sysparams["fsc_mhz"] = 4.406
 
-    return sysparams
+def get_rfparams_secam_vhs(rfparams_pal: dict, tape_speed: int = 0) -> dict:
+    params = get_rfparams_pal_vhs(rfparams_pal, tape_speed)
+
+    # SECAM method 1 (IEC 60774-1 6.4.1 / annex E figure E1): the studio SECAM
+    # chroma block is separated with a band-pass centred on 4.32 MHz (-3 dB at
+    # +-800 kHz) and counted down by 4 in a digital divider, so the rest
+    # carriers on tape are exactly foB/4 = 1062500 Hz and foR/4 = 1101562.5 Hz
+    # and the FM deviations are also divided by 4 (max ~+-126.5 kHz).
+    # Playback restores the block by multiplying the carrier phase by 4 again;
+    # there is no conversion crystal anywhere in the chain, so unlike ME-SECAM
+    # there is no LO error to servo out, and tape timebase error scales the
+    # deviation together with the carrier so it self-corrects (JVC video
+    # technical guide 3.1.4).
+    params["color_under_carrier"] = (1062500.0 + 1101562.5) / 2  # 1082031.25
+    params["chroma_rotation"] = None
+    params["chroma_carrier_mult"] = 4
+    # The under carriers sit much higher than PAL colour-under, so raise the
+    # take-off low edge to keep head-switch thump and low-frequency junk out
+    # of the phase measurement. The upper edge (chroma_bpf_upper, 1.3 MHz)
+    # stays below the luma FM lower sideband area and the 1.4 MHz FM audio
+    # carrier.
+    params["chroma_bpf_lower"] = 350000
+
+    return params
+
+
+def get_sysparams_secam_vhs(sysparams_pal: dict, tape_speed: int = 0) -> dict:
+    """Get system params for SECAM (method 1) VHS"""
+
+    # Same as PAL/ME-SECAM: the TBC output stays at standard PAL 4fsc. The
+    # x4 phase multiplication puts the restored subcarriers on the studio
+    # frequencies (ITU-R BT.470: foR 4406250 Hz, foB 4250000 Hz) by itself.
+    return get_sysparams_pal_vhs(sysparams_pal, tape_speed)

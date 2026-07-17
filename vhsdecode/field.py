@@ -87,6 +87,8 @@ def field_class_from_formats(system: str, tape_format: str) -> ldd.Field:
         field_class = FieldPALMVHS
     elif system == "MESECAM" and tape_format == "VHS":
         field_class = FieldMESECAMVHS
+    elif system == "SECAM" and tape_format == "VHS":
+        field_class = FieldSECAMVHS
     elif system == "405":
         if tape_format == "BETAMAX":
             field_class = FieldPALTypeC
@@ -1100,7 +1102,7 @@ class FieldShared:
             np.clip((reduced * self.out_scale) + self.rf.SysParams["outputZero"], 0, 65535) + 0.5
         )
 
-    def lock_to_burst(self, linelocs):
+    def lock_to_burst(self):
         self.chroma_tbc_buffer = None
         (
             self.rf.track_phase,
@@ -1112,7 +1114,6 @@ class FieldShared:
             self.odd_burst_phase_avg,
         ) = decode_chroma_phase_rotation(
             self,
-            linelocs,
             chroma_rotation=self.rf.DecoderParams.get("chroma_rotation", None),
             detect_chroma_track_phase=self.rf.options.detect_chroma_track_phase,
         )
@@ -1765,6 +1766,7 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
     def _sync_to_burst(
         linelocs,
         outlinelen,
+        fsc,
         fsc_ratio,
         even_burst_avg_phase,
         odd_burst_avg_phase,
@@ -1773,23 +1775,38 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
-        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[
-            burst_tbc_start:
-        ]:
-            target_phase = odd_burst_avg_phase if line_number % 2 else even_burst_avg_phase
+        inv_outlinelen = 1.0 / outlinelen
+        inv_fsc = 1.0 / fsc
+        phase_to_samples_factor = fsc_ratio / 360.0
 
-            phase_delta = (target_phase - burst_phase + burst_phase_offset + 180) % 360 - 180
+        for idx in range(burst_tbc_start, len(phase_sequence)):
+            burst = phase_sequence[idx]
 
-            # scale up burst fsc for each line
-            line_start = linelocs[line_number]
-            line_end = linelocs[line_number + 1]
+            # Select PAL target phase based on line polarity (even/odd)
+            target_phase = odd_burst_avg_phase if burst.line_number % 2 else even_burst_avg_phase
+
+            # Calculate phase delta including the PAL line offset
+            phase_delta = (target_phase - burst.phase_deg + burst.phase_offset_deg + 180.0) % 360.0 - 180.0
+
+            line_start = linelocs[burst.line_number]
+            line_end = linelocs[burst.line_number + 1]
             line_length = line_end - line_start
-            scale = line_length / outlinelen
+            
+            scale = line_length * inv_outlinelen
 
-            line_adjust = phase_delta / 360.0 * fsc_ratio
-            linelocs[line_number] += (
-                line_adjust * scale
-            )  # 4fsc, then scaled up to the input line length
+            # Base phase adjustment
+            line_adjust = phase_delta * phase_to_samples_factor
+
+            # Frequency Drift Tracking
+            f_offset = burst.frequency - fsc
+            burst_center_distance = burst.center - line_start
+            accumulated_drift_samples = (f_offset * burst_center_distance) * inv_fsc
+
+            # Combine phase offset and subcarrier drift adjustments
+            corrected_adjust = line_adjust - accumulated_drift_samples
+
+            # Shift the HSync location 
+            linelocs[burst.line_number] += corrected_adjust * scale
 
     def refine_linelocs_pilot(self, linelocs=None):
         if linelocs is None:
@@ -1799,7 +1816,7 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
 
         if not self.track_phase_set and self.rf.options.write_chroma:
             # only do this once, since this does not affect hsync currently
-            self.lock_to_burst(linelocs)
+            self.lock_to_burst()
 
             if (
                 not self.rf.options.disable_burst_hsync
@@ -1809,6 +1826,7 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
                 FieldPALShared._sync_to_burst(
                     linelocs,
                     self.outlinelen,
+                    self.rf.SysParams["fsc_mhz"] * 1e6,
                     self.fsc_ratio,
                     self.even_burst_phase_avg,
                     self.odd_burst_phase_avg,
@@ -1833,27 +1851,41 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
         self.burst_detected_line = 0
         self.fsc_ratio = self.rf.SysParams["outfreq"] / self.rf.SysParams["fsc_mhz"]
 
+
     @staticmethod
     def _sync_to_burst(
-        linelocs, outlinelen, fsc_ratio, burst_avg_phase, phase_sequence, burst_detected_line
+        linelocs, outlinelen, fsc, fsc_ratio, burst_avg_phase, phase_sequence, burst_detected_line
     ):
         burst_tbc_start = max(9, burst_detected_line)
 
-        for line_number, _, burst_phase, burst_phase_offset, _, _, _ in phase_sequence[
-            burst_tbc_start:
-        ]:
-            phase_delta = (burst_avg_phase - burst_phase + burst_phase_offset + 180) % 360 - 180
+        # Precompute loop-invariant multipliers (Eliminates division inside the loop)
+        inv_outlinelen = 1.0 / outlinelen
+        inv_fsc = 1.0 / fsc
+        phase_to_samples_factor = fsc_ratio / 360.0
 
-            # scale up burst fsc for each line
-            line_start = linelocs[line_number]
-            line_end = linelocs[line_number + 1]
+        for idx in range(burst_tbc_start, len(phase_sequence)):
+            burst = phase_sequence[idx]
+
+            # Phase difference at the burst center
+            phase_delta = (burst_avg_phase - burst.phase_deg + 180.0) % 360.0 - 180.0
+
+            line_start = linelocs[burst.line_number]
+            line_end = linelocs[burst.line_number + 1]
             line_length = line_end - line_start
-            scale = line_length / outlinelen
+            scale = line_length * inv_outlinelen
 
-            line_adjust = phase_delta / 360.0 * fsc_ratio
-            linelocs[line_number] += (
-                line_adjust * scale
-            )  # 4fsc, then scaled up to the input line length
+            # Base phase adjustment
+            line_adjust = phase_delta * phase_to_samples_factor
+
+            # Calculate the subcarrier cycle frequency drift as samples:
+            f_offset = burst.frequency - fsc
+            burst_center_distance = burst.center - line_start
+            accumulated_drift_samples = (f_offset * burst_center_distance) * inv_fsc
+
+            # Subtract frequency drift and scale the shift
+            corrected_adjust = line_adjust - accumulated_drift_samples
+
+            linelocs[burst.line_number] += corrected_adjust * scale
 
     def refine_linelocs_burst(self, linelocs=None):
         if linelocs is None:
@@ -1863,7 +1895,7 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
 
         # populates color burst info for hsync refinement the step below
         if self.rf.options.write_chroma:
-            self.lock_to_burst(linelocs)
+            self.lock_to_burst()
 
             if (
                 not self.rf.options.disable_burst_hsync
@@ -1874,6 +1906,7 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
                     FieldNTSCShared._sync_to_burst(
                         linelocs,
                         self.outlinelen,
+                        self.rf.SysParams["fsc_mhz"] * 1e6,
                         self.fsc_ratio,
                         self.burst_phase_avg,
                         self.phase_sequence,
@@ -1884,6 +1917,7 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
                     FieldPALShared._sync_to_burst(
                         linelocs,
                         self.outlinelen,
+                        self.rf.SysParams["fsc_mhz"] * 1e6,
                         self.fsc_ratio,
                         self.even_burst_phase_avg,
                         self.odd_burst_phase_avg,
@@ -2036,6 +2070,17 @@ class FieldMESECAMVHS(FieldPALShared):
 
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldMESECAMVHS, self).downscale(final=final, *args, **kwargs)
+        dschroma = decode_chroma(self)
+
+        return (dsout, dschroma), dsaudio, dsefm
+
+
+class FieldSECAMVHS(FieldPALShared):
+    def __init__(self, *args, **kwargs):
+        super(FieldSECAMVHS, self).__init__(*args, **kwargs)
+
+    def downscale(self, final=False, *args, **kwargs):
+        dsout, dsaudio, dsefm = super(FieldSECAMVHS, self).downscale(final=final, *args, **kwargs)
         dschroma = decode_chroma(self)
 
         return (dsout, dschroma), dsaudio, dsefm
