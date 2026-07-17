@@ -393,9 +393,7 @@ class VHSDecode(ldd.LDdecode):
             if not self.capture_id:
                 self.build_sqlite_metadata()
             self.fieldinfo.append(fi_out)
-            self._db_writer.write_field(
-                fi_out, self.dbconn, self.capture_id, self.doDOD
-            )
+            self._db_writer.write_field(fi_out, self.capture_id, self.doDOD)
             # NOTE: this calls commit so we don't call it in dbwriter.write_field.
             self.build_sqlite_metadata()
         else:
