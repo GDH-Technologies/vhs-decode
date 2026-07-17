@@ -1,6 +1,8 @@
+import contextlib
 import os
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
@@ -16,6 +18,20 @@ class BackendContext:
     reason: str = ""
     gpu_name: Optional[str] = None
     has_cupyx_signal: bool = False
+    _stream_local: Any = field(
+        default_factory=threading.local, repr=False, compare=False
+    )
+
+    def stream(self):
+        """Context manager scoping GPU work to a per-thread CUDA stream so
+        worker threads do not serialize on the default stream. No-op on CPU."""
+        if not self.active:
+            return contextlib.nullcontext()
+        stream = getattr(self._stream_local, "stream", None)
+        if stream is None:
+            stream = self.xp.cuda.Stream(non_blocking=True)
+            self._stream_local.stream = stream
+        return stream
 
 
 def _ensure_cuda_path():

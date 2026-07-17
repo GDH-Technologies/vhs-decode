@@ -1661,14 +1661,23 @@ class VHSRFDecode(ldd.RFDecode):
         if self.options.export_raw_tbc:
             out_video = to_numpy_if_needed(demod, backend)
 
+        # One download for the device-resident outputs instead of one each.
+        if (
+            backend.active
+            and hasattr(out_video, "__cuda_array_interface__")
+            and hasattr(out_video05, "__cuda_array_interface__")
+        ):
+            stacked = backend.xp.asnumpy(
+                backend.xp.stack([out_video, out_video05])
+            )
+            out_video, out_video05 = stacked[0], stacked[1]
+        else:
+            out_video = to_numpy_if_needed(out_video, backend)
+            out_video05 = to_numpy_if_needed(out_video05, backend)
+
         # demod_burst is a bit misleading, but keeping the naming for compatability.
         video_out = np.rec.array(
-            [
-                to_numpy_if_needed(out_video, backend),
-                to_numpy_if_needed(out_video05, backend),
-                out_chroma,
-                env,
-            ],
+            [out_video, out_video05, out_chroma, env],
             names=["demod", "demod_05", "demod_burst", "envelope"],
         )
 

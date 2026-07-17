@@ -72,9 +72,16 @@ def _run_threaded(decoder, wave, threads: int, repeats: int) -> float:
     done = []
 
     def worker():
+        # Per-thread warmup: cupy caches FFT plans per thread, so each worker
+        # must build its own before the timed window.
+        for _ in range(2):
+            with decoder.gpu_backend.stream():
+                decoder.demodblock(data=wave)
         barrier.wait()
         for _ in range(repeats):
-            decoder.demodblock(data=wave)
+            # Same per-thread stream scoping as DemodCacheTape.worker.
+            with decoder.gpu_backend.stream():
+                decoder.demodblock(data=wave)
         done.append(True)
 
     pool = [threading.Thread(target=worker) for _ in range(threads)]

@@ -230,6 +230,44 @@ class TestVideo05Xp:
         assert float(np.max(np.abs(cp.asnumpy(gpu_out) - cpu_out))) <= 5.0
 
 
+class TestPerThreadStreams:
+    def test_cpu_backend_stream_is_noop(self):
+        ctx = create_backend(use_gpu=False)
+        with ctx.stream():
+            pass
+
+    @pytest.mark.skipif(not _cuda_device_available(), reason="no CUDA device")
+    def test_concurrent_gpu_demod_matches_single_thread(self):
+        import threading
+
+        gpu = _make_decoder(use_gpu=True)
+        if not gpu.gpu_backend.active:
+            pytest.skip(f"GPU backend inactive: {gpu.gpu_backend.reason}")
+        wave = _make_wave(gpu)
+
+        with gpu.gpu_backend.stream():
+            ref = gpu.demodblock(data=wave)["video"]["demod"].copy()
+
+        failures = []
+
+        def worker():
+            try:
+                for _ in range(3):
+                    with gpu.gpu_backend.stream():
+                        out = gpu.demodblock(data=wave)["video"]["demod"]
+                    if not np.array_equal(out, ref):
+                        failures.append(float(np.max(np.abs(out - ref))))
+            except Exception as exc:  # pragma: no cover
+                failures.append(repr(exc))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not failures, failures[:5]
+
+
 class TestSpikeRepairEquivalence:
     """The GPU decode path must repair diff-demod spikes index-for-index
     like the numba replace_spikes it round-trips through."""
