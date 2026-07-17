@@ -26,44 +26,71 @@ def chroma_to_u16(chroma):
         
     return out
 
+@njit(cache=False, nogil=True, fastmath=True)
+def chroma_automatic_gain(chroma, burst_abs_ref, phase_sequence, burst_detected_line, smoothing_window=8, k=2.0):
+    burst_count = len(phase_sequence)
+    raw_gains = np.zeros(burst_count, dtype=np.float64)
 
-@njit(cache=True, nogil=True)
-def acc(chroma, burst_abs_ref, burststart, burstend, linelength, lines, burst_detected_line):
-    """Scale chroma according to the level of the color burst on each line."""
-    STARTING_LINE = int(16)
-    assert lines > STARTING_LINE
+    # extract gain values
+    valid_gains_list = []
+    for i in range(burst_count):
+        current_burst = phase_sequence[i]
+        curr_amp = current_burst.amplitude if current_burst.amplitude != 0 else 1e-8
+        raw_gains[i] = burst_abs_ref / curr_amp
+        
+        if current_burst.line_number >= burst_detected_line:
+            valid_gains_list.append(raw_gains[i])
 
-    output = np.zeros(chroma.size, dtype=np.double)
-    mean_burst_accumulator = 0
-    for linenumber in range(16, lines):
-        linestart = linelength * linenumber
-        lineend = linestart + linelength
+    # calculate MAD
+    if len(valid_gains_list) > 0:
+        valid_gains = np.array(valid_gains_list)
+        median_gain = np.median(valid_gains)
+        mad_gain = np.median(np.abs(valid_gains - median_gain))
+        max_allowable_gain = median_gain + (k * mad_gain)
+    else:
+        max_allowable_gain = 1.0
 
-        if linenumber < burst_detected_line:
-            # color killer active for this line
-            output[linestart:lineend] = 0
+    # calculate smoothing
+    smoothed_gains = np.zeros(burst_count, dtype=np.float64)
+    half_w = smoothing_window // 2
+    for i in range(burst_count):
+        # Apply moving average directly to the clamped values
+        start = max(0, i - half_w)
+        end = min(burst_count, i + half_w + 1)
+        
+        window_sum = 0.0
+        for w in range(start, end):
+            window_sum += min(raw_gains[w], max_allowable_gain)
+        smoothed_gains[i] = window_sum / (end - start)
+
+    # apply gain
+    for i in range(burst_count):
+        current_burst = phase_sequence[i]
+        current_burst_start = current_burst.start
+        next_burst_start = phase_sequence[i + 1].start if i < burst_count - 1 else len(chroma)
+
+        if current_burst.line_number < burst_detected_line:
+            chroma[current_burst_start:next_burst_start] = 0
         else:
-            line = chroma[linestart:lineend]
-            acced, rms = acc_line(line, burst_abs_ref, burststart, burstend)
-            output[linestart:lineend] = acced
-            mean_burst_accumulator += rms
+            gain_start = smoothed_gains[i]
+            gain_end = smoothed_gains[i + 1] if i < burst_count - 1 else smoothed_gains[i]
+            gain_increment = (gain_end - gain_start) / (next_burst_start - current_burst_start)
+            gain = gain_start
 
-    return output, mean_burst_accumulator / (lines - STARTING_LINE)
+            for j in range(current_burst_start, next_burst_start):
+                chroma[j] = chroma[j] * gain
+                gain += gain_increment
 
+    # calculate RMS
+    if len(valid_gains_list) > 0:
+        sq_sum = 0.0
+        for g in valid_gains_list:
+            # Reconstruct original amplitude from valid gains to calculate signal RMS
+            amp = burst_abs_ref / g
+            sq_sum += amp * amp
+        return np.sqrt(sq_sum / len(valid_gains_list))
 
-@njit(cache=True, nogil=True)
-def acc_line(chroma, burst_abs_ref, burststart, burstend):
-    """Scale chroma according to the level of the color burst the line."""
-    output = np.zeros(chroma.size, dtype=np.double)
-
-    line = chroma
-    burst_abs_mean = lddu.rms(line[burststart:burstend])
-    # np.sqrt(np.mean(np.square(line[burststart:burstend])))
-    #    burst_abs_mean = np.mean(np.abs(line[burststart:burstend]))
-    scale = burst_abs_ref / burst_abs_mean if burst_abs_mean != 0 else 1
-    output = line * scale
-
-    return output, burst_abs_mean
+    return 0.0
 
 
 @njit(cache=True, nogil=True)
@@ -118,6 +145,7 @@ def comb_c_ntsc(data, line_len):
     'end': numba.int32,
     'phase_deg': numba.float64,
     'phase_offset_deg': numba.float64,
+    'amplitude': numba.float64,
     'magnitude': numba.float64,
     'frequency': numba.float64,
     'dc': numba.float64,
@@ -128,9 +156,10 @@ def comb_c_ntsc(data, line_len):
 class BurstInfo:
     line_number: int
     start: int
-    center: float
     end: int
+    center: int
     phase_deg: float
+    amplitude: float
     magnitude: float
     frequency: float
     dc: float
@@ -142,9 +171,10 @@ class BurstInfo:
         self,
         line_number,
         burst_start,
-        burst_center,
         burst_end,
+        burst_center,
         burst_phase_deg,
+        burst_amplitude,
         burst_magnitude,
         burst_dc,
         burst_frequency,
@@ -153,12 +183,13 @@ class BurstInfo:
     ):
         self.line_number = line_number
         self.start = burst_start
-        self.center = burst_center
         self.end = burst_end
+        self.center = burst_center
         self.phase_deg = burst_phase_deg
+        self.amplitude = burst_amplitude
         self.magnitude = burst_magnitude
-        self.frequency = burst_frequency
         self.dc = burst_dc
+        self.frequency = burst_frequency
         self.I = I
         self.Q = Q
         self.phase_rotation = -1 # this is set later
@@ -219,14 +250,20 @@ def _tune_burst_measurements(
     burst, burst_start, amp_guess, phi_guess, dc_guess, fsc, f_weight=1e4, max_iter=32, max_precision=1e-10
 ):
     """
-    Gauss-Newton tuner.
-    Optimizes: A * cos(2 * pi * f * t - phi) + dc
+    Gauss-Newton optimization for tuning color burst measurements.
 
-    Parameters:
-    -----------
-    f_weight : float
-        Regularization strength pulling f toward fsc.
-        Larger values restrict f variation to minor fractions of a Hz.
+    Fits an NTSC/PAL analytical subcarrier model to digitized video samples:
+        Model(t) = A * cos(2 * pi * f * t - phi) + dc
+
+    Utilizes an iterative least-squares (Gauss-Newton) algorithm to extract 
+    four critical parameters from the color burst window:
+        1. Amplitude (A)       -> Subcarrier strength / chroma saturation
+        2. Phase (phi)         -> Subcarrier phase / chroma hue
+        3. DC Offset (dc)      -> Local luma/black level offset
+        4. Frequency (f)       -> Local subcarrier frequency drift
+
+    Includes a Bayesian frequency prior (f_weight) acting as a regularizer 
+    to prevent the frequency parameter from diverging on noisy lines.
     """
     A = amp_guess
     phi = phi_guess
@@ -381,7 +418,7 @@ def _demod_burst(
     burst_phase_deg = math.degrees(fit_phi) % 360.0
     burst_magnitude = burst_amplitude * (burst_len / 2.0)
 
-    return burst_center, burst_phase_deg, burst_magnitude, burst_dc, burst_frequency, I, Q
+    return burst_center, burst_phase_deg, burst_amplitude, burst_magnitude, burst_dc, burst_frequency, I, Q
 
 def _get_upconverted_burst(
     chroma,
@@ -411,13 +448,15 @@ def _get_upconverted_burst(
     filtered = filtered_padded[burst_filter_padding:-burst_filter_padding]
 
     burst_len = len(filtered)
-
-    burst_center, burst_phase_deg, burst_magnitude, burst_dc, burst_frequency, I, Q = _demod_burst(
+    burst_results = _demod_burst(
         filtered, burst_start + burst_filter_padding, burst_len, burst_sin, burst_cos, fsc
     )
 
     return BurstInfo(
-        line_number, burst_start, burst_center, burst_end, burst_phase_deg, burst_magnitude, burst_dc, burst_frequency, I, Q
+        line_number,
+        burst_start,
+        burst_end,
+        *burst_results
     )
 
 def _get_phase_sequence(
@@ -1216,13 +1255,10 @@ def process_chroma(
             uphet = comb_c_pal(uphet, outwidth)
 
     # Final automatic chroma gain.
-    uphet, mean_rms = acc(
+    mean_rms = chroma_automatic_gain(
         uphet,
         field.rf.SysParams["burst_abs_ref"],
-        burstarea[0],
-        burstarea[1],
-        outwidth,
-        linesout,
+        field.phase_sequence,
         field.burst_detected_line
     )
 

@@ -243,7 +243,7 @@ def get_sysparams_ntsc_umatic(sysparams_ntsc):
 
     SysParams_NTSC_UMATIC["ire0"] = 4257143
     SysParams_NTSC_UMATIC["hz_ire"] = 1600000 / 140.0
-    SysParams_NTSC_UMATIC["burst_abs_ref"] = 2500
+    SysParams_NTSC_UMATIC["burst_abs_ref"] = 3650
 
     return SysParams_NTSC_UMATIC
 
