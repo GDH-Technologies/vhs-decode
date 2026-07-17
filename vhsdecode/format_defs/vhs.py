@@ -344,7 +344,8 @@ def get_sysparams_ntsc_vhs(sysparams_ntsc: dict, tape_speed: int = 0) -> dict:
 
     # TODO: LP value is doubled as a workaround for burst emp not being used in LP mode
     # this should be fixed properly by disabling burst deemp in LP mode
-    SysParams_NTSC_VHS["burst_abs_ref"] = [4416, 4416 / 2, 4416][tape_speed]
+    burst_abs_ref = 5730
+    SysParams_NTSC_VHS["burst_abs_ref"] = [burst_abs_ref, burst_abs_ref / 2, burst_abs_ref][tape_speed]
 
     return SysParams_NTSC_VHS
 

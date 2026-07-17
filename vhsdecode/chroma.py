@@ -11,54 +11,86 @@ from numba import njit
 from numba.experimental import jitclass
 
 
-@njit(cache=True, nogil=True)
+@njit(cache=True, nogil=True, fastmath=True)
 def chroma_to_u16(chroma):
-    """Scale the chroma output array to a 16-bit value for output."""
-    S16_ABS_MAX = 32767
+    """
+    Scale the chroma output array to a 16-bit value for output.
+    """
+    S16_ABS_MAX = 32767.0
+    N = len(chroma)
 
-    # Disabled for now as it's misleading.
-    # if np.max(chroma) > S16_ABS_MAX:
-    #     ldd.logger.warning("Chroma signal clipping.")
-    return (chroma + S16_ABS_MAX).astype(np.uint16)
+    out = np.empty(N, dtype=np.uint16)
 
+    for i in range(N):
+        out[i] = np.uint16(chroma[i] + S16_ABS_MAX)
+        
+    return out
 
-@njit(cache=True, nogil=True)
-def acc(chroma, burst_abs_ref, burststart, burstend, linelength, lines, burst_detected_line):
-    """Scale chroma according to the level of the color burst on each line."""
-    STARTING_LINE = int(16)
-    assert lines > STARTING_LINE
+@njit(cache=False, nogil=True, fastmath=True)
+def chroma_automatic_gain(chroma, burst_abs_ref, phase_sequence, burst_detected_line, smoothing_window=8, k=2.0):
+    burst_count = len(phase_sequence)
+    raw_gains = np.zeros(burst_count, dtype=np.float64)
 
-    output = np.zeros(chroma.size, dtype=np.double)
-    mean_burst_accumulator = 0
-    for linenumber in range(16, lines):
-        linestart = linelength * linenumber
-        lineend = linestart + linelength
+    # extract gain values
+    valid_gains_list = []
+    for i in range(burst_count):
+        current_burst = phase_sequence[i]
+        curr_amp = current_burst.amplitude if current_burst.amplitude != 0 else 1e-8
+        raw_gains[i] = burst_abs_ref / curr_amp
+        
+        if current_burst.line_number >= burst_detected_line:
+            valid_gains_list.append(raw_gains[i])
 
-        if linenumber < burst_detected_line:
-            # color killer active for this line
-            output[linestart:lineend] = 0
+    # calculate MAD
+    if len(valid_gains_list) > 0:
+        valid_gains = np.array(valid_gains_list)
+        median_gain = np.median(valid_gains)
+        mad_gain = np.median(np.abs(valid_gains - median_gain))
+        max_allowable_gain = median_gain + (k * mad_gain)
+    else:
+        max_allowable_gain = 1.0
+
+    # calculate smoothing
+    smoothed_gains = np.zeros(burst_count, dtype=np.float64)
+    half_w = smoothing_window // 2
+    for i in range(burst_count):
+        # Apply moving average directly to the clamped values
+        start = max(0, i - half_w)
+        end = min(burst_count, i + half_w + 1)
+        
+        window_sum = 0.0
+        for w in range(start, end):
+            window_sum += min(raw_gains[w], max_allowable_gain)
+        smoothed_gains[i] = window_sum / (end - start)
+
+    # apply gain
+    for i in range(burst_count):
+        current_burst = phase_sequence[i]
+        current_burst_start = current_burst.start
+        next_burst_start = phase_sequence[i + 1].start if i < burst_count - 1 else len(chroma)
+
+        if current_burst.line_number < burst_detected_line:
+            chroma[current_burst_start:next_burst_start] = 0
         else:
-            line = chroma[linestart:lineend]
-            acced, rms = acc_line(line, burst_abs_ref, burststart, burstend)
-            output[linestart:lineend] = acced
-            mean_burst_accumulator += rms
+            gain_start = smoothed_gains[i]
+            gain_end = smoothed_gains[i + 1] if i < burst_count - 1 else smoothed_gains[i]
+            gain_increment = (gain_end - gain_start) / (next_burst_start - current_burst_start)
+            gain = gain_start
 
-    return output, mean_burst_accumulator / (lines - STARTING_LINE)
+            for j in range(current_burst_start, next_burst_start):
+                chroma[j] = chroma[j] * gain
+                gain += gain_increment
 
+    # calculate RMS
+    if len(valid_gains_list) > 0:
+        sq_sum = 0.0
+        for g in valid_gains_list:
+            # Reconstruct original amplitude from valid gains to calculate signal RMS
+            amp = burst_abs_ref / g
+            sq_sum += amp * amp
+        return np.sqrt(sq_sum / len(valid_gains_list))
 
-@njit(cache=True, nogil=True)
-def acc_line(chroma, burst_abs_ref, burststart, burstend):
-    """Scale chroma according to the level of the color burst the line."""
-    output = np.zeros(chroma.size, dtype=np.double)
-
-    line = chroma
-    burst_abs_mean = lddu.rms(line[burststart:burstend])
-    # np.sqrt(np.mean(np.square(line[burststart:burstend])))
-    #    burst_abs_mean = np.mean(np.abs(line[burststart:burstend]))
-    scale = burst_abs_ref / burst_abs_mean if burst_abs_mean != 0 else 1
-    output = line * scale
-
-    return output, burst_abs_mean
+    return 0.0
 
 
 @njit(cache=True, nogil=True)
@@ -113,7 +145,9 @@ def comb_c_ntsc(data, line_len):
     'end': numba.int32,
     'phase_deg': numba.float64,
     'phase_offset_deg': numba.float64,
+    'amplitude': numba.float64,
     'magnitude': numba.float64,
+    'frequency': numba.float64,
     'dc': numba.float64,
     'I': numba.float64,
     'Q': numba.float64,
@@ -122,10 +156,12 @@ def comb_c_ntsc(data, line_len):
 class BurstInfo:
     line_number: int
     start: int
-    center: float
     end: int
+    center: int
     phase_deg: float
+    amplitude: float
     magnitude: float
+    frequency: float
     dc: float
     I: float
     Q: float
@@ -135,114 +171,213 @@ class BurstInfo:
         self,
         line_number,
         burst_start,
-        burst_center,
         burst_end,
+        burst_center,
         burst_phase_deg,
+        burst_amplitude,
         burst_magnitude,
         burst_dc,
+        burst_frequency,
         I,
         Q
     ):
         self.line_number = line_number
         self.start = burst_start
-        self.center = burst_center
         self.end = burst_end
+        self.center = burst_center
         self.phase_deg = burst_phase_deg
+        self.amplitude = burst_amplitude
         self.magnitude = burst_magnitude
         self.dc = burst_dc
+        self.frequency = burst_frequency
         self.I = I
         self.Q = Q
         self.phase_rotation = -1 # this is set later
 
 
-@njit(nogil=True, fastmath=True, cache=True)
-def _tune_burst_measurements(burst, t, fsc, amp_guess, phi_guess, dc_guess, max_iter=128, max_precision=1e-10):
+@njit(nogil=True, inline='always')
+def _solve_4x4(A, b):
+    """
+    Inlined 4x4 Gaussian elimination solver with partial pivoting.
+    """
+    M = np.empty((4, 5))
+    for r in range(4):
+        M[r, 0] = A[r, 0]
+        M[r, 1] = A[r, 1]
+        M[r, 2] = A[r, 2]
+        M[r, 3] = A[r, 3]
+        M[r, 4] = b[r]
+        
+    for i in range(4):
+        # Find pivot row
+        max_row = i
+        max_val = abs(M[i, i])
+        for r in range(i + 1, 4):
+            val = abs(M[r, i])
+            if val > max_val:
+                max_val = val
+                max_row = r
+                
+        # Swap rows if necessary
+        if max_row != i:
+            for c in range(i, 5):
+                tmp = M[i, c]
+                M[i, c] = M[max_row, c]
+                M[max_row, c] = tmp
+                
+        if abs(M[i, i]) < 1e-12:
+            return np.zeros(4), False  # Singular matrix protection
+            
+        # Eliminate below
+        for r in range(i + 1, 4):
+            factor = M[r, i] / M[i, i]
+            for c in range(i, 5):
+                M[r, c] -= factor * M[i, c]
+                
+    # Back substitution
+    x = np.empty(4)
+    for i in range(3, -1, -1):
+        sum_ax = 0.0
+        for j in range(i + 1, 4):
+            sum_ax += M[i, j] * x[j]
+        x[i] = (M[i, 4] - sum_ax) / M[i, i]
+        
+    return x, True
+
+
+@njit(nogil=True, fastmath=False, cache=True, inline='always')
+def _tune_burst_measurements(
+    burst, burst_start, amp_guess, phi_guess, dc_guess, fsc, f_weight=1e4, max_iter=32, max_precision=1e-10
+):
     """
     Gauss-Newton optimization for tuning color burst measurements.
-    Optimizes: A * cos(2 * pi * fsc * t - phi) + dc
+
+    Fits an NTSC/PAL analytical subcarrier model to digitized video samples:
+        Model(t) = A * cos(2 * pi * f * t - phi) + dc
+
+    Utilizes an iterative least-squares (Gauss-Newton) algorithm to extract 
+    four critical parameters from the color burst window:
+        1. Amplitude (A)       -> Subcarrier strength / chroma saturation
+        2. Phase (phi)         -> Subcarrier phase / chroma hue
+        3. DC Offset (dc)      -> Local luma/black level offset
+        4. Frequency (f)       -> Local subcarrier frequency drift
+
+    Includes a Bayesian frequency prior (f_weight) acting as a regularizer 
+    to prevent the frequency parameter from diverging on noisy lines.
     """
     A = amp_guess
     phi = phi_guess
     dc = dc_guess
+    f = fsc
+    f_target = fsc
 
-    omega = 2.0 * np.pi * fsc
     N = len(burst)
+    
+    # Precompute time array
+    t = np.empty(N, dtype=np.float64)
+    for k in range(N):
+        t[k] = (k + burst_start) / (4.0 * fsc)
 
-    # Pre-allocate Jacobian array and residual vector
-    J = np.empty((3, N))
+    theta = np.empty(N, dtype=np.float64)
+    cos_theta = np.empty(N, dtype=np.float64)
+    sin_theta = np.empty(N, dtype=np.float64)
+    r = np.empty(N, dtype=np.float64)
+    
+    # Pre-allocate Jacobian components
+    j0 = np.empty(N, dtype=np.float64)
+    j1 = np.empty(N, dtype=np.float64)
+    # Note: j2 is constant 1.0, so we do not need an array for it
+    j3 = np.empty(N, dtype=np.float64)
+
+    # Pre-allocate normal equation containers
+    J_JT = np.empty((4, 4), dtype=np.float64)
+    J_r = np.empty(4, dtype=np.float64)
+
+    minus_two_pi = -2.0 * np.pi
 
     for _ in range(max_iter):
-        # Compute current model values and errors
-        theta = omega * t - phi
+        two_pi_f = 2.0 * np.pi * f
+
+        theta = (two_pi_f * t) - phi
         cos_theta = np.cos(theta)
         sin_theta = np.sin(theta)
         
-        # Residuals: actual minus predicted
+        # Compute residual vector
         r = burst - (A * cos_theta + dc)
         
-        # Build Jacobian rows: d_model/dA, d_model/dphi, d_model/ddc
-        J[0, :] = cos_theta
-        J[1, :] = A * sin_theta
-        J[2, :] = 1.0
+        # Build Jacobian components
+        j0 = cos_theta
+        j1 = A * sin_theta
+        j3 = (minus_two_pi * t) * j1
 
-        # Form normal equations: (J * J^T) * delta = J * r
-        # J_JT shape: (3, 3), J_r shape: (3,)
-        J_JT = np.zeros((3, 3))
-        J_r = np.zeros(3)
+        # np.dot utilizes BLAS-like instruction sets (SSE, AVX, or AVX-512)
+        J_JT[0, 0] = np.dot(j0, j0)
+        J_JT[0, 1] = np.dot(j0, j1)
+        J_JT[0, 2] = np.sum(j0)          # since j2 is 1.0
+        J_JT[0, 3] = np.dot(j0, j3)
         
-        for i in range(3):
-            for j in range(3):
-                for k in range(N):
-                    J_JT[i, j] += J[i, k] * J[j, k]
-            for k in range(N):
-                J_r[i] += J[i, k] * r[k]
+        J_JT[1, 1] = np.dot(j1, j1)
+        J_JT[1, 2] = np.sum(j1)          # since j2 is 1.0
+        J_JT[1, 3] = np.dot(j1, j3)
+        
+        J_JT[2, 2] = float(N)            # np.dot(1.0, 1.0) for N elements
+        J_JT[2, 3] = np.sum(j3)          # since j2 is 1.0
+        
+        J_JT[3, 3] = np.dot(j3, j3)
+        
+        # Compute J_r vector elements using SIMD-accelerated dot products
+        J_r[0] = np.dot(j0, r)
+        J_r[1] = np.dot(j1, r)
+        J_r[2] = np.sum(r)               # since j2 is 1.0
+        J_r[3] = np.dot(j3, r)
 
-        # Regularize to prevent singular matrices (Levenberg-Marquardt style hint)
-        for i in range(3):
-            J_JT[i, i] += 1e-6
+        # Mirror the upper triangle to the lower triangle (Exploit Symmetry)
+        J_JT[1, 0] = J_JT[0, 1]
+        J_JT[2, 0] = J_JT[0, 2]
+        J_JT[2, 1] = J_JT[1, 2]
+        J_JT[3, 0] = J_JT[0, 3]
+        J_JT[3, 1] = J_JT[1, 3]
+        J_JT[3, 2] = J_JT[2, 3]
 
-        # Explicit 3x3 matrix inversion (much faster in Numba than np.linalg.solve)
-        det = (J_JT[0, 0] * (J_JT[1, 1] * J_JT[2, 2] - J_JT[1, 2] * J_JT[2, 1]) -
-               J_JT[0, 1] * (J_JT[1, 0] * J_JT[2, 2] - J_JT[1, 2] * J_JT[2, 0]) +
-               J_JT[0, 2] * (J_JT[1, 0] * J_JT[2, 1] - J_JT[1, 1] * J_JT[2, 0]))
+        # Apply Bayesian frequency centering prior/penalty
+        J_JT[3, 3] += f_weight
+        J_r[3] += f_weight * (f_target - f)
 
-        if abs(det) < 1e-9:
-            break  # Numerical safety boundary
+        # Diagonal regularization
+        J_JT[0, 0] += 1e-6
+        J_JT[1, 1] += 1e-6
+        J_JT[2, 2] += 1e-6
+        J_JT[3, 3] += 1e-6
 
-        inv_det = 1.0 / det
+        # Solve system
+        delta, success = _solve_4x4(J_JT, J_r)
+        if not success:
+            break
 
-        # Calculate update vector delta
-        delta_A = inv_det * (
-            (J_JT[1, 1] * J_JT[2, 2] - J_JT[1, 2] * J_JT[2, 1]) * J_r[0] +
-            (J_JT[0, 2] * J_JT[2, 1] - J_JT[0, 1] * J_JT[2, 2]) * J_r[1] +
-            (J_JT[0, 1] * J_JT[1, 2] - J_JT[0, 2] * J_JT[1, 1]) * J_r[2]
-        )
-        delta_phi = inv_det * (
-            (J_JT[1, 2] * J_JT[2, 0] - J_JT[1, 0] * J_JT[2, 2]) * J_r[0] +
-            (J_JT[0, 0] * J_JT[2, 2] - J_JT[0, 2] * J_JT[2, 0]) * J_r[1] +
-            (J_JT[0, 2] * J_JT[1, 0] - J_JT[0, 0] * J_JT[1, 2]) * J_r[2]
-        )
-        delta_dc = inv_det * (
-            (J_JT[1, 0] * J_JT[2, 1] - J_JT[1, 1] * J_JT[2, 0]) * J_r[0] +
-            (J_JT[0, 1] * J_JT[2, 0] - J_JT[0, 0] * J_JT[2, 1]) * J_r[1] +
-            (J_JT[0, 0] * J_JT[1, 1] - J_JT[0, 1] * J_JT[1, 0]) * J_r[2]
-        )
+        delta_A = delta[0]
+        delta_phi = delta[1]
+        delta_dc = delta[2]
+        delta_f = delta[3]
 
         # Apply updates
         A += delta_A
         phi += delta_phi
         dc += delta_dc
+        f += delta_f
 
         # Break early if updates converge to tiny changes
-        if (abs(delta_A) < max_precision) and (abs(delta_phi) < max_precision) and (abs(delta_dc) < max_precision):
+        if (abs(delta_A) < max_precision) and \
+           (abs(delta_phi) < max_precision) and \
+           (abs(delta_dc) < max_precision) and \
+           (abs(delta_f) < max_precision):
             break
 
     phi = (phi + np.pi) % (2 * np.pi) - np.pi
 
-    return A, phi, dc
+    return A, phi, dc, f
 
 
-@njit(cache=True, nogil=True, fastmath=True)
+@njit(cache=True, nogil=True, fastmath=False)
 def _demod_burst(
     burst,
     burst_start,
@@ -254,40 +389,36 @@ def _demod_burst(
     # get initial burst measurements
     I = 0.0
     Q = 0.0
+    burst_sum = 0.0
 
     for i in range(burst_len):
         burst_sample = burst[i]
+        burst_sum += burst_sample
         carrier_idx = i + burst_start
         I += burst_sample * burst_cos[carrier_idx]
         Q += burst_sample * burst_sin[carrier_idx]
 
 
     # build starting point for refinement
-    phi_guess = (np.arctan2(Q, I) + np.pi) % (2 * np.pi) - np.pi
-    dc_guess = np.mean(burst)
-    amp_guess = (2.0 * np.hypot(I, Q)) / burst_len
+    phi_guess = (math.atan2(Q, I) + math.pi) % (2.0 * math.pi) - math.pi
+    dc_guess = burst_sum / burst_len
+    amp_guess = (2.0 * math.sqrt(I * I + Q * Q)) / burst_len
 
     # refine burst measurements
-    t = (np.arange(burst_len) + burst_start) / (4.0 * fsc)
-    burst_amplitude, fit_phi, burst_dc = _tune_burst_measurements(
-        burst, t, fsc, amp_guess, phi_guess, dc_guess
+    burst_amplitude, fit_phi, burst_dc, burst_frequency = _tune_burst_measurements(
+        burst, burst_start, amp_guess, phi_guess, dc_guess, fsc
     )
 
-    # Convert the absolute fitted phase shift (radians) into a fractional sample offset.
-    # Since model uses (2*pi*fsc*t - phi) and fs = 4*fsc:
-    # Samples = t * fs = t * 4 * fsc.
-    # Therefore, 1 radian = 4 / (2 * pi) = 2 / pi samples.
-    # We add a modulo 4 tracking window to isolate sub-cycle position adjustments.
-    phase_sample_offset = (fit_phi % (2 * np.pi)) * (2.0 / np.pi)
-    
+    # Convert the absolute fitted phase shift (radians) into a fractional sample offset
+    phase_sample_offset = (fit_phi % (2.0 * math.pi)) * (2.0 / math.pi)
+
     # Combine the geometric window midpoint with the phase shift
     burst_center_relative = (burst_len - 1) / 2.0 + phase_sample_offset
-
     burst_center = burst_start + burst_center_relative
-    burst_phase_deg = np.degrees(fit_phi) % 360.0
-    burst_magnitude = burst_amplitude * (burst_len / 2)
+    burst_phase_deg = math.degrees(fit_phi) % 360.0
+    burst_magnitude = burst_amplitude * (burst_len / 2.0)
 
-    return burst_center, burst_phase_deg, burst_magnitude, burst_dc, I, Q
+    return burst_center, burst_phase_deg, burst_amplitude, burst_magnitude, burst_dc, burst_frequency, I, Q
 
 def _get_upconverted_burst(
     chroma,
@@ -317,13 +448,15 @@ def _get_upconverted_burst(
     filtered = filtered_padded[burst_filter_padding:-burst_filter_padding]
 
     burst_len = len(filtered)
-
-    burst_center, burst_phase_deg, burst_magnitude, burst_dc, I, Q = _demod_burst(
+    burst_results = _demod_burst(
         filtered, burst_start + burst_filter_padding, burst_len, burst_sin, burst_cos, fsc
     )
 
     return BurstInfo(
-        line_number, burst_start, burst_center, burst_end, burst_phase_deg, burst_magnitude, burst_dc, I, Q
+        line_number,
+        burst_start,
+        burst_end,
+        *burst_results
     )
 
 def _get_phase_sequence(
@@ -621,7 +754,7 @@ def get_phase_rotation_sequence(
     return chroma_rotation_index, phase_sequence, burst_detected_line, burst_magnitude_avg, burst_phase_avg, even_burst_phase_avg, odd_burst_phase_avg
 
 
-@njit(cache=False, nogil=True, fastmath=True)
+@njit(cache=False, nogil=True, fastmath=False)
 def upconvert_chroma(
     chroma,
     uphet,
@@ -636,10 +769,10 @@ def upconvert_chroma(
 
         heterodyne = chroma_heterodyne[burst.phase_rotation][linestart:lineend]
         c = chroma[linestart:lineend]
-        uphet[linestart:lineend] = c * heterodyne - burst.dc
+        uphet[linestart:lineend] = c * heterodyne
 
 
-@njit(cache=False, nogil=True, fastmath=True)
+@njit(nogil=True, cache=False, fastmath=False)
 def upconvert_chroma_phase_comp(
     chroma,
     uphet,
@@ -654,25 +787,68 @@ def upconvert_chroma_phase_comp(
     deg2rad_scale = np.pi / 180.0
     pi_over_two = np.pi / 2.0
 
-    het_mhz = color_under_carrier_fs / 1e6
-    het_coefficient = pi_over_two * (1.0 + het_mhz / fsc)
+    # Initial nominal reference coefficient
+    het_hz_nominal = color_under_carrier_fs
+    het_coefficient = pi_over_two * (1.0 + het_hz_nominal / fsc)
 
     target_phase_even_rad = target_phase_even * deg2rad_scale
     target_phase_odd_rad = target_phase_odd * deg2rad_scale
+    num_bursts = len(phase_rotation_sequence)
 
-    for burst in phase_rotation_sequence:
-        linestart = (burst.line_number - lineoffset) * outwidth
+    coeff_step_factor = pi_over_two / (fsc * outwidth)
+
+    # Pre-generate a local pixel coordinate array to help Numba vectorize
+    # Computing on a local range [0, outwidth) helps the compiler reason about alignment
+    local_idx = np.arange(outwidth, dtype=np.float64)
+
+    for idx in range(num_bursts):
+        current_burst = phase_rotation_sequence[idx]
+
+        # Solve for current line's active het_hz
+        k_current = current_burst.frequency / fsc
+        het_hz_current = k_current * color_under_carrier_fs
+
+        # Solve for next line's active het_hz
+        if idx < num_bursts - 1:
+            next_burst = phase_rotation_sequence[idx + 1]
+            k_next = next_burst.frequency / fsc
+            het_hz_next = k_next * color_under_carrier_fs
+        else:
+            het_hz_next = het_hz_current
+
+        linestart = (current_burst.line_number - lineoffset) * outwidth
         lineend = linestart + outwidth
-        target_phase_rad = target_phase_odd_rad if burst.line_number % 2 else target_phase_even_rad
 
-        theta = het_coefficient * linestart + (
-            burst.phase_rotation * pi_over_two # heterodyne rotation
-            + target_phase_rad + burst.phase_deg * deg2rad_scale # phase offset relative to line
+        # Determine target phase
+        if current_burst.line_number % 2 != 0:
+            target_phase_rad = target_phase_odd_rad
+        else:
+            target_phase_rad = target_phase_even_rad
+
+        # Initial starting phase
+        theta_0 = het_coefficient * linestart + (
+            current_burst.phase_rotation * pi_over_two
+            + target_phase_rad 
+            + current_burst.phase_deg * deg2rad_scale
         )
 
-        for i in range(linestart, lineend):
-            uphet[i] = chroma[i] * -math.cos(theta) - burst.dc
-            theta += het_coefficient
+        # Coefficient step parameters
+        alpha = pi_over_two * (1.0 + het_hz_current / fsc)
+        delta_coeff = (het_hz_next - het_hz_current) * coeff_step_factor
+        beta = 0.5 * delta_coeff
+        dc_val = current_burst.dc
+
+        # Slice target and source arrays to provide direct contiguous memory views
+        chroma_slice = chroma[linestart:lineend]
+        uphet_slice = uphet[linestart:lineend]
+
+        # No outer dependencies so LLVM can vectorize
+        for k in range(outwidth):
+            # Compute closed-form phase directly (no dependency on previous k)
+            theta_k = theta_0 + alpha * local_idx[k] + beta * (local_idx[k] * local_idx[k])
+            
+            # Vectorized trigonometric and arithmetic execution
+            uphet_slice[k] = chroma_slice[k] * -np.cos(theta_k) - dc_val
 
 
 @njit(cache=True, nogil=True)
@@ -681,12 +857,12 @@ def burst_deemphasis(chroma, lineoffset, linesout, outwidth, burstarea):
         linestart = (line - lineoffset) * outwidth
         lineend = linestart + outwidth
 
-        chroma[linestart + burstarea[1] + 5 : lineend] *= 2
+        chroma[linestart + burstarea[1] + 4 : lineend] *= 2
 
     return chroma
 
 
-@njit(cache=True, nogil=True, fastmath=True)
+@njit(cache=True, nogil=True, fastmath=False)
 def shift_chroma_and_remove_dc(out_chroma, move):
     n = len(out_chroma)
     move %= n
@@ -1015,7 +1191,7 @@ def process_chroma(
             outwidth,
             field.phase_sequence,
             field.rf.chroma_afc.color_under,
-            field.rf.chroma_afc.fsc_mhz,
+            field.rf.chroma_afc.fsc_mhz * 1e6,
             target_phase_even,
             target_phase_odd
         )
@@ -1079,13 +1255,10 @@ def process_chroma(
             uphet = comb_c_pal(uphet, outwidth)
 
     # Final automatic chroma gain.
-    uphet, mean_rms = acc(
+    mean_rms = chroma_automatic_gain(
         uphet,
         field.rf.SysParams["burst_abs_ref"],
-        burstarea[0],
-        burstarea[1],
-        outwidth,
-        linesout,
+        field.phase_sequence,
         field.burst_detected_line
     )
 
