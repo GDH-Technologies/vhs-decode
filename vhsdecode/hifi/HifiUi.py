@@ -259,7 +259,7 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
     decode_options = {
         "input_rate": float(values.input_sample_rate) * 1e6,
         "standard": "p" if values.standard == "PAL" else "n",
-        "format": "vhs" if values.format == "VHS" else "8mm",
+        "format": "vhs" if values.format in ("VHS", "Betamax", "Betacam") else "8mm",
         "demod_type": values.demod_type.lower(),
         "auto_fine_tune": values.automatic_fine_tuning,
         "bias_guess": values.bias_guess,
@@ -633,7 +633,16 @@ class HifiUi(QMainWindow):
         format_layout = QHBoxLayout()
         format_label = QLabel("Format")
         self.format_combo = QComboBox(self)
-        self.format_combo.addItems(["VHS", "Video8/Hi8"])
+        self.format_combo.addItems(["VHS", "Video8/Hi8", "Betamax", "Betacam"])
+        self.format_combo.setToolTip(
+            "Tape format.\n"
+            "VHS / SVHS: VHS HiFi AFM stereo profile.\n"
+            "Video8/Hi8: 8mm AFM audio profile.\n"
+            "Betamax: placeholder - uses the VHS decode profile until a "
+            "dedicated Betamax profile is available.\n"
+            "Betacam: placeholder - uses the VHS decode profile until a "
+            "dedicated Betacam profile is available."
+        )
         format_layout.addWidget(format_label)
         format_layout.addWidget(self.format_combo)
         self.format_combo.currentIndexChanged.connect(self.on_format_change)
@@ -1189,7 +1198,7 @@ class HifiUi(QMainWindow):
         afe_right_carrier=0,
     ):
         standard, _ = get_standard(
-            "vhs" if format == "VHS" else "8mm",
+            "vhs" if format in ("VHS", "Betamax", "Betacam") else "8mm",
             "p" if standard == "PAL" else "n",
             afe_vco_deviation,
             afe_left_carrier,
@@ -1200,7 +1209,7 @@ class HifiUi(QMainWindow):
         self.afe_right_carrier_spinbox.setValue(int(standard.RCarrierRef))
 
     def update_deemphasis_expander_values(self, format):
-        if format == "VHS":
+        if format in ("VHS", "Betamax", "Betacam"):
             self.deemphasis_low_tau_dial_control.setValue(DEFAULT_VHS_DEEMPHASIS_TAU_1)
             self.deemphasis_high_tau_dial_control.setValue(DEFAULT_VHS_DEEMPHASIS_TAU_2)
             self.nr_deemphasis_low_tau_dial_control.setValue(DEFAULT_VHS_NR_DEEMPHASIS_TAU_1)
@@ -1238,11 +1247,31 @@ class HifiUi(QMainWindow):
         )
 
     def on_format_change(self):
+        current_format = self.format_combo.currentText()
         self.update_afe_values(
-            format=self.format_combo.currentText(),
+            format=current_format,
             standard=self.standard_combo.currentText(),
         )
-        self.update_deemphasis_expander_values(self.format_combo.currentText())
+        self.update_deemphasis_expander_values(current_format)
+        self._warn_if_placeholder_format(current_format)
+
+    PLACEHOLDER_FORMATS = ("Betamax", "Betacam")
+
+    def _warn_if_placeholder_format(self, current_format: str) -> None:
+        if current_format in self.PLACEHOLDER_FORMATS:
+            print(
+                f"{current_format}: using the VHS decode profile as a placeholder "
+                "until a dedicated profile is available."
+            )
+            QMessageBox.warning(
+                self,
+                "Placeholder format",
+                f"{current_format}: Place Holder - Format yet to be implemented.\n\n"
+                "Decoding will use the VHS profile as a stand-in.",
+            )
+
+    def _is_placeholder_format_selected(self) -> bool:
+        return self.format_combo.currentText() in self.PLACEHOLDER_FORMATS
 
     def change_button_color(self, button, color):
         button.setStyleSheet(
@@ -1301,6 +1330,8 @@ class HifiUi(QMainWindow):
 
     def on_play_clicked(self):
         print("[PLAY] Play command issued.")
+        if self._is_placeholder_format_selected():
+            self._warn_if_placeholder_format(self.format_combo.currentText())
         if self.confirm_overwrite():
             return
 
@@ -1313,6 +1344,8 @@ class HifiUi(QMainWindow):
 
     def on_preview_clicked(self):
         print("[PREVIEW] Preview command issued.")
+        if self._is_placeholder_format_selected():
+            self._warn_if_placeholder_format(self.format_combo.currentText())
         if self.confirm_overwrite():
             return
 
@@ -1716,11 +1749,44 @@ class FileIODialogUI(HifiUi):
         self.set_input_sample_rate_mhz(mhz)
         print(f"Input sample rate auto set to {mhz:g} MHz from the FLAC header")
 
+    def auto_detect_format_system_from_filename(self, input_path: str):
+        """Auto-set Format and Standard from keywords in the input filename.
+
+        Recognizes VHS/SVHS, Video8/Hi8, Betamax, Betacam, NTSC and PAL. Only
+        updates a control when a matching keyword is found; the existing
+        selection is left untouched otherwise.
+        """
+        if not input_path:
+            return
+        name_lower = os.path.basename(input_path).lower()
+
+        # Check rarer/more-specific formats first so SVHS/VHS don't shadow them.
+        if "betamax" in name_lower:
+            self.format_combo.setCurrentText("Betamax")
+        elif "betacam" in name_lower:
+            self.format_combo.setCurrentText("Betacam")
+        elif "video8" in name_lower or "hi8" in name_lower or "hi-8" in name_lower:
+            self.format_combo.setCurrentText("Video8/Hi8")
+        elif (
+            "svhs" in name_lower
+            or "s-vhs" in name_lower
+            or "supervhs" in name_lower
+            or "super-vhs" in name_lower
+            or "vhs" in name_lower
+        ):
+            self.format_combo.setCurrentText("VHS")
+
+        if "ntsc" in name_lower:
+            self.standard_combo.setCurrentText("NTSC")
+        elif "pal" in name_lower:
+            self.standard_combo.setCurrentText("PAL")
+
     def set_input_file(self, file_name: str):
         self.file_input_textbox.setText(file_name)
         self._last_input_path = file_name
         self.auto_populate_output_file(file_name)
         self.auto_set_input_frequency(file_name)
+        self.auto_detect_format_system_from_filename(file_name)
 
     def on_input_editing_finished(self):
         # auto fill the output when the user typed/pasted a new input path
@@ -1729,6 +1795,7 @@ class FileIODialogUI(HifiUi):
             self._last_input_path = text
             self.auto_populate_output_file(text)
             self.auto_set_input_frequency(text)
+            self.auto_detect_format_system_from_filename(text)
 
     def dragEnterEvent(self, event):
         mime_data = event.mimeData()
@@ -1790,6 +1857,10 @@ class FileIODialogUI(HifiUi):
         # an input was provided without an output: derive the output name
         if values.input_file and not values.output_file:
             self.auto_populate_output_file(values.input_file)
+        # auto-detect format/standard from the filename when pre-populated
+        # (e.g. when launched from the decode-launcher with an input file).
+        if values.input_file:
+            self.auto_detect_format_system_from_filename(values.input_file)
 
     def on_decode_finished(self, decoded_filename: str = "input stream"):
         decoded_filename = os.path.basename(self.file_input_textbox.text())
