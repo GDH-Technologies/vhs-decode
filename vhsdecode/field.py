@@ -1075,6 +1075,20 @@ class FieldShared:
 
                         ldd.logger.debug("calculated hz_ire: %.02f", hz_ire)
 
+                        # Guard: on a degenerate field (dropout / sync loss) the
+                        # backporch and hsync measurement windows can read the same
+                        # level, so hz_ire becomes 0 (or non-finite) and
+                        # hz_to_output_array divides out_scale by it -> ZeroDivisionError
+                        # aborts the whole decode. Fall back to the global hz_ire.
+                        if not np.isfinite(hz_ire) or hz_ire == 0:
+                            ldd.logger.warning(
+                                "ire0_adjust(hsync): degenerate hz_ire "
+                                "(ire0=%.2f, hsync_level=%.2f) -> using global hz_ire",
+                                ire0,
+                                hsync_level,
+                            )
+                            hz_ire = self.rf.DecoderParams["hz_ire"]
+
                 if self.rf.track_phase is not None:
                     ire0 += self.rf.DecoderParams["track_ire0_offset"][
                         self.rf.track_phase ^ (self.field_number % 2)
