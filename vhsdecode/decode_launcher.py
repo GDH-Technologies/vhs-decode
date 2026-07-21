@@ -145,6 +145,60 @@ TAPE_FORMATS_BY_TOOL = {
 # Supported tape speeds
 TAPE_SPEEDS = ["SP", "LP", "EP", "SLP", "VP"]
 
+# Filename keyword -> tape format CLI value. Order matters: more specific /
+# rarer formats are checked first so "vhs" doesn't shadow "svhs" etc.
+# Each entry is (list_of_keywords, tape_format_cli_value, tool_subcommand).
+# tool_subcommand is None when the format is valid for the currently selected
+# decoder and should not force a tool switch.
+FILENAME_TAPE_FORMAT_HINTS: list[tuple[tuple[str, ...], str, Optional[str]]] = [
+    (("svhs_et", "svhs-et", "s-vhs_et", "s-vhs-et"), "SVHS_ET", None),
+    (("svhs", "s-vhs", "supervhs", "super-vhs"), "SVHS", None),
+    (("vhshq", "vhs-hq", "vhs_hq"), "VHSHQ", None),
+    (("vhs",), "VHS", None),
+    (("umatic_hi", "umatic-hi", "umatic hi"), "UMATIC_HI", None),
+    (("umatic", "u-matic"), "UMATIC", None),
+    (("betamax_hifi", "betamax-hifi", "betamax hifi", "βetamax hifi"), "BETAMAX_HIFI", "hifi"),
+    (("superbeta", "super-beta"), "SUPERBETA", None),
+    (("betamax", "beta-max", "βetamax"), "BETAMAX", None),
+    (("video8", "video-8"), "VIDEO8", None),
+    (("hi8", "hi-8"), "HI8", None),
+    (("eiaj",), "EIAJ", None),
+    (("quaduplex", "quadruplex", "quad",), "QUADRUPLEX", None),
+    (("vcr_lp", "vcr-lp", "vcr lp", "philips vcr_lp"), "VCR_LP", None),
+    (("vcr", "philips vcr"), "VCR", None),
+    (("smpte-c", "smpte c", "typec", "type-c"), "TYPEC", None),
+    (("smpte-b", "smpte b", "typeb", "type-b"), "TYPEB", None),
+    (("video2000", "video-2000"), "VIDEO2000", None),
+    (("betacam", "beta-cam"), None, "hifi"),  # placeholder - hifi GUI handles it
+]
+
+# Filename keyword -> TV system combo label.
+FILENAME_SYSTEM_HINTS: list[tuple[tuple[str, ...], str]] = [
+    (("ntscj", "ntsc-j", "ntsc_j"), "NTSCJ"),
+    (("ntsc",), "NTSC"),
+    (("pal_m", "pal-m", "palm"), "PAL_M"),
+    (("mesecam",), "MESECAM"),
+    (("pal",), "PAL"),
+]
+
+# Filename keyword -> tape speed combo label.
+FILENAME_TAPE_SPEED_HINTS: list[tuple[tuple[str, ...], str]] = [
+    (("slp",), "SLP"),
+    (("ep",), "EP"),
+    (("lp",), "LP"),
+    (("vp",), "VP"),
+    (("sp",), "SP"),
+]
+
+# Filename keyword -> hifi GUI format combo label (used when launching hifi).
+# Mirrors vhsdecode.hifi.HifiUi auto-detect so launcher and hifi GUI agree.
+FILENAME_HIFI_FORMAT_HINTS: list[tuple[tuple[str, ...], str]] = [
+    (("betamax",), "Betamax"),
+    (("betacam",), "Betacam"),
+    (("video8", "hi8", "hi-8"), "Video8/Hi8"),
+    (("svhs", "s-vhs", "supervhs", "super-vhs", "vhs"), "VHS"),
+]
+
 TOOL_ENTRYPOINTS = {
     "hifi": "hifi-decode",
     "filter-tune": "filter-tune",
@@ -152,6 +206,12 @@ TOOL_ENTRYPOINTS = {
     "cvbs": "cvbs-decode",
     "ld": "ld-decode",
 }
+
+# Mirrors vhsdecode.hifi.HifiUi.FileIODialogUI.OUTPUT_FILE_SUFFIX so the
+# launcher can derive the same default output name the hifi GUI does without
+# importing the Qt-based UI module here.
+HIFI_OUTPUT_SUFFIX = "_HiFi_Decoded.flac"
+HIFI_AUDIO_OUTPUT_EXTENSIONS = {".flac", ".wav"}
 
 
 def _load_app_icon() -> QIcon:
@@ -363,7 +423,29 @@ def _build_basic_decoder_args(
     threads: int,
 ) -> list[str]:
     if tool.subcommand == "hifi":
-        return ["-t", str(threads)]
+        args: list[str] = []
+        input_path = input_path.strip()
+        output_path = output_path.strip()
+        if input_path:
+            args.append(input_path)
+            if output_path:
+                # The launcher's Output base field is an extension-less base
+                # name for the terminal decoders. The hifi GUI expects a full
+                # output filename; derive the same suffixed name it would when
+                # the user loads the input directly, unless the user already
+                # typed an audio extension (.flac/.wav).
+                out_ext = Path(output_path).suffix.lower()
+                if out_ext not in HIFI_AUDIO_OUTPUT_EXTENSIONS:
+                    output_path = f"{output_path}{HIFI_OUTPUT_SUFFIX}"
+                args.append(output_path)
+        if frequency.strip():
+            args += ["-f", frequency.strip()]
+        args += ["-t", str(threads)]
+        if system == "PAL":
+            args += ["--pal"]
+        elif system == "NTSC":
+            args += ["--ntsc"]
+        return args
     if tool.subcommand not in DECODER_SUBCOMMANDS:
         return []
 
@@ -734,9 +816,10 @@ class DecodeLauncherWindow(QWidget):
             window.move(0, 0)
         self._track_hosted_launch(window, window)
 
-    def _launch_hifi_in_process(self, extra: str, threads: int) -> None:
-        extra_args = _split_user_args(extra) if extra else []
-        extra_args = ["-t", str(threads)] + extra_args
+    def _launch_hifi_in_process(self, basic_args: list[str], extra: str) -> None:
+        extra_args = list(basic_args)
+        if extra:
+            extra_args += _split_user_args(extra)
 
         from vhsdecode.hifi.main import launch_hosted_ui
 
@@ -748,13 +831,13 @@ class DecodeLauncherWindow(QWidget):
         self._track_hosted_launch(controller, controller.window)
 
     def _launch_native_gui_in_process(
-        self, tool: ToolSpec, extra: str, threads: int
+        self, tool: ToolSpec, basic_args: list[str], extra: str
     ) -> bool:
         if tool.subcommand == "filter-tune":
             self._launch_filter_tune_in_process(extra)
             return True
         if tool.subcommand == "hifi":
-            self._launch_hifi_in_process(extra, threads)
+            self._launch_hifi_in_process(basic_args, extra)
             return True
         return False
 
@@ -790,6 +873,7 @@ class DecodeLauncherWindow(QWidget):
         self.note_label.setText(tool.notes)
         decoder_selected = tool.subcommand in DECODER_SUBCOMMANDS
         hifi_selected = tool.subcommand == "hifi"
+        file_inputs_enabled = decoder_selected or hifi_selected
         for widget in (
             self.input_edit,
             self.input_browse_button,
@@ -798,7 +882,7 @@ class DecodeLauncherWindow(QWidget):
             self.frequency_edit,
             self.system_combo,
         ):
-            widget.setEnabled(decoder_selected)
+            widget.setEnabled(file_inputs_enabled)
         self.tape_format_combo.setEnabled(tool.subcommand == "vhs")
         self.tape_speed_combo.setEnabled(tool.subcommand == "vhs")
         self.threads_spin.setEnabled(decoder_selected or hifi_selected)
@@ -850,7 +934,62 @@ class DecodeLauncherWindow(QWidget):
     def _on_input_changed(self, value: str) -> None:
         if not self._output_manually_set:
             self.output_edit.setText(self._infer_default_output_base(value))
+        self._auto_detect_config_from_filename(value)
         self._refresh_tool_state()
+
+    def _auto_detect_config_from_filename(self, input_path: str) -> None:
+        """Auto-set tool / tape format / tape speed / TV system from keywords
+        found in the input filename. Only updates a control when a matching
+        keyword is present; absent keywords leave the current selection alone.
+        """
+        if not input_path:
+            return
+        name_lower = os.path.basename(input_path).lower()
+        if not name_lower:
+            return
+
+        # Tool / tape format: pick the first matching hint (order already
+        # favors more-specific formats over generic ones).
+        target_tool: Optional[str] = None
+        target_format_value: Optional[str] = None
+        for keywords, fmt_value, tool_sub in FILENAME_TAPE_FORMAT_HINTS:
+            if any(kw in name_lower for kw in keywords):
+                target_format_value = fmt_value
+                target_tool = tool_sub
+                break
+
+        # If a hint wants the hifi tool (e.g. betamax/betacam), switch to it
+        # only when the user hasn't already selected a terminal decoder that
+        # also accepts the format. We never downgrade from hifi back to vhs.
+        if target_tool == "hifi" and self._selected_tool().subcommand != "hifi":
+            for i, tool in enumerate(self._tools):
+                if tool.subcommand == "hifi":
+                    self.tool_combo.setCurrentIndex(i)
+                    break
+
+        # Tape format combo: only set when the current tool exposes the value.
+        if target_format_value is not None:
+            self._set_tape_format_by_value(target_format_value)
+
+        # TV system.
+        for keywords, system_label in FILENAME_SYSTEM_HINTS:
+            if any(kw in name_lower for kw in keywords):
+                if self.system_combo.findText(system_label) >= 0:
+                    self.system_combo.setCurrentText(system_label)
+                break
+
+        # Tape speed.
+        for keywords, speed_label in FILENAME_TAPE_SPEED_HINTS:
+            if any(kw in name_lower for kw in keywords):
+                if self.tape_speed_combo.findText(speed_label) >= 0:
+                    self.tape_speed_combo.setCurrentText(speed_label)
+                break
+
+    def _set_tape_format_by_value(self, value: str) -> None:
+        for i, (_label, fmt_value) in enumerate(self._active_tape_format_options):
+            if fmt_value == value:
+                self.tape_format_combo.setCurrentIndex(i)
+                return
 
     def _on_output_edited(self, value: str) -> None:
         self._output_manually_set = bool(value.strip())
@@ -894,6 +1033,8 @@ class DecodeLauncherWindow(QWidget):
         handled = False
         if input_path:
             self.input_edit.setText(input_path)
+            # _on_input_changed fires via the textChanged signal and runs the
+            # filename auto-detect; no need to call it again here.
             handled = True
         if params_json_path:
             self.params_json_check.setChecked(True)
@@ -1184,7 +1325,7 @@ class DecodeLauncherWindow(QWidget):
             if tool.prefer_native_gui and not self.force_terminal_check.isChecked():
                 try:
                     if self._launch_native_gui_in_process(
-                        tool, extra, self.threads_spin.value()
+                        tool, basic_args, extra
                     ):
                         return
                 except Exception as hosted_exc:
