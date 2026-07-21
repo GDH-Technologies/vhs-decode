@@ -1,4 +1,5 @@
 import argparse
+import importlib.metadata
 import os
 from typing import Optional
 
@@ -108,6 +109,21 @@ class TestOutputFile(argparse.Action):
             setattr(namespace, self.dest, values)
 
 
+def get_version_string() -> str:
+    """Version of vhs-decode, from the build-time version file or, failing
+    that, the installed package metadata."""
+    try:
+        from vhsdecode._version import __version__
+
+        return __version__
+    except ImportError:
+        pass
+    try:
+        return importlib.metadata.version("vhs_decode")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def add_argument_hidden_in_gui(parser, use_gui, *args, **kwargs):
     if use_gui:
         parser.add_argument(*args, **kwargs, gooey_options={"visible": False})
@@ -185,6 +201,14 @@ def common_parser_cli(meta_title, default_threads=DEFAULT_THREADS + 1):
 
 
 def common_parser_inner(parser, use_gui=False, default_threads=DEFAULT_THREADS):
+    add_argument_hidden_in_gui(
+        parser,
+        use_gui,
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {get_version_string()}",
+    )
     parser.add_argument(
         "--system",
         metavar="system",
