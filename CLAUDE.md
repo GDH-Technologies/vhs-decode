@@ -37,14 +37,26 @@ for general project documentation.
   but subpackages raise ModuleNotFoundError. Fix: `rm -rf` the cache-only dirs.
   Diagnose from a neutral cwd — importing from inside the repo masks the problem because
   cwd is on sys.path.
-- **Editable installs cannot import `vhsd_rust`** (workflow-master, verified 2026-08-07).
-  setuptools-rust declares it as a *top-level* target (`[[tool.setuptools-rust.ext-modules]]`,
-  `target = "vhsd_rust"`), so an editable install builds the `.so` in-place at the repo root
-  but setuptools' editable finder only maps the declared Python packages — `vhsd_rust` is
-  absent from `__editable___vhs_decode_*_finder.py`. Every `sosfiltfilt_rust` call therefore
-  takes the scipy fallback, which is correct but slower, for both video and hifi decodes.
-  Check with `cd /tmp && python -c "import vhsdecode.rust_utils as r; print(r._HAS_VHSD_RUST)"`
-  — from inside the repo it always prints True because cwd is on sys.path.
+- **Editable installs never build `vhsd_rust`** (verified 2026-08-07 by A/B-ing throwaway
+  venvs). A regular `pip install .` compiles it and drops
+  `vhsd_rust.cpython-3xx-*.so` into site-packages; `pip install -e .` does not build it at
+  all, in either lenient or strict (`--config-settings editable_mode=strict`) mode —
+  setuptools documents editable support as "primarily restricted to Python modules".
+  So workflow-master (editable) silently takes the scipy fallback in `sosfiltfilt_rust`
+  for **both video and hifi** decodes; fleet hosts on regular installs get the rust path.
+  Check from a neutral cwd:
+  `cd /tmp && python -c "import vhsdecode.rust_utils as r; print(r._HAS_VHSD_RUST)"`
+  — inside the repo it always prints True because cwd is on sys.path and a `.so` sits at
+  the repo root. Remedy: build a wheel/regular install and copy the resulting
+  `vhsd_rust*.so` into the pipx venv's site-packages.
+- **swiftly's clang shadows `/usr/bin/clang` and breaks every rebuild** (workflow-master,
+  verified 2026-08-07). `/home/rdodge/.local/share/swiftly/bin` precedes `/usr/bin` on
+  PATH, and `setup.py` compiles with `-flto`; the Swift toolchain ships no `LLVMgold.so`,
+  so linking dies with `LLVMgold.so: cannot open shared object file`. Until the fixed
+  `setup.py` (which uses `os.environ.setdefault`) is deployed, exporting `CC` does **not**
+  help — the old code overwrote it with the bare name `clang`, re-resolving through PATH.
+  Workaround on the old code: drop swiftly from PATH for the build. With the fix:
+  `CC=/usr/bin/clang CXX=/usr/bin/clang++ pipx install --force ...`.
 
 ## GPU-resident demodblock (`feat/gpu-resident-demodblock`, fork PR #4)
 

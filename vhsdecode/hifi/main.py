@@ -1703,6 +1703,16 @@ async def decode_parallel(
     dt_string = elapsed_time.total_seconds()
     print(f"\nDecode finished, seconds elapsed: {round(dt_string)}")
 
+    # A peak gain of exactly zero means not one sample of audio made it through,
+    # which is never a real decode - it means the decoder workers died (their
+    # tracebacks scroll past during init) or no carrier was ever locked. Reporting
+    # success here hands downstream automation a silent file that looks valid.
+    if max(peak_gain.left, peak_gain.right) == 0:
+        raise RuntimeError(
+            "Decode produced no audio (peak gain 0%). The decoder workers most "
+            "likely failed - check above for worker tracebacks."
+        )
+
 async def normalize(input_file_post_gain, output_file, peak_gain, channels, audio_rate):
     try:
         total_frames_read = 0
