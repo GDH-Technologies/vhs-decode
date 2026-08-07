@@ -37,6 +37,14 @@ for general project documentation.
   but subpackages raise ModuleNotFoundError. Fix: `rm -rf` the cache-only dirs.
   Diagnose from a neutral cwd — importing from inside the repo masks the problem because
   cwd is on sys.path.
+- **Editable installs cannot import `vhsd_rust`** (workflow-master, verified 2026-08-07).
+  setuptools-rust declares it as a *top-level* target (`[[tool.setuptools-rust.ext-modules]]`,
+  `target = "vhsd_rust"`), so an editable install builds the `.so` in-place at the repo root
+  but setuptools' editable finder only maps the declared Python packages — `vhsd_rust` is
+  absent from `__editable___vhs_decode_*_finder.py`. Every `sosfiltfilt_rust` call therefore
+  takes the scipy fallback, which is correct but slower, for both video and hifi decodes.
+  Check with `cd /tmp && python -c "import vhsdecode.rust_utils as r; print(r._HAS_VHSD_RUST)"`
+  — from inside the repo it always prints True because cwd is on sys.path.
 
 ## GPU-resident demodblock (`feat/gpu-resident-demodblock`, fork PR #4)
 
