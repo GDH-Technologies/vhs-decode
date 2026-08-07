@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 
 from setuptools import setup
-import shutil
 import os
+import shlex
+import subprocess
+import sys
+import sysconfig
+import tempfile
 import distutils.ccompiler
 from distutils.extension import Extension
 from Cython.Build import cythonize
@@ -13,20 +17,90 @@ from Cython.Build import cythonize
 
 import numpy
 
+def _executables_on_path(name):
+    """Every executable called `name` on PATH, in PATH order, de-duplicated.
+
+    Compares path strings rather than realpath() on purpose: toolchain shims
+    (swiftly points clang, clang++ and a dozen other names at one `swiftly`
+    binary) would otherwise collapse into a single candidate."""
+    found = []
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        candidate = os.path.join(directory, name)
+        if candidate in found:
+            continue
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            found.append(candidate)
+    return found
+
+
+def _links_with_flto(cc):
+    """Can this compiler actually complete an -flto link?
+
+    -flto makes the compiler hand the linker an LTO plugin from its *own*
+    toolchain. Toolchains that ship a compiler but no plugin -- Swift's swiftly
+    is one, some conda and nix channels are others -- compile happily and then
+    die at link time with
+
+        LLVMgold.so: error loading plugin ... cannot open shared object file
+
+    Since such a toolchain routinely shadows /usr/bin/clang on PATH, and the
+    failure only appears at link time, actually trying it is the only reliable
+    test."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source = os.path.join(tmpdir, "probe.c")
+        with open(source, "w") as handle:
+            handle.write("int probe(void) { return 0; }\n")
+        try:
+            subprocess.run(
+                [cc, "-shared", "-fPIC", "-flto",
+                 source, "-o", os.path.join(tmpdir, "probe.so")],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return False
+    return True
+
+
 compiler = distutils.ccompiler.new_compiler()
 
 if compiler.compiler_type == "unix":
-    # Prefer clang, but never override a compiler the caller asked for: an
-    # unrelated toolchain earlier on PATH (Swift's swiftly, conda, nix) shadows
-    # /usr/bin/clang, and some of those ship no LTO linker plugin, so -flto below
-    # fails to link with "LLVMgold.so: cannot open shared object file".
-    # setdefault keeps `CC=/usr/bin/clang pip install .` working as an escape hatch.
-    if shutil.which("clang"):
-        os.environ.setdefault("CC", "clang")
-        os.environ.setdefault("CXX", "clang++")
+    use_lto = True
 
-    extra_compile_args=["-O3", "-flto"]
-    extra_link_args=["-O3", "-flto"]
+    if os.environ.get("CC"):
+        # The caller named a compiler; never second-guess it. Only check that
+        # -flto won't sink their build.
+        use_lto = _links_with_flto(shlex.split(os.environ["CC"])[0])
+    else:
+        # Prefer clang for the code it generates, but only a clang that can
+        # finish an LTO link -- see _links_with_flto. Absolute paths, so the
+        # choice survives any later PATH change.
+        for clang in _executables_on_path("clang"):
+            if not _links_with_flto(clang):
+                continue
+            os.environ["CC"] = clang
+            if os.access(clang + "++", os.X_OK):
+                os.environ["CXX"] = clang + "++"
+            break
+        else:
+            # No usable clang. Fall back to whatever built Python, and keep
+            # -flto only if that compiler can link with it.
+            default_cc = sysconfig.get_config_var("CC") or "cc"
+            use_lto = _links_with_flto(shlex.split(default_cc)[0])
+
+    if not use_lto:
+        print(
+            "setup.py: building without -flto, no available compiler could "
+            "complete an LTO link. Set CC (and CXX) to a compiler whose "
+            "toolchain ships an LTO plugin to re-enable it.",
+            file=sys.stderr,
+        )
+
+    extra_compile_args=["-O3"] + (["-flto"] if use_lto else [])
+    extra_link_args=["-O3"] + (["-flto"] if use_lto else [])
 else:
     extra_compile_args=[]
     extra_link_args=[]

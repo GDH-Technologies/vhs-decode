@@ -21,14 +21,17 @@ for general project documentation.
 ## Fleet deployment (pipx)
 
 - Capture-fleet hosts install this repo via pipx with extras `[intel,hifi_gui_qt6]`.
-  On workflow-master the install is **editable** (`--editable` in pip_args, verified
-  2026-07-21): pure-Python edits are live in the installed CLIs immediately; rebuild only
-  for Rust/Cython changes. `pipx install --force` **without `-e` silently reverts to a
-  regular install.** Check each host's pipx metadata before assuming its layout.
-- cupy-cuda13x + nvidia libs were added to the venv manually and are **not in the pipx
-  spec** (injected_packages empty): they survive `pipx install --force` but
-  `pipx reinstall` drops GPU support. Adding a `cuda13` extra to the spec would make them
-  durable.
+  `pipx install --force` **without `-e` silently reverts to a regular install.** Check
+  each host's pipx metadata before assuming its layout:
+  `pipx list --json | jq '.venvs["vhs-decode"].metadata.main_package | {package_or_url, pip_args}'`
+- workflow-master was editable until 2026-08-07 and is now a **regular** install
+  (`.[intel,hifi_gui_qt6,cuda13]`, no `--editable`), chosen so `vhsd_rust` gets built —
+  see the editable/`vhsd_rust` bullet below. Consequence: pure-Python edits in the repo no
+  longer reach the installed CLIs, so **rebuild after every change**, not just Rust/Cython
+  ones.
+- GPU support is durable now: `cuda13` (also `cuda12`/`cuda11`) is a real extra in
+  `pyproject.toml`, and workflow-master's pipx spec includes it. cupy no longer depends on
+  hand-injection surviving, so `pipx reinstall` is safe.
 - **Regular→editable switch gotcha** (hit on two hosts, expect it on any): the old
   install's numba `.nbc`/`.nbi` and `.pyc` caches leave `__init__.py`-less husk dirs in
   site-packages (`vhsdecode/`, `vhsdecode/addons/`, `vhsdecode/hifi/`; also check
@@ -42,21 +45,31 @@ for general project documentation.
   `vhsd_rust.cpython-3xx-*.so` into site-packages; `pip install -e .` does not build it at
   all, in either lenient or strict (`--config-settings editable_mode=strict`) mode —
   setuptools documents editable support as "primarily restricted to Python modules".
-  So workflow-master (editable) silently takes the scipy fallback in `sosfiltfilt_rust`
-  for **both video and hifi** decodes; fleet hosts on regular installs get the rust path.
+  Any editable host therefore silently takes the scipy fallback in `sosfiltfilt_rust` for
+  **both video and hifi** decodes; regular installs get the rust path. This is why
+  workflow-master was moved to a regular install on 2026-08-07.
   Check from a neutral cwd:
   `cd /tmp && python -c "import vhsdecode.rust_utils as r; print(r._HAS_VHSD_RUST)"`
   — inside the repo it always prints True because cwd is on sys.path and a `.so` sits at
   the repo root. Remedy: build a wheel/regular install and copy the resulting
   `vhsd_rust*.so` into the pipx venv's site-packages.
-- **swiftly's clang shadows `/usr/bin/clang` and breaks every rebuild** (workflow-master,
-  verified 2026-08-07). `/home/rdodge/.local/share/swiftly/bin` precedes `/usr/bin` on
-  PATH, and `setup.py` compiles with `-flto`; the Swift toolchain ships no `LLVMgold.so`,
-  so linking dies with `LLVMgold.so: cannot open shared object file`. Until the fixed
-  `setup.py` (which uses `os.environ.setdefault`) is deployed, exporting `CC` does **not**
-  help — the old code overwrote it with the bare name `clang`, re-resolving through PATH.
-  Workaround on the old code: drop swiftly from PATH for the build. With the fix:
-  `CC=/usr/bin/clang CXX=/usr/bin/clang++ pipx install --force ...`.
+- **A shadowing toolchain on PATH breaks `-flto` builds** (hit on workflow-master via
+  swiftly, verified 2026-08-07). The Swift toolchain ships `clang`, `clang++`, `lld` and
+  `clangd`, but no `LLVMgold.so` — the LTO plugin `ld.bfd` needs. Its clang *compiles*
+  fine and only dies at link with `LLVMgold.so: cannot open shared object file`, so the
+  failure looks like a compiler bug rather than a PATH problem. conda and nix ship
+  similarly incomplete toolchains; expect this class again.
+  `setup.py` now **probes** instead of trusting PATH: it tries a real `-flto` link with
+  each `clang` on PATH and takes the first that works (absolute path), falling back to the
+  compiler that built Python and dropping `-flto` — with a warning — if nothing can LTO.
+  An explicitly set `CC` is always respected; only the `-flto` decision is probed.
+  So no `CC=` incantation is needed any more. Note the earlier `os.environ.setdefault`
+  fix was **insufficient**: it only helped when the caller set `CC`, and the normal
+  `pipx install` path does not.
+- workflow-master's `~/.bash_profile` additionally moves swiftly's bin to the **end** of
+  PATH (it sources swiftly's `env.sh` for the `SWIFTLY_*` vars, then relocates
+  `$SWIFTLY_BIN_DIR`). That un-shadows `/usr/bin/clang` for every other project on the
+  box; `swift`/`swiftly` still resolve. Backups: `~/.bash_profile.bak.*`.
 
 ## GPU-resident demodblock (`feat/gpu-resident-demodblock`, fork PR #4)
 
