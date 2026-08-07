@@ -28,7 +28,15 @@ def sosfiltfilt_rust(sos, input):
         input = abs(input)
 
     if not _HAS_VHSD_RUST:
-        return sps.sosfiltfilt(sos, input)
+        # scipy promotes everything to float64 and hands back a reverse-strided
+        # view. Match the rust path's contract instead (float64 in -> float64 out,
+        # anything else -> float32, always C-contiguous), otherwise numba kernels
+        # compiled with explicit signatures reject the result. hifi-decode's
+        # FMDiscriminator.demod_quadrature only accepts float32, so the raw scipy
+        # output kills every decoder worker with "No matching definition for
+        # argument type(s) array(float64, 1d, A), ...".
+        out_dtype = np.float64 if input.dtype == np.float64 else np.float32
+        return np.ascontiguousarray(sps.sosfiltfilt(sos, input), dtype=out_dtype)
 
     order, filter = sos_filter_as_array_and_order(sos)
 

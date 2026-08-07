@@ -16,9 +16,14 @@ import numpy
 compiler = distutils.ccompiler.new_compiler()
 
 if compiler.compiler_type == "unix":
+    # Prefer clang, but never override a compiler the caller asked for: an
+    # unrelated toolchain earlier on PATH (Swift's swiftly, conda, nix) shadows
+    # /usr/bin/clang, and some of those ship no LTO linker plugin, so -flto below
+    # fails to link with "LLVMgold.so: cannot open shared object file".
+    # setdefault keeps `CC=/usr/bin/clang pip install .` working as an escape hatch.
     if shutil.which("clang"):
-        os.environ["CC"] = "clang"
-        os.environ["CXX"] = "clang++"
+        os.environ.setdefault("CC", "clang")
+        os.environ.setdefault("CXX", "clang++")
 
     extra_compile_args=["-O3", "-flto"]
     extra_link_args=["-O3", "-flto"]
