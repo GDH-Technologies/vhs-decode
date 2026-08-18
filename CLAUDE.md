@@ -20,10 +20,21 @@ for general project documentation.
 
 ## Fleet deployment (pipx)
 
-- Capture-fleet hosts install this repo via pipx with extras `[intel,hifi_gui_qt6]`.
-  `pipx install --force` **without `-e` silently reverts to a regular install.** Check
-  each host's pipx metadata before assuming its layout:
+- Capture-fleet hosts install this repo via pipx. `pipx install --force` **without `-e`
+  silently reverts to a regular install.** Check each host's pipx metadata before assuming
+  its layout:
   `pipx list --json | jq '.venvs["vhs-decode"].metadata.main_package | {package_or_url, pip_args}'`
+- Fleet roster (verified 2026-08-18): **workflow-master, lws, wf1** — Fedora, regular
+  installs of `~/Repos/vhs-decode[intel,hifi_gui_qt6,cuda13]`; **air0** — macOS, Homebrew
+  pipx at `/opt/homebrew/bin/pipx` (not on non-interactive PATH), regular install of
+  `~/Repos/vhs-decode` with no extras, venv under `~/Library/Application Support/pipx`.
+  cs0/cs1 have no vhs-decode (cs0 has the repo + pipx but nothing installed; cs1 nothing).
+  win-node-0 was unreachable on 2026-08-18 and did not get that day's update.
+  lws and wf1 were **editable until 2026-08-18**, then converted to regular installs for
+  the same vhsd_rust reason as workflow-master below.
+- Extras drift happens: workflow-master's spec had silently drifted to `[hifi_gui_qt6]`
+  alone (no intel/cuda13, so no cupy and no `--use-gpu`) before being restored on
+  2026-08-18. Verify the metadata; don't trust these notes for the current spec.
 - workflow-master was editable until 2026-08-07 and is now a **regular** install
   (`.[intel,hifi_gui_qt6,cuda13]`, no `--editable`), chosen so `vhsd_rust` gets built —
   see the editable/`vhsd_rust` bullet below. Consequence: pure-Python edits in the repo no
@@ -110,6 +121,29 @@ these silently breaks fleet decode jobs:
   lines breaks fleet progress reporting.
 - GPU decode (`--use-gpu`) additionally requires cupy present in that host's vhs-decode
   pipx venv (see Fleet deployment above).
+
+## MISRC-GUI (capture tool, GDH-Technologies/MISRC-GUI fork at ~/Repos/MISRC-GUI)
+
+- RF FLAC convention: STREAMINFO `sample_rate` is stored in **kHz** (FLAC's 20-bit rate
+  field caps at 655,350 Hz; 40 MSps → 40000). True values live in the vorbis tags
+  (`RF_SAMPLE_RATE`, `RF_TOTAL_SAMPLES`, `DURATION_SECONDS`). Header-derived durations
+  therefore read 1000× long in naive players — expected, not a bug.
+- Builds ≤ v1.0.7-25 wrote STREAMINFO `total_samples` scaled ÷1000, so libsndfile-trusting
+  readers silently decoded 1/1000th of the capture with exit 0 (hifi-decode: 61 ms of a
+  60.8 s tape). Fixed writer-side in MISRC-GUI PR #1 (v1.0.7-27). Reader-side, hifi-decode
+  falls back to ffmpeg on implausible header frame counts since vhs-decode fork PR #7, so
+  captures from the buggy builds still decode fully (with a WARN). Captures > 2^36 samples
+  (~28.6 min at 40 MSps) now get `total_samples = 0` ("unknown") instead of a wrapped count.
+- workflow-master install: `meson install -C build-fedora` with prefix `~/.local` (set
+  2026-08-18) → `misrc_gui`/`misrc_capture`/`misrc_extract` in `~/.local/bin`. The binaries
+  rpath-link vendored hsdaoh from `~/Repos/MISRC-GUI/.deps/install` — **the repo dir must
+  stay put** or the installed binaries break. Upgrade = `git pull` + `meson compile` +
+  `meson install`; do not rerun `scripts/build-fedora.sh` on an existing build dir (it
+  `--wipe`s the configuration, including the `~/.local` prefix).
+- GNOME launcher: `~/.local/share/applications/misrc-gui.desktop`, icon copied to
+  `~/.local/share/icons/misrc-gui.png`. `StartupWMClass` embeds the version string
+  (`MISRC Capture v...`, matching the CI AppImage convention) — refresh it after upgrades
+  or dock/window matching silently breaks.
 
 ## Output conventions
 
