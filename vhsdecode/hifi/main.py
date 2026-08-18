@@ -875,6 +875,36 @@ class AsyncSoundFileReader(sf.SoundFile):
         return values_read
 
 
+_FLAC_SUBTYPE_BYTES = {"PCM_S8": 1, "PCM_U8": 1, "PCM_16": 2, "PCM_24": 3, "PCM_32": 4, "FLOAT": 4, "DOUBLE": 8}
+
+
+def flac_frame_count_mismatch(reader, path):
+    """Return why the FLAC header frame count is implausible, or None if it looks sane.
+
+    Some writers corrupt STREAMINFO total_samples (misrc_tools scaled it /1000 to
+    match its kHz-stored sample rate; counts past 2^36 also wrap the 36-bit field).
+    libsndfile trusts the header and stops reading there, silently truncating the
+    decode. A valid FLAC never compresses to less than roughly half the decoded PCM
+    size, so a header count far below that is bogus; frames == 0 means "unknown
+    length" per the spec. Either way the ffmpeg reader, which reads to actual EOF,
+    is the safe path.
+    """
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        return None
+    if reader.frames <= 0:
+        return "FLAC header reports unknown length"
+    bytes_per_sample = _FLAC_SUBTYPE_BYTES.get(reader.subtype, 2)
+    decoded_bytes = reader.frames * reader.channels * bytes_per_sample
+    if decoded_bytes < file_size / 2:
+        return (
+            f"FLAC header claims {reader.frames} frames (~{decoded_bytes} bytes decoded) "
+            f"but the file is {file_size} bytes; the header sample count is corrupt"
+        )
+    return None
+
+
 def as_soundfile(pathR, input_format_override: np.dtype = None):
     extension = pathR.lower().rsplit(".", 1)[-1]
     extension_with_endian = extension.replace("16", "16le").replace("32", "32le")
@@ -895,22 +925,33 @@ def as_soundfile(pathR, input_format_override: np.dtype = None):
             input_format
         )
     elif "flac" == extension:
+        reader = None
+        fallback_reason = None
         try:
-            return AsyncSoundFileReader(
+            reader = AsyncSoundFileReader(
                 pathR,
                 input_format
             )
+            fallback_reason = flac_frame_count_mismatch(reader, pathR)
         except sf.LibsndfileError as e:
-            print(f"WARN: libsndfile could not open this FLAC file: {e}")
-            if test_if_ffmpeg_is_installed():
-                return AsyncReader(
-                    FFMpegFileReader(pathR),
-                    input_format
-                )
-            else:
-                print(
-                    "ERROR: ffmpeg is not installed (or not in PATH), cannot decode this FLAC bit depth."
-                )
+            fallback_reason = f"libsndfile could not open this FLAC file: {e}"
+
+        if fallback_reason is None:
+            return reader
+
+        if reader is not None:
+            reader.close()
+        print(f"WARN: {fallback_reason}")
+        if test_if_ffmpeg_is_installed():
+            print("WARN: reading this FLAC file with ffmpeg (to actual EOF) instead of libsndfile")
+            return AsyncReader(
+                FFMpegFileReader(pathR),
+                input_format
+            )
+        else:
+            print(
+                "ERROR: ffmpeg is not installed (or not in PATH), cannot decode this FLAC file."
+            )
     elif "ldf" == extension:
         try:
             for ldf_reader_tool in ("ld-ldf-reader", "ld-ldf-reader-py"):
