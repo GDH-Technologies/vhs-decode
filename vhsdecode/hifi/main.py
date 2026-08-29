@@ -877,6 +877,11 @@ class AsyncSoundFileReader(sf.SoundFile):
 
 _FLAC_SUBTYPE_BYTES = {"PCM_S8": 1, "PCM_U8": 1, "PCM_16": 2, "PCM_24": 3, "PCM_32": 4, "FLOAT": 4, "DOUBLE": 8}
 
+#: STREAMINFO total_samples is a 36-bit field, so any count at or above this is
+#: not a real length -- either the writer overflowed it (and stored 0) or the
+#: reader is reporting its own "unknown" sentinel (libsndfile uses SF_COUNT_MAX).
+_FLAC_MAX_TOTAL_SAMPLES = 1 << 36
+
 
 def flac_frame_count_mismatch(reader, path):
     """Return why the FLAC header frame count is implausible, or None if it looks sane.
@@ -888,13 +893,22 @@ def flac_frame_count_mismatch(reader, path):
     size, so a header count far below that is bogus; frames == 0 means "unknown
     length" per the spec. Either way the ffmpeg reader, which reads to actual EOF,
     is the safe path.
+
+    STREAMINFO stores total_samples in 36 bits, so a real count never reaches
+    2^36 -- at 40 MSps that caps an honest header at ~28.6 minutes, and every
+    longer RF capture is written with the "unknown length" value of 0. Do NOT
+    test that case with ``frames <= 0``: libsndfile surfaces an unknown length
+    as SF_COUNT_MAX (2^63-1), not 0, so a bare ``<= 0`` check sails past it,
+    keeps the libsndfile reader, and the decode dies near EOF with "Internal
+    psf_fseek() failed" -- which the block reader swallows as a short read,
+    truncating the tail while still exiting 0.
     """
     try:
         file_size = os.path.getsize(path)
     except OSError:
         return None
-    if reader.frames <= 0:
-        return "FLAC header reports unknown length"
+    if reader.frames <= 0 or reader.frames >= _FLAC_MAX_TOTAL_SAMPLES:
+        return f"FLAC header reports unknown length (frames={reader.frames})"
     bytes_per_sample = _FLAC_SUBTYPE_BYTES.get(reader.subtype, 2)
     decoded_bytes = reader.frames * reader.channels * bytes_per_sample
     if decoded_bytes < file_size / 2:
