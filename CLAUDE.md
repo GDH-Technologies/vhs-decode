@@ -30,9 +30,15 @@ for general project documentation.
   its layout:
   `pipx list --json | jq '.venvs["vhs-decode"].metadata.main_package | {package_or_url, pip_args}'`
 - Fleet roster (verified 2026-08-18): **workflow-master, lws, wf1** — Fedora, regular
-  installs of `~/Repos/vhs-decode[intel,hifi_gui_qt6,cuda13]`; **air0** — macOS, Homebrew
-  pipx at `/opt/homebrew/bin/pipx` (not on non-interactive PATH), regular install of
-  `~/Repos/vhs-decode` with no extras, venv under `~/Library/Application Support/pipx`.
+  installs of `~/Repos/vhs-decode[intel,hifi_gui_qt6,cuda13]`; **air0** — macOS/Apple
+  Silicon, user `dodge` (not `rdodge`), Homebrew pipx at `/opt/homebrew/bin/pipx` (not on a
+  non-interactive ssh PATH, but the runner's launchd `.path` does carry `/opt/homebrew/bin`),
+  regular install of `~/Repos/vhs-decode`, venv under `~/Library/Application Support/pipx`
+  (note the space). Its extras were **none** until 2026-08-31, now
+  `[hifi_gui_qt6,hifi_gnuradio]`. `cargo` there is Homebrew's, not rustup's — there is no
+  `~/.cargo/bin`. air0 also has upstream's prebuilt `.dmg` at `/Applications/decode.app`; it
+  exports nothing onto PATH and CI does not manage it, so it stays frozen at whatever
+  release was last installed by hand.
   cs0/cs1 have no vhs-decode (cs0 has the repo + pipx but nothing installed; cs1 nothing).
   win-node-0 was unreachable on 2026-08-18 and did not get that day's update.
   lws and wf1 were **editable until 2026-08-18**, then converted to regular installs for
@@ -94,20 +100,52 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
 - All 14 workflows inherited from upstream are **disabled as a repo setting**
   (`gh workflow disable`), not by editing files, so upstream merges stay conflict-free.
   That state is invisible in the tree; the doc above is the only record of it.
-- `.github/workflows/deploy-self-hosted.yml` is the only CI that runs. Build + unit tests
-  on `wm` for same-repo PRs and dispatches; a merge to `main` also pipx-reinstalls
-  vhs-decode on `wm`, `wf1` and `lws`.
-- **This fork is public** and the org runner group allows public repos, so the `verify` job
-  carries a same-repo guard (`head.repo.full_name == github.repository`) — without it any
+- `.github/workflows/deploy-self-hosted.yml` is the only CI that runs. Five jobs:
+  `preflight` (is air0 online?), then an independent verify→deploy pair per platform —
+  `verify-fedora`/`deploy-fedora` (`wm`, `wf1`, `lws`) and `verify-macos`/`deploy-macos`
+  (`air0`). Verify runs on same-repo PRs and dispatches; deploy only on a merge to `main`.
+- **The two platforms are independent.** Each deploys on its own build + tests; neither can
+  block or stall the other. A red `wm` does not stop a macOS deploy and vice versa. This is
+  the point of the layout — earlier shapes (air0 as a `verify` matrix leg; one `macos` job
+  that tested and deployed together) were contortions to stop a sleeping Air stalling the
+  Fedora deploy, a problem that vanishes once `deploy-fedora` depends on nothing macOS.
+- **`preflight` exists because an offline runner queues rather than failing** (up to 24h),
+  and there is no native "skip if the runner is offline". It asks GitHub whether a runner
+  labelled `air0` is online; `verify-macos` is `if:`-gated on that output. `GITHUB_TOKEN`
+  cannot answer — the runners are org-level, so it needs
+  `organization_self_hosted_runners: read`, held by the **gdh-ci-cd** App
+  (`vars.GDH_APP_CLIENT_ID` + `secrets.GDH_APP_PRIVATE_KEY` — the action's `client-id` input
+  needs the `Iv23li…` Client ID, **not** the numeric `vars.GDH_APP_ID`; they are different
+  values). That org secret was `private`
+  visibility (private repos only) and this fork is **public**, so it resolved to an empty
+  string until it was changed to `selected` on 2026-08-31 — check that first if the token
+  step ever fails. `wf1`/`lws` still queue rather than skip; that is deliberate for laptops.
+- **`deploy-macos` gates on `needs.verify-macos.outputs.passed == 'true'`, not on
+  `.result`** — `verify-macos` is `continue-on-error`, and how a dependent job sees a
+  forgiven failure is too subtle to bet a deploy on. The output is set by a `Record success`
+  step reachable only when everything before it passed. Do not give that step an `if:`, and
+  do not "simplify" the gate to `result == 'success'`.
+- **This fork is public** and the org runner group allows public repos, so `preflight` and
+  `verify-fedora` each carry a same-repo guard (every other job descends from one of them,
+  and `verify-macos` repeats it explicitly) (`head.repo.full_name == github.repository`) — without it any
   fork PR would run arbitrary code as `rdodge` on the fleet. MISRC-GUI's equivalent
   workflow has no such guard because that fork is private; do not copy between them
   without re-checking visibility. Fork-PR approval is set to `all_external_contributors`.
-- The deploy step **reads each node's existing pipx extras** and reuses them rather than
-  imposing one spec, per the extras-drift warning above. It installs from the runner
-  workspace, so after the first CI deploy a node's `package_or_url` points there rather
-  than at `~/Repos/vhs-decode`.
-- Offline nodes (usually `lws`) **queue rather than fail** — up to 24h. `wf1` and `lws` are
-  `continue-on-error`, so only `wm` can turn a merge red.
+- The deploy step installs the **union** of each node's existing pipx extras and a per-node
+  `baseline_extras` in the deploy matrices (changed 2026-08-31; it used to be "recorded extras
+  win, seed only if none"). So **CI can add an extra fleet-wide and can never remove one** —
+  which respects the extras-drift warning above while still letting CI push a new extra to a
+  node that already has some. Dropping an extra is a manual `pipx install` on that node, and
+  CI will re-add it next merge if it is still in that host's baseline. It installs from the
+  runner workspace, so after the first CI deploy a node's `package_or_url` points there
+  rather than at `~/Repos/vhs-decode`.
+- Current baselines: `wm` = `intel,hifi_gui_qt6,cuda13,gnuradio,hifi_gnuradio,test`;
+  `wf1`/`lws` = `intel,hifi_gui_qt6,cuda13`; `air0` = `hifi_gui_qt6,hifi_gnuradio`.
+  **`intel` and `cuda*` cannot be installed on Apple Silicon at all** — `intel-cmplr-lib-rt`
+  and `icc_rt` publish no macOS wheels and no sdist, and cupy is NVIDIA-only — which is why
+  the baseline is per-node rather than one fleet-wide default.
+- Offline nodes (usually `lws` and `air0`) **queue rather than fail** — up to 24h. `wf1`,
+  `lws` and `air0` are `continue-on-error`, so only `wm` can turn a merge red.
 
 ## GPU-resident demodblock (`feat/gpu-resident-demodblock`, fork PR #4)
 
@@ -133,9 +171,10 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
   uninitialized submodule looks like. `tests/unit` reaches it through the `data_dir`
   fixture in `tests/conftest.py`, not a literal path, so grepping the tests for
   `tests/data` finds nothing and the dependency looks absent. Run
-  `git submodule update --init --depth 1 tests/data` and the suite is **66 passed,
-  12 skipped, 0 failed**. There is no baseline to compare failure sets against — gate on
-  green.
+  `git submodule update --init --depth 1 tests/data` and the suite is green — **84 passed,
+  12 skipped, 0 failed** as measured in CI on 2026-08-31, identical on `wm` (Fedora/x86-64)
+  and `air0` (macOS/arm64). That count rises as tests are added, so it is a snapshot, not a
+  contract. There is no baseline to compare failure sets against — gate on green.
 - Parked follow-ups: launch batching / `cp.fuse` for thread scaling, cupyx `filtfilt`
   gate for the Betamax fsc notch, HiFi pipeline unported.
 
