@@ -82,9 +82,14 @@ jobs:
         # here. It was changed to `selected` with vhs-decode included on 2026-08-31. If this
         # step ever starts failing with an empty private key, check that visibility first.
         #
-        # `app-id` is the deprecated spelling of `client-id`; it still works, and the org
-        # variable we have is the numeric app id. The token is revoked automatically in a
-        # post step.
+        # `app-id` is the deprecated spelling of `client-id`. It still works, and the org
+        # variable we have (GDH_APP_ID = 4105774) is the numeric app id, not the client id --
+        # they are different values. The cost is one `##[warning] Input 'app-id' has been
+        # deprecated` annotation per run. To silence it: copy the App's Client ID (the
+        # Iv23li... string on the gdh-ci-cd settings page) into an org variable, then swap
+        # this line for `client-id: ${{ vars.GDH_APP_CLIENT_ID }}`.
+        #
+        # The token is revoked automatically in a post step.
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.GDH_APP_ID }}
