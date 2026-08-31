@@ -14,9 +14,14 @@ for general project documentation.
   `fork` = GDH, `origin` = oyvindln, `upstream` = happycube; lws: `origin` = GDH,
   `upstream` = oyvindln) — always identify the push target by URL via `git remote -v`,
   never by remote name.
-- Versioning is setuptools_scm from upstream tags. If builds stamp `0.3.8.x.devNNN`
-  instead of `0.4.x.devNN`, the clone is missing upstream tags — fetch `--tags` from the
-  oyvindln remote (cosmetic otherwise).
+- Versioning is setuptools_scm from upstream tags. If builds stamp `0.3.8.x.devNNN` or
+  `0.1.devNNNN` instead of `0.4.x.devNN`, the clone is missing upstream tags — fetch
+  `--tags` from the oyvindln remote (cosmetic otherwise).
+- **The GDH fork itself carried no tags until 2026-08-31.** Every fleet host had them
+  locally (fetched by hand), so this stayed invisible until CI started cloning from the
+  fork and stamped `0.1.dev5678`. The 53 upstream tags were pushed to the fork
+  (`git push fork --tags`), so `fetch-depth: 0` now resolves a real version. If a fresh
+  clone of the fork ever stamps `0.1.devN` again, the tags were lost — re-push them.
 
 ## Fleet deployment (pipx)
 

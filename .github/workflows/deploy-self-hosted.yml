@@ -200,6 +200,31 @@ jobs:
         # sosfiltfilt fallback. See CLAUDE.md.
         env:
           EXTRAS: ${{ steps.extras.outputs.extras }}
+          # Required, and only on uv-backed nodes -- this is what broke the first fleet
+          # deploy on wf1 and lws while wm succeeded.
+          #
+          # `pipx install --force` does NOT delete an existing venv. On an existing install
+          # it prints "Installing to existing venv", prepends --force-reinstall to the pip
+          # args (pipx/commands/install.py:100) and then calls create_venv() on the
+          # directory that is already there. With the pip backend that is harmless --
+          # `python -m venv` reuses a populated directory. With the uv backend,
+          # UvBackend.create_venv runs `uv venv <root>` with no --clear, and uv refuses to
+          # write into a directory that already holds a venv. The install then raises, and
+          # the except branch's venv.remove_venv() declines to clean up because
+          # safe_to_remove() is false for a pre-existing venv -- hence the confusing
+          # "Not removing existing venv ... not created in this session".
+          #
+          # Which backend is used is NOT a per-run choice: resolve_backend_name()'s
+          # precedence is cli > metadata > env > auto, and `metadata` is the backend
+          # recorded in the venv already on disk. wm's venv was pip-backed so it kept
+          # working; wf1's and lws's were uv-backed so they failed. Passing --backend pip
+          # does not help -- pipx will not retarget an existing venv (verified).
+          #
+          # UV_VENV_CLEAR is uv's own documented remedy (it is the hint uv prints on this
+          # exact error) and passes through, since pipx only overrides VIRTUAL_ENV and
+          # UV_NO_PROGRESS. It is inert on pip-backed nodes, and unlike uninstall-then-
+          # install it leaves each node's recorded backend alone.
+          UV_VENV_CLEAR: "1"
         run: |
           set -euo pipefail
           pipx install --force "${GITHUB_WORKSPACE}[${EXTRAS}]"
