@@ -1,0 +1,236 @@
+# Fork-only CI for GDH-Technologies/vhs-decode.
+#
+# Every workflow inherited from oyvindln/vhs-decode is left byte-identical in the tree and
+# is DISABLED on this fork as a repository setting (`gh workflow disable`), not by editing
+# the files. Upstream churns .github/workflows constantly and we merge from it regularly,
+# so an edited workflow is a guaranteed conflict on every sync. Because a disable is
+# invisible in the working tree, it is written down in .github/GDH_SELFHOSTED_CI.md.
+#
+# This file is the only CI that runs on the fork, and it runs entirely on the org's own
+# capture fleet. A merge to main additionally pipx-reinstalls vhs-decode on every Fedora
+# node, so the fleet's decode CLIs always match main.
+name: Self-hosted build and deploy (GDH fork)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # main only. A feature branch with an open PR is already covered by the pull_request
+  # event -- triggering on '**' as well would double every run, which is the exact noise
+  # this workflow was created to stop.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref. Two quick merges could otherwise race the pipx install and leave a node
+# holding a build from the older commit.
+concurrency:
+  group: selfhosted-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fleet standard, used ONLY to seed a node with no vhs-decode installed yet. An existing
+  # install's own extras always win -- see "Resolve extras" in the deploy job.
+  DEFAULT_EXTRAS: intel,hifi_gui_qt6,cuda13
+
+jobs:
+  verify:
+    name: Build and unit test (wm)
+    # SECURITY -- do not remove. This fork is PUBLIC and the org's Default runner group
+    # sets allows_public_repositories: true, so without this guard a pull_request from any
+    # fork would execute attacker-controlled code as rdodge on machines holding client
+    # capture data. Only PRs whose head branch lives in this repository may run; a fork PR
+    # shows as skipped and never reaches a runner.
+    #
+    # GDH-Technologies/MISRC-GUI's equivalent workflow has no such guard because that fork
+    # is private. Do not copy this file back and forth without re-checking visibility.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, wm]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # setuptools_scm derives the version from upstream tags; a shallow checkout
+          # stamps 0.1.dev1+... instead of 0.4.x.devNN.
+          fetch-depth: 0
+          # Handled explicitly below -- `recursive` would also clone the `testdata`
+          # laserdisc submodule, which no test here reads.
+          submodules: false
+
+      - name: Fetch unit-test fixtures
+        # tests/unit reaches tests/data through the `data_dir` fixture in tests/conftest.py
+        # rather than a literal path, so grepping the tests for "tests/data" finds nothing
+        # and the dependency looks absent. Without this, six tests in test_sync.py and
+        # test_rust_math.py fail with FileNotFoundError on PAL_GOOD.txt.gz / hilbert_data.npz
+        # -- which is precisely the "pre-existing baseline" this repo's CLAUDE.md records.
+        # It is not a baseline; it is an uninitialized submodule.
+        run: git submodule update --init --depth 1 tests/data
+
+      - name: Put the Rust toolchain on PATH
+        # The runner is a systemd service with a minimal PATH; rustup installs cargo into
+        # ~/.cargo/bin. The vhsd_rust ext-module in pyproject.toml is not marked optional,
+        # so a missing cargo hard-fails the wheel build rather than degrading quietly.
+        run: |
+          set -euo pipefail
+          if [ -d "$HOME/.cargo/bin" ]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Build into a throwaway venv
+        # Deliberately NOT the fleet's pipx venv. A commit must never reach the installed
+        # CLIs before its tests pass; the deploy job below is the only thing allowed to
+        # touch pipx.
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/venv"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/venv/bin/python" -m pip install ".[test]"
+
+      - name: Verify compiled extensions
+        # Run from /tmp so Python imports the *installed* package. Inside the workspace,
+        # cwd is on sys.path and the source tree -- plus any stale vhsd_rust*.so sitting at
+        # the repo root -- masks whether the build actually produced the extensions. This
+        # is the same trap CLAUDE.md documents for checking _HAS_VHSD_RUST by hand.
+        run: |
+          set -euo pipefail
+          cd /tmp
+          "$RUNNER_TEMP/venv/bin/python" -c "import vhsdecode.linear_filter, vhsdecode.sync; print('Cython OK')"
+          "$RUNNER_TEMP/venv/bin/python" -c "import vhsdecode.rust_utils as r; print('vhsd_rust present:', r._HAS_VHSD_RUST); raise SystemExit(0 if r._HAS_VHSD_RUST else 'vhsd_rust missing -- sosfiltfilt would fall back to scipy for both video and hifi decodes')"
+
+      - name: Run unit tests
+        # Via the repo's own runner script so this workflow does not become a second,
+        # drifting definition of "the unit tests". It reads GITHUB_WORKSPACE and invokes
+        # `python3 -m pytest`, hence sourcing the venv rather than calling its python
+        # directly. Integration tests are deliberately not run here: they decode real RF
+        # samples and take up to an hour.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source "$RUNNER_TEMP/venv/bin/activate"
+          cd /tmp
+          "$GITHUB_WORKSPACE/tests/run_unit.sh"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### Verify on \`wm\`"
+            echo
+            echo "- commit: \`${GITHUB_SHA:0:12}\`"
+            echo "- result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to ${{ matrix.host }}
+    needs: verify
+    # Only a real merge to main installs. PRs and manual dispatches build and test but
+    # never touch a fleet node's installed CLIs.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [wm, wf1, lws]
+    runs-on: [self-hosted, Linux, X64, "${{ matrix.host }}"]
+    # wm is the machine that must always be current, so its leg gates the run. wf1 and lws
+    # are best-effort: lws is a laptop and is frequently offline, and a job targeting an
+    # offline runner does not fail -- it queues (up to 24h) until that runner appears. That
+    # is deliberate here: a queued leg means "this node self-updates the next time it is
+    # online", which for a laptop is the behaviour we want. The cost is the run showing
+    # in-progress until then.
+    continue-on-error: ${{ matrix.host != 'wm' }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # As above: setuptools_scm needs the tags to stamp 0.4.x.devNN.
+          fetch-depth: 0
+          # Deploy only builds and installs; nothing here reads the test fixtures.
+          submodules: false
+
+      - name: Put the Rust toolchain and pipx on PATH
+        run: |
+          set -euo pipefail
+          for d in "$HOME/.cargo/bin" "$HOME/.local/bin"; do
+            if [ -d "$d" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+            fi
+          done
+
+      - name: Resolve extras
+        id: extras
+        # Reuse whatever extras this node already has installed rather than imposing a
+        # single spec on the fleet. CLAUDE.md records that extras drift between hosts and
+        # that the notes should not be trusted over the live metadata -- so read the live
+        # metadata. A node with no vhs-decode yet gets DEFAULT_EXTRAS.
+        #
+        # package_or_url looks like: /home/rdodge/Repos/vhs-decode[intel,hifi_gui_qt6,cuda13]
+        run: |
+          set -euo pipefail
+          if ! command -v pipx >/dev/null 2>&1; then
+            echo "::error::pipx not found on ${{ matrix.host }}"
+            exit 1
+          fi
+          spec="$(pipx list --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_or_url") or "")' 2>/dev/null || true)"
+          extras="$(printf '%s' "$spec" | sed -n 's/.*\[\(.*\)\]$/\1/p')"
+          if [ -z "$extras" ]; then
+            extras="$DEFAULT_EXTRAS"
+            echo "no existing vhs-decode extras on ${{ matrix.host }}; seeding with '$extras'"
+          else
+            echo "preserving existing extras on ${{ matrix.host }}: '$extras'"
+          fi
+          echo "extras=$extras" >> "$GITHUB_OUTPUT"
+
+      - name: Install with pipx
+        id: install
+        # Installed from the runner workspace, NOT ~/Repos/vhs-decode. A regular (non
+        # -editable) install copies the source into the venv, so nothing depends on this
+        # path surviving -- and CI must never hard-reset a repo directory the user edits by
+        # hand. Note this rewrites the node's pipx package_or_url to the runner workspace.
+        #
+        # Regular install is also required, not incidental: `pipx install -e` never builds
+        # vhsd_rust at all, which silently drops every decode on the node to the scipy
+        # sosfiltfilt fallback. See CLAUDE.md.
+        env:
+          EXTRAS: ${{ steps.extras.outputs.extras }}
+        run: |
+          set -euo pipefail
+          pipx install --force "${GITHUB_WORKSPACE}[${EXTRAS}]"
+          version="$(pipx list --json | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_version") or "unknown")')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "installed vhs_decode $version on ${{ matrix.host }}"
+
+      - name: Verify install
+        # From /tmp, for the sys.path reason above, and against the pipx venv's own
+        # interpreter rather than whatever `python3` resolves to.
+        run: |
+          set -euo pipefail
+          venvs="$(pipx environment --value PIPX_LOCAL_VENVS)"
+          py="$venvs/vhs-decode/bin/python"
+          test -x "$py" || { echo "::error::pipx venv interpreter missing at $py"; exit 1; }
+          cd /tmp
+          "$py" -c "import vhsdecode.linear_filter, vhsdecode.sync; print('Cython OK')"
+          "$py" -c "import vhsdecode.rust_utils as r; print('vhsd_rust present:', r._HAS_VHSD_RUST); raise SystemExit(0 if r._HAS_VHSD_RUST else 'vhsd_rust missing -- this node would silently take the scipy sosfiltfilt fallback')"
+          command -v vhs-decode >/dev/null || { echo "::error::vhs-decode not on PATH after install"; exit 1; }
+
+      - name: Summary
+        if: always()
+        env:
+          INSTALLED_VERSION: ${{ steps.install.outputs.version }}
+          EXTRAS: ${{ steps.extras.outputs.extras }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Deployed to \`${{ matrix.host }}\`"
+            echo
+            echo "- version: \`${INSTALLED_VERSION:-n/a}\`"
+            echo "- extras: \`${EXTRAS:-n/a}\`"
+            echo "- result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
