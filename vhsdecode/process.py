@@ -8,6 +8,7 @@ from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
 import lddecode.core as ldd
+import lddecode.tbc_db as tbc_db
 
 import lddecode.utils as lddu
 import vhsdecode.utils as utils
@@ -83,6 +84,9 @@ def _demodcache_dummy(self, *args, **kwargs):
 # work that is later overridden, but avoids altering any ld-decode code to ease merging back in
 # later as the ld-decode is in flux at the moment.
 class VHSDecode(ldd.LDdecode):
+    # capture.decoder identity in the .tbc.db (decode-orc branches on it).
+    db_decoder_name = tbc_db.DECODER_VHS
+
     def __init__(
         self,
         fname_in,

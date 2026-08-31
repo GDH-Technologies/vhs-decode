@@ -8,6 +8,7 @@ from collections import namedtuple
 import itertools
 
 import lddecode.core as ldd
+import lddecode.tbc_db as tbc_db
 import lddecode.utils as lddu
 from lddecode.utils import inrange
 
@@ -512,6 +513,11 @@ def _demodcache_dummy(self, *args, **kwargs):
 # work that is later overridden, but avoids altering any ld-decode code to ease merging back in
 # later as the ld-decode is in flux at the moment.
 class CVBSDecode(ldd.LDdecode):
+    # capture.decoder identity in the .tbc.db. The schema CHECK only admits
+    # ('ld-decode','vhs-decode'); cvbs-decode ships with vhs-decode and is
+    # not ld-decode, so it reports as vhs-decode.
+    db_decoder_name = tbc_db.DECODER_VHS
+
     def __init__(
         self,
         fname_in,
