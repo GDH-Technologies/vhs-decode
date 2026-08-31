@@ -1013,7 +1013,16 @@ class FieldShared:
                 self.field_number = self.prevfield.field_number
                 ldd.logger.debug("readloc loc didn't advance.")
         else:
-            self.field_number = 0
+            # --resume seeds the first decoded field with its absolute field
+            # index (consume-once): the chroma rotation cycle is anchored on
+            # field_number, so starting the counter at 0 mid-tape would
+            # re-roll the track-phase pairing the interrupted run used.
+            seed = getattr(self.rf, "resume_field_number_seed", None)
+            if seed is not None:
+                self.field_number = seed
+                self.rf.resume_field_number_seed = None
+            else:
+                self.field_number = 0
 
         super(FieldShared, self).process()
 

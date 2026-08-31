@@ -3,8 +3,12 @@ import sys
 import os
 
 
-def init_logging(outfile_name, columns=80):
-    """ Sets up a logger with a logfile, status line, and stderr output """
+def init_logging(outfile_name, columns=80, append=False):
+    """ Sets up a logger with a logfile, status line, and stderr output.
+
+    ``append=True`` keeps an existing logfile (a resumed decode continues
+    the prior run's log instead of destroying it).
+    """
 
     statusWritten = False
 
@@ -32,11 +36,12 @@ def init_logging(outfile_name, columns=80):
     logger.addHandler(logger_stderr)
 
     if outfile_name is not None:
-        # Delete old logfile if it exists
-        try:
-            os.unlink(outfile_name)
-        except (OSError, FileNotFoundError):
-            pass
+        # Delete old logfile if it exists (kept when resuming)
+        if not append:
+            try:
+                os.unlink(outfile_name)
+            except (OSError, FileNotFoundError):
+                pass
 
         logger_file = logging.FileHandler(outfile_name)
         logger_file.setLevel(logging.DEBUG)

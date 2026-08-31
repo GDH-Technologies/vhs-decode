@@ -1448,6 +1448,19 @@ class FieldInfo:
         self._fieldinfo_unsent.append(value)
         self._len += 1
 
+    def seed(self, fields):
+        """Replay recovered field dicts at the start of a resumed decode.
+
+        One pass restores all three roles this object plays: the ring ends
+        holding the true predecessors (seam parity/continuity checks), the
+        unsent list replays every prior field into the JSON dumper, and
+        ``len(self)`` restores seqNo / numberOfSequentialFields continuity.
+        Only valid before any decoding has happened.
+        """
+        assert self._len == 0, "seed() must run before any field is appended"
+        for value in fields:
+            self.append(value)
+
 
 class JSONDumper:
     def __init__(self, ldd, outname):

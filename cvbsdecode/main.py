@@ -163,6 +163,9 @@ def main(args=None):
     # Wrap the LDdecode creation so that the signal handler is not taken by sub-threads,
     # allowing SIGINT/control-C's to be handled cleanly
     original_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        signal.signal(sigterm, signal.SIG_IGN)
 
     logger = init_logging(outname + ".log")
 
@@ -184,6 +187,13 @@ def main(args=None):
     )
 
     signal.signal(signal.SIGINT, original_sigint_handler)
+    if sigterm is not None:
+        # A service manager's stop must flush metadata exactly like
+        # Ctrl+C instead of dying with the JSON stale.
+        def _sigterm_to_interrupt(signum, frame):
+            raise KeyboardInterrupt
+
+        signal.signal(sigterm, _sigterm_to_interrupt)
 
     if args.start_fileloc != -1:
         vhsd.roughseek(args.start_fileloc, False)
