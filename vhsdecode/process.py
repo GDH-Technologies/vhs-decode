@@ -8,6 +8,7 @@ from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
 import lddecode.core as ldd
+import lddecode.tbc_db as tbc_db
 
 # from lddecode.core import npfft
 # Use numpy fft rather than scipy fft as is imported in lddecode core as it seems to be slightly faster.
@@ -76,6 +77,9 @@ def _demodcache_dummy(self, *args, **kwargs):
 # work that is later overridden, but avoids altering any ld-decode code to ease merging back in
 # later as the ld-decode is in flux at the moment.
 class VHSDecode(ldd.LDdecode):
+    # capture.decoder identity in the .tbc.db (decode-orc branches on it).
+    db_decoder_name = tbc_db.DECODER_VHS
+
     def __init__(
         self,
         fname_in,

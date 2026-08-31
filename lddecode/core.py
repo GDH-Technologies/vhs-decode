@@ -25,6 +25,7 @@ from scipy import interpolate
 # internal libraries
 
 from . import efm_pll
+from .tbc_db import DECODER_LD, db_system_value
 from .utils import ac3_pipe, ldf_pipe, traceback
 from .utils import nb_mean, nb_median, nb_round, nb_min, nb_max, nb_abs, nb_absmax, n_orgt
 from .utils import polar2z, sqsum, genwave, dsa_rescale_and_clip, scale, scale_field, rms
@@ -3517,6 +3518,13 @@ class FieldNTSC(Field):
 
 
 class LDdecode:
+    # Written to capture.decoder in the .tbc.db; subclasses that are a
+    # different decoder (vhs-decode / cvbs-decode) override this so
+    # downstream tooling (decode-orc branches its pipeline on the column)
+    # sees the right identity. The value must stay inside the schema's
+    # CHECK vocabulary.
+    db_decoder_name = DECODER_LD
+
     def __init__(
         self,
         fname_in,
@@ -4802,11 +4810,15 @@ class LDdecode:
         js = self.build_json()
         vp = js.get("videoParameters", {})
         pcm = js.get("pcmAudioParameters", {})
-        decoder_val = vp.get('decoder', 'ld-decode')
+        # The JSON never carries a decoder key today; the class knows what
+        # it is. (Previously this defaulted to 'ld-decode' even from
+        # vhs-decode, which decode-orc then trusted.)
+        decoder_val = vp.get('decoder', self.db_decoder_name)
 
         # Prepare Video Parameters data tuple
         video_values = (
-            vp["system"],
+            # JSON spells PAL-M with a hyphen; the CHECK admits 'PAL_M'.
+            db_system_value(vp["system"]),
             decoder_val,
             vp.get("gitBranch", ""),
             vp.get("gitCommit", ""),

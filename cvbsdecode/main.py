@@ -128,7 +128,7 @@ def main(args=None):
     sample_freq = select_sample_freq(args)
 
     if not args.overwrite:
-        conflicts_ext = [".tbc", ".log", ".tbc.json"]
+        conflicts_ext = [".tbc", ".log", ".tbc.json", ".tbc.db"]
         conflicts = []
 
         for ext in conflicts_ext:
