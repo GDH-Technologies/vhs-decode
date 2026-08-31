@@ -82,6 +82,28 @@ for general project documentation.
   `$SWIFTLY_BIN_DIR`). That un-shadows `/usr/bin/clang` for every other project on the
   box; `swift`/`swiftly` still resolve. Backups: `~/.bash_profile.bak.*`.
 
+## CI (fork-local, self-hosted)
+
+Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI. Summary:
+
+- All 14 workflows inherited from upstream are **disabled as a repo setting**
+  (`gh workflow disable`), not by editing files, so upstream merges stay conflict-free.
+  That state is invisible in the tree; the doc above is the only record of it.
+- `.github/workflows/deploy-self-hosted.yml` is the only CI that runs. Build + unit tests
+  on `wm` for same-repo PRs and dispatches; a merge to `main` also pipx-reinstalls
+  vhs-decode on `wm`, `wf1` and `lws`.
+- **This fork is public** and the org runner group allows public repos, so the `verify` job
+  carries a same-repo guard (`head.repo.full_name == github.repository`) — without it any
+  fork PR would run arbitrary code as `rdodge` on the fleet. MISRC-GUI's equivalent
+  workflow has no such guard because that fork is private; do not copy between them
+  without re-checking visibility. Fork-PR approval is set to `all_external_contributors`.
+- The deploy step **reads each node's existing pipx extras** and reuses them rather than
+  imposing one spec, per the extras-drift warning above. It installs from the runner
+  workspace, so after the first CI deploy a node's `package_or_url` points there rather
+  than at `~/Repos/vhs-decode`.
+- Offline nodes (usually `lws`) **queue rather than fail** — up to 24h. `wf1` and `lws` are
+  `continue-on-error`, so only `wm` can turn a merge red.
+
 ## GPU-resident demodblock (`feat/gpu-resident-demodblock`, fork PR #4)
 
 - Makes demodblock GPU-resident; CPU path byte-identical, 100-frame Puppy Test
@@ -99,9 +121,16 @@ for general project documentation.
   reference.
 - `tau = np.pi*2` in `lddecode/utils.py` (commit 9b5f071e) is required for the numba
   unwrap to compile — keep it through upstream merges.
-- Pre-existing pytest baseline: 4 failures + 3 errors, all from test-data files
-  (PAL_GOOD.txt.gz etc.) removed by upstream's pytest migration. Compare failure *sets*
-  against baseline, not counts, when gating changes.
+- ~~Pre-existing pytest baseline: 4 failures + 3 errors, all from test-data files
+  (PAL_GOOD.txt.gz etc.) removed by upstream's pytest migration.~~ **Wrong — corrected
+  2026-08-31.** Those files were never removed; `tests/data` is a *submodule*
+  (eshaz/vhs-decode-testdata-ci, ~300 MB) and the failures are simply what an
+  uninitialized submodule looks like. `tests/unit` reaches it through the `data_dir`
+  fixture in `tests/conftest.py`, not a literal path, so grepping the tests for
+  `tests/data` finds nothing and the dependency looks absent. Run
+  `git submodule update --init --depth 1 tests/data` and the suite is **66 passed,
+  12 skipped, 0 failed**. There is no baseline to compare failure sets against — gate on
+  green.
 - Parked follow-ups: launch batching / `cp.fuse` for thread scaling, cupyx `filtfilt`
   gate for the Betamax fsc notch, HiFi pipeline unported.
 
