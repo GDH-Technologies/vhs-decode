@@ -152,6 +152,75 @@ and that `vhsdecode.rust_utils._HAS_VHSD_RUST` is true.
 with a minimal environment, and the `vhsd_rust` ext-module in `pyproject.toml` is not marked
 `optional`, so a missing `cargo` hard-fails the wheel build.
 
+### `UV_VENV_CLEAR=1` is required — do not remove it
+
+The first fleet deploy succeeded on `wm` and failed on `wf1` and `lws` with:
+
+```
+error: Failed to create virtual environment
+  Caused by: A virtual environment already exists at: .
+⚠️  Not removing existing venv …/pipx/venvs/vhs-decode because it was not created
+    in this session
+```
+
+**`pipx install --force` does not delete an existing venv.** On an existing install it
+prints `Installing to existing venv`, prepends `--force-reinstall` to the pip args
+(`pipx/commands/install.py:100`), and then calls `create_venv()` on the directory that is
+already there:
+
+- **pip backend** — `python -m venv <dir>` reuses a populated directory. Harmless.
+- **uv backend** — `UvBackend.create_venv` runs `uv venv <root>` with **no `--clear`**, and
+  uv refuses to write into a directory that already holds a venv. The install raises, and
+  the `except` branch's `venv.remove_venv()` declines to clean up because `safe_to_remove()`
+  is false for a pre-existing venv — hence that misleading second line. (uv reports the path
+  as `.` because pipx runs it with `run_dir=root`.)
+
+Which backend runs is **not** a per-run choice. `resolve_backend_name()`'s precedence is
+`cli > metadata > env > auto`, and `metadata` is the backend recorded in the venv already on
+disk — deliberately, so `PIPX_DEFAULT_BACKEND` cannot silently retarget existing venvs. All
+three nodes have identical pipx 1.15.0 / uv 0.12.2 / Python 3.14.7; they differed only in
+how their venv had originally been created:
+
+| node | `pyvenv.cfg` says | backend | result |
+|---|---|---|---|
+| `wm` | `command = /usr/bin/python3.14 -m venv …` | pip | worked |
+| `wf1`, `lws` | `uv = 0.12.2` | uv | failed |
+
+Measured against every venv state (scratch `PIPX_HOME`, `pycowsay`):
+
+| candidate | none | pip-backed | uv-backed | keeps backend |
+|---|---|---|---|---|
+| `--force` (original) | ok | ok | **fail** | — |
+| `--force --backend pip` | ok | ok | **fail** | no |
+| `pipx uninstall` then install | ok | ok | ok | **no** — flips pip→uv |
+| `--force` + `UV_VENV_CLEAR=1` | ok | ok | ok | **yes** |
+
+`--backend pip` does not help: pipx will not retarget an existing venv's backend.
+`UV_VENV_CLEAR` is uv's own documented remedy — it is the hint uv prints on this exact
+error — and it passes through because pipx only overrides `VIRTUAL_ENV` and
+`UV_NO_PROGRESS`. It is inert on pip-backed nodes and leaves each node's recorded backend
+alone, which uninstall-then-install would not.
+
+Note the failure was safe: it happened at venv creation, before anything was written, so
+`wf1` and `lws` kept their previous working installs.
+
+## The fork needs tags, or every CI build is misversioned
+
+`fetch-depth: 0` fetches tags **from the fork**, and until 2026-08-31 the GDH fork had
+**zero** — every fleet host had them only because they had been fetched by hand locally.
+So the first CI deploy stamped `wm` with `0.1.dev5678` (setuptools_scm's no-tag fallback)
+instead of `0.4.1.dev88`.
+
+Fixed by pushing upstream's 53 tags to the fork:
+
+```bash
+git fetch <oyvindln-url> --tags
+git push <gdh-fork-url> --tags
+```
+
+If a fresh clone of the fork ever stamps `0.1.devN` again, the tags are gone — re-push
+them. Identify both remotes by URL, never by name: remote names differ per machine.
+
 ## Offline nodes queue, they do not fail
 
 `lws` is a laptop and is frequently offline; `wf1` is usually up. A job targeting an offline
