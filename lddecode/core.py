@@ -9,7 +9,6 @@ import time
 import types
 
 from queue import Queue
-from textwrap import dedent
 from importlib.resources import files
 
 # standard numeric/scientific libraries
@@ -25,7 +24,7 @@ from scipy import interpolate
 # internal libraries
 
 from . import efm_pll
-from .tbc_db import DECODER_LD, db_system_value
+from .tbc_db import DECODER_LD, SCHEMA_SQL, db_system_value
 from .utils import ac3_pipe, ldf_pipe, traceback
 from .utils import nb_mean, nb_median, nb_round, nb_min, nb_max, nb_abs, nb_absmax, n_orgt
 from .utils import polar2z, sqsum, genwave, dsa_rescale_and_clip, scale, scale_field, rms
@@ -3559,6 +3558,9 @@ class LDdecode:
         self.numthreads = threads
 
         self.fields_written = 0
+        # Fields carried over by --resume (print_stats reports only what
+        # this run decoded).
+        self.fields_written_offset = 0
 
         self.blackIRE = 0
 
@@ -3731,120 +3733,9 @@ class LDdecode:
         # Enforce foreign key constraints (SQLite default is usually OFF)
         # cur.execute("PRAGMA foreign_keys = ON;")
 
-        cur.executescript(dedent('''\
-            PRAGMA user_version = 1;
-
-            CREATE TABLE capture (
-                capture_id INTEGER PRIMARY KEY,
-                system TEXT NOT NULL CHECK (system IN ('NTSC','PAL','PAL_M')),
-                decoder TEXT NOT NULL CHECK (decoder IN ('ld-decode','vhs-decode')),
-                git_branch TEXT,
-                git_commit TEXT,
-                video_sample_rate REAL,
-                active_video_start INTEGER,
-                active_video_end INTEGER,
-                field_width INTEGER,
-                field_height INTEGER,
-                number_of_sequential_fields INTEGER,
-                colour_burst_start INTEGER,
-                colour_burst_end INTEGER,
-                is_mapped INTEGER CHECK (is_mapped IN (0,1)),
-                is_subcarrier_locked INTEGER CHECK (is_subcarrier_locked IN (0,1)),
-                is_widescreen INTEGER CHECK (is_widescreen IN (0,1)),
-                white_16b_ire INTEGER,
-                black_16b_ire INTEGER,
-                blanking_16b_ire INTEGER,
-                capture_notes TEXT
-            );
-
-            CREATE TABLE pcm_audio_parameters (
-                capture_id INTEGER PRIMARY KEY REFERENCES capture(capture_id) ON DELETE CASCADE,
-                bits INTEGER,
-                is_signed INTEGER CHECK (is_signed IN (0,1)),
-                is_little_endian INTEGER CHECK (is_little_endian IN (0,1)),
-                sample_rate REAL
-            );
-
-            CREATE TABLE field_record (
-                capture_id INTEGER NOT NULL REFERENCES capture(capture_id) ON DELETE CASCADE,
-                field_id INTEGER NOT NULL,
-                audio_samples INTEGER,
-                decode_faults INTEGER,
-                disk_loc REAL,
-                efm_t_values INTEGER,
-                field_phase_id INTEGER,
-                file_loc INTEGER,
-                is_first_field INTEGER CHECK (is_first_field IN (0,1)),
-                median_burst_ire REAL,
-                pad INTEGER CHECK (pad IN (0,1)),
-                sync_conf INTEGER,
-                ntsc_is_fm_code_data_valid INTEGER CHECK (ntsc_is_fm_code_data_valid IN (0,1)),
-                ntsc_fm_code_data INTEGER,
-                ntsc_field_flag INTEGER CHECK (ntsc_field_flag IN (0,1)),
-                ntsc_is_video_id_data_valid INTEGER CHECK (ntsc_is_video_id_data_valid IN (0,1)),
-                ntsc_video_id_data INTEGER,
-                ntsc_white_flag INTEGER CHECK (ntsc_white_flag IN (0,1)),
-                PRIMARY KEY (capture_id, field_id)
-            );
-
-            CREATE TABLE vits_metrics (
-                capture_id INTEGER NOT NULL,
-                field_id INTEGER NOT NULL,
-                b_psnr REAL,
-                w_snr REAL,
-                FOREIGN KEY (capture_id, field_id) 
-                    REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
-                PRIMARY KEY (capture_id, field_id)
-            );
-
-            CREATE TABLE vbi (
-                capture_id INTEGER NOT NULL,
-                field_id INTEGER NOT NULL,
-                vbi0 INTEGER NOT NULL,
-                vbi1 INTEGER NOT NULL,
-                vbi2 INTEGER NOT NULL,
-                FOREIGN KEY (capture_id, field_id) 
-                    REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
-                PRIMARY KEY (capture_id, field_id)
-            );
-
-            CREATE TABLE drop_outs (
-                capture_id INTEGER NOT NULL,
-                field_id INTEGER NOT NULL,
-                field_line INTEGER NOT NULL,
-                startx INTEGER NOT NULL,
-                endx INTEGER NOT NULL,
-                FOREIGN KEY (capture_id, field_id) 
-                    REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
-                PRIMARY KEY (capture_id, field_id, field_line, startx, endx)
-            );
-
-            CREATE TABLE vitc (
-                capture_id INTEGER NOT NULL,
-                field_id INTEGER NOT NULL,
-                vitc0 INTEGER NOT NULL,
-                vitc1 INTEGER NOT NULL,
-                vitc2 INTEGER NOT NULL,
-                vitc3 INTEGER NOT NULL,
-                vitc4 INTEGER NOT NULL,
-                vitc5 INTEGER NOT NULL,
-                vitc6 INTEGER NOT NULL,
-                vitc7 INTEGER NOT NULL,
-                FOREIGN KEY (capture_id, field_id) 
-                    REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
-                PRIMARY KEY (capture_id, field_id)
-            );
-
-            CREATE TABLE closed_caption (
-                capture_id INTEGER NOT NULL,
-                field_id INTEGER NOT NULL,
-                data0 INTEGER,
-                data1 INTEGER,
-                FOREIGN KEY (capture_id, field_id) 
-                    REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
-                PRIMARY KEY (capture_id, field_id)
-            );
-        '''))
+        # The DDL lives in tbc_db.SCHEMA_SQL (one canonical copy shared
+        # with --resume and the unit tests).
+        cur.executescript(SCHEMA_SQL)
 
         self.dbconn.commit()
 
@@ -4284,7 +4175,10 @@ class LDdecode:
         if self.fields_written:
             timeused = time.time() - self.start_time
             timeused2 = time.time() - self.second_decode
-            frames = self.fields_written // 2
+            # A resumed decode seeds fields_written with the prior run's
+            # count; report only what THIS run decoded (the line format is
+            # parsed downstream -- keep it stable).
+            frames = (self.fields_written - self.fields_written_offset) // 2
             fps = frames / timeused2
 
             print(
