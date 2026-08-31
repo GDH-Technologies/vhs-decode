@@ -114,7 +114,9 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
   labelled `air0` is online; `verify-macos` is `if:`-gated on that output. `GITHUB_TOKEN`
   cannot answer — the runners are org-level, so it needs
   `organization_self_hosted_runners: read`, held by the **gdh-ci-cd** App
-  (`vars.GDH_APP_ID` + `secrets.GDH_APP_PRIVATE_KEY`). That org secret was `private`
+  (`vars.GDH_APP_CLIENT_ID` + `secrets.GDH_APP_PRIVATE_KEY` — the action's `client-id` input
+  needs the `Iv23li…` Client ID, **not** the numeric `vars.GDH_APP_ID`; they are different
+  values). That org secret was `private`
   visibility (private repos only) and this fork is **public**, so it resolved to an empty
   string until it was changed to `selected` on 2026-08-31 — check that first if the token
   step ever fails. `wf1`/`lws` still queue rather than skip; that is deliberate for laptops.

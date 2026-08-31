@@ -369,11 +369,16 @@ The **`gdh-ci-cd`** GitHub App holds exactly that permission. Both halves are or
 > `selected` with `vhs-decode` included on 2026-08-31. If the token step ever fails on an
 > empty private key, check that visibility before anything else.
 
-The workflow passes `app-id`, which is the **deprecated** spelling of `client-id` — the org
-variable we have is the numeric app id, and the client id is a different value
-(`Iv23li…`, on the App's settings page). It works, at the cost of one
-`##[warning] Input 'app-id' has been deprecated` annotation per run. To silence it, add the
-Client ID as an org variable and switch the input; nothing else changes.
+The workflow passes **`client-id`**, not the deprecated `app-id` (which warns on every run).
+These are different *values*, not two spellings of one:
+
+| org variable | value | what it is |
+|---|---|---|
+| `GDH_APP_ID` | `4105774` | numeric App ID — **not** accepted by the `client-id` input |
+| `GDH_APP_CLIENT_ID` | `Iv23li…` | Client ID, added 2026-08-31 for this workflow |
+
+A Client ID is a public identifier, not a secret — `GET /apps/gdh-ci-cd` returns it — which
+is why it lives in `vars` rather than `secrets`. The private key is the secret half.
 
 The probe matches on the **`air0` label**, not the runner's name (`air-0`), because the label
 is what `runs-on` selects on — renaming the runner would otherwise break scheduling while
