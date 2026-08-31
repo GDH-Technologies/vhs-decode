@@ -30,9 +30,15 @@ for general project documentation.
   its layout:
   `pipx list --json | jq '.venvs["vhs-decode"].metadata.main_package | {package_or_url, pip_args}'`
 - Fleet roster (verified 2026-08-18): **workflow-master, lws, wf1** — Fedora, regular
-  installs of `~/Repos/vhs-decode[intel,hifi_gui_qt6,cuda13]`; **air0** — macOS, Homebrew
-  pipx at `/opt/homebrew/bin/pipx` (not on non-interactive PATH), regular install of
-  `~/Repos/vhs-decode` with no extras, venv under `~/Library/Application Support/pipx`.
+  installs of `~/Repos/vhs-decode[intel,hifi_gui_qt6,cuda13]`; **air0** — macOS/Apple
+  Silicon, user `dodge` (not `rdodge`), Homebrew pipx at `/opt/homebrew/bin/pipx` (not on a
+  non-interactive ssh PATH, but the runner's launchd `.path` does carry `/opt/homebrew/bin`),
+  regular install of `~/Repos/vhs-decode`, venv under `~/Library/Application Support/pipx`
+  (note the space). Its extras were **none** until 2026-08-31, now
+  `[hifi_gui_qt6,hifi_gnuradio]`. `cargo` there is Homebrew's, not rustup's — there is no
+  `~/.cargo/bin`. air0 also has upstream's prebuilt `.dmg` at `/Applications/decode.app`; it
+  exports nothing onto PATH and CI does not manage it, so it stays frozen at whatever
+  release was last installed by hand.
   cs0/cs1 have no vhs-decode (cs0 has the repo + pipx but nothing installed; cs1 nothing).
   win-node-0 was unreachable on 2026-08-18 and did not get that day's update.
   lws and wf1 were **editable until 2026-08-18**, then converted to regular installs for
@@ -95,19 +101,39 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
   (`gh workflow disable`), not by editing files, so upstream merges stay conflict-free.
   That state is invisible in the tree; the doc above is the only record of it.
 - `.github/workflows/deploy-self-hosted.yml` is the only CI that runs. Build + unit tests
-  on `wm` for same-repo PRs and dispatches; a merge to `main` also pipx-reinstalls
-  vhs-decode on `wm`, `wf1` and `lws`.
+  on `wm` for same-repo PRs and dispatches, plus a **non-gating** macOS build + unit-test
+  job on `air0`; a merge to `main` also pipx-reinstalls vhs-decode on `wm`, `wf1`, `lws`
+  and `air0`.
+- The `macos` job **tests and deploys air0 in one job**, unlike every other node. This looks
+  like a layering violation and is not — do not split it. air0 must not be deployed to when
+  its tests fail, but gating a separate macOS deploy job with `needs` would stall the Linux
+  fleet: an offline runner *queues* (up to 24h) rather than failing, `needs` waits on the
+  whole job, and `continue-on-error` forgives failure but not queuing. Since steps in a job
+  stop at the first failure, putting the pipx steps after the test steps gives that gate for
+  free. It also carries `needs: verify`, so air0 still won't install what `wm` rejected, and
+  `deploy` does **not** list `macos` in its `needs`, so a sleeping Air can't hold up
+  `wm`/`wf1`/`lws`. Tried as a `verify` matrix leg and as a separate `verify-macos` job
+  first; both were wrong.
 - **This fork is public** and the org runner group allows public repos, so the `verify` job
   carries a same-repo guard (`head.repo.full_name == github.repository`) — without it any
   fork PR would run arbitrary code as `rdodge` on the fleet. MISRC-GUI's equivalent
   workflow has no such guard because that fork is private; do not copy between them
   without re-checking visibility. Fork-PR approval is set to `all_external_contributors`.
-- The deploy step **reads each node's existing pipx extras** and reuses them rather than
-  imposing one spec, per the extras-drift warning above. It installs from the runner
-  workspace, so after the first CI deploy a node's `package_or_url` points there rather
-  than at `~/Repos/vhs-decode`.
-- Offline nodes (usually `lws`) **queue rather than fail** — up to 24h. `wf1` and `lws` are
-  `continue-on-error`, so only `wm` can turn a merge red.
+- The deploy step installs the **union** of each node's existing pipx extras and a per-node
+  `baseline_extras` in the deploy matrix (changed 2026-08-31; it used to be "recorded extras
+  win, seed only if none"). So **CI can add an extra fleet-wide and can never remove one** —
+  which respects the extras-drift warning above while still letting CI push a new extra to a
+  node that already has some. Dropping an extra is a manual `pipx install` on that node, and
+  CI will re-add it next merge if it is still in that host's baseline. It installs from the
+  runner workspace, so after the first CI deploy a node's `package_or_url` points there
+  rather than at `~/Repos/vhs-decode`.
+- Current baselines: `wm` = `intel,hifi_gui_qt6,cuda13,gnuradio,hifi_gnuradio,test`;
+  `wf1`/`lws` = `intel,hifi_gui_qt6,cuda13`; `air0` = `hifi_gui_qt6,hifi_gnuradio`.
+  **`intel` and `cuda*` cannot be installed on Apple Silicon at all** — `intel-cmplr-lib-rt`
+  and `icc_rt` publish no macOS wheels and no sdist, and cupy is NVIDIA-only — which is why
+  the baseline is per-node rather than one fleet-wide default.
+- Offline nodes (usually `lws` and `air0`) **queue rather than fail** — up to 24h. `wf1`,
+  `lws` and `air0` are `continue-on-error`, so only `wm` can turn a merge red.
 
 ## GPU-resident demodblock (`feat/gpu-resident-demodblock`, fork PR #4)
 

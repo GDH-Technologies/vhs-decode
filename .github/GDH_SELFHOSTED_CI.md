@@ -7,15 +7,21 @@ Fork-local notes for `GDH-Technologies/vhs-decode`. None of this exists upstream
 All CI for this fork runs on the org's own capture fleet, via
 `.github/workflows/deploy-self-hosted.yml`:
 
-| Event | Build + unit tests (`wm`) | pipx install (`wm`, `wf1`, `lws`) |
-|---|---|---|
-| Pull request (same-repo) | yes | no |
-| Pull request (from a fork) | **skipped — see Security** | no |
-| Push to `main` | yes | **yes** |
-| `workflow_dispatch` | yes | no |
+Three jobs: `verify` (build + unit tests on `wm`), `macos` (build + unit tests **and**
+deploy on `air0`, in one job — see below for why), and `deploy` (pipx install on the three
+Linux nodes).
 
-The runner service runs as `rdodge`, the same user as the desktop session, so the install
-step reaches that user's pipx venvs without sudo.
+| Event | `verify` — tests on `wm` | `macos` — tests on `air0` | `macos` — install on `air0` | `deploy` — install on `wm`, `wf1`, `lws` |
+|---|---|---|---|---|
+| Pull request (same-repo) | yes | yes | no | no |
+| Pull request (from a fork) | **skipped — see Security** | **skipped — see Security** | no | no |
+| Push to `main` | yes | yes | **yes, only if the macOS tests passed** | **yes** |
+| `workflow_dispatch` | yes | yes | no | no |
+
+On the Fedora nodes the runner service runs as `rdodge`, the same user as the desktop
+session, so the install step reaches that user's pipx venvs without sudo. On `air0` the
+runner is a **launchd agent** (`~/Library/LaunchAgents/actions.runner.GDH-Technologies.air-0.plist`)
+running as **`dodge`** — a different username, same principle.
 
 There is deliberately no `push` trigger on `'**'`. A feature branch with an open PR is
 already covered by the `pull_request` event; triggering on both doubles every run, which is
@@ -61,11 +67,17 @@ What *was* real: `build-and-test.yml` triggers on `push` to `'**'` and `pull_req
 `'**'`, so every commit on every branch produced a red X. It has been failing at startup
 since it gained `uses: ./.github/workflows/...` reusable-workflow calls.
 
-### Consequence: no cross-platform coverage here
+### Consequence: reduced cross-platform coverage here
 
-Windows, macOS and the AppImage are no longer built on this fork at all, and neither PyPI
-workflow can fire. A fork-local change can break them without CI noticing. Before sending
-work upstream, re-enable the relevant workflow and run it once via `workflow_dispatch`.
+Windows and the AppImage are no longer built on this fork at all, and neither PyPI workflow
+can fire. A fork-local change can break them without CI noticing. Before sending work
+upstream, re-enable the relevant workflow and run it once via `workflow_dispatch`.
+
+macOS is the exception: the `macos` job builds and unit-tests on `air0` (Apple Silicon) for
+every same-repo PR, so a Cython or `setuptools-rust` break that only shows on macOS is
+caught here. It is **non-gating** and it is not a substitute for upstream's `Build macOS
+decode` workflow — it proves the source builds and the unit tests pass on macOS, not that
+the `.dmg` packaging still works.
 
 ### Two workflows are not files
 
@@ -128,7 +140,9 @@ hour.
 
 ## The install step
 
-Each Fedora node runs `pipx install --force "$GITHUB_WORKSPACE[<extras>]"`.
+Each fleet node runs `pipx install --force "$GITHUB_WORKSPACE[<extras>]"` (bare
+`"$GITHUB_WORKSPACE"`, with no bracket suffix, if the node resolves to no extras at all —
+`pipx install "/path[]"` is not a valid requirement).
 
 - **From the runner workspace, not `~/Repos/vhs-decode`.** A regular (non-editable) install
   copies the source into the venv, so nothing depends on that path surviving, and CI must
@@ -138,11 +152,40 @@ Each Fedora node runs `pipx install --force "$GITHUB_WORKSPACE[<extras>]"`.
 - **Regular, never editable.** `pipx install -e` does not build `vhsd_rust` at all, which
   silently drops every decode on that node to the scipy `sosfiltfilt` fallback for both
   video and hifi. See `CLAUDE.md`.
-- **Extras are read from the node, not imposed.** The step parses the existing
-  `package_or_url` (e.g. `…/vhs-decode[intel,hifi_gui_qt6,cuda13]`) and reuses those
-  extras, falling back to `DEFAULT_EXTRAS` only on a node with no vhs-decode yet. `CLAUDE.md`
-  records that extras drift between hosts and that its own notes should not be trusted over
-  live metadata — so the workflow reads the live metadata.
+- **Extras are the union of the node's own and a per-node baseline.** The step parses the
+  existing `package_or_url` (e.g. `…/vhs-decode[intel,hifi_gui_qt6,cuda13]`) and unions
+  those extras with the `baseline_extras` recorded for that host in the deploy matrix.
+
+### Why union, and not either side alone
+
+This changed on 2026-08-31; it used to be "the node's recorded extras win, seed with
+`DEFAULT_EXTRAS` only if there are none". Both one-sided rules are wrong:
+
+- **Not "baseline wins".** `CLAUDE.md` records that extras drift between hosts and that its
+  own notes should not be trusted over live metadata. Imposing one spec would silently strip
+  an extra somebody added by hand on a node.
+- **Not "recorded wins"** (the old behaviour). A node that already has *any* extras recorded
+  could then never be handed a new one by CI. That is exactly what blocked adding
+  `gnuradio`/`hifi_gnuradio`/`test` to `wm`, which already had `intel,hifi_gui_qt6,cuda13`
+  recorded — changing the seed did nothing, because the seed only applied to nodes with no
+  extras at all.
+
+So the rule is: **CI can add an extra to the fleet and can never remove one.** Dropping an
+extra is a deliberate manual `pipx install` on that node; CI will not do it for you, and
+will re-add it on the next merge if it is still in that host's `baseline_extras`.
+
+The current baselines:
+
+| host | `baseline_extras` | declared in |
+|---|---|---|
+| `wm` | `intel,hifi_gui_qt6,cuda13,gnuradio,hifi_gnuradio,test` | `deploy` matrix |
+| `wf1`, `lws` | `intel,hifi_gui_qt6,cuda13` | `deploy` matrix |
+| `air0` | `hifi_gui_qt6,hifi_gnuradio` | `macos` job env (it deploys from there) |
+
+The union is computed with a plain `tr`/`sed`/`awk` pipeline that dedupes while preserving
+order. The rejoin is `tr '\n' ','` + `sed 's/,$//'` rather than `paste -s`, deliberately, so
+nothing depends on how a given `paste(1)` treats the `-` stdin operand across BSD and GNU
+userlands.
 
 Post-install it verifies, from `/tmp` (inside the workspace, cwd is on `sys.path` and the
 source tree masks whether the build produced anything), that the Cython extensions import
@@ -185,6 +228,14 @@ how their venv had originally been created:
 |---|---|---|---|
 | `wm` | `command = /usr/bin/python3.14 -m venv …` | pip | worked |
 | `wf1`, `lws` | `uv = 0.12.2` | uv | failed |
+| `air0` | `uv = 0.12.2` | uv | would have failed the same way |
+
+`air0` joined the fleet deploy later (2026-08-31) and is **uv-backed too**, so the `macos`
+job sets `UV_VENV_CLEAR=1` for exactly the same reason — verified by running the real
+`UV_VENV_CLEAR=1 pipx install --force "$HOME/Repos/vhs-decode[hifi_gui_qt6,hifi_gnuradio]"`
+on it by hand first, which succeeded (`vhs-decode 0.4.1.dev88`). Its pipx is Homebrew's
+1.16.6 on Python 3.14.6, not the Fedora nodes' 1.15.0/3.14.7, so the versions in the table
+above are not fleet-wide.
 
 Measured against every venv state (scratch `PIPX_HOME`, `pycowsay`):
 
@@ -221,15 +272,96 @@ git push <gdh-fork-url> --tags
 If a fresh clone of the fork ever stamps `0.1.devN` again, the tags are gone — re-push
 them. Identify both remotes by URL, never by name: remote names differ per machine.
 
+## `air0` — the macOS node
+
+Added 2026-08-31. `air0` is not in the `deploy` matrix — it builds, tests **and** installs
+itself in the single `macos` job, for the reason in "Why the macOS job tests and deploys
+together" below.
+
+Runner labels are `self-hosted, macOS, ARM64, air0` (runner name `air-0`, in the `Default`
+pool). What differs from a Fedora node:
+
+- **Different user.** The runner is a launchd agent running as `dodge`, not `rdodge`.
+- **Homebrew, not rustup.** `cargo`, `pipx` and `python3` are all `/opt/homebrew/bin/…`;
+  there is no `~/.cargo/bin` on that host. The launchd agent's captured
+  `~/actions-runner/.path` **already contains** `/opt/homebrew/bin`, so this works today —
+  the PATH step adds `/opt/homebrew/{bin,sbin}` behind a `-d` guard only as insurance
+  against a runner re-registration picking up a leaner environment. (The `CLAUDE.md` note
+  that Homebrew pipx "is not on the non-interactive PATH" is about plain `ssh air0 <cmd>`,
+  which is a non-login shell — it does not describe the runner.)
+- **`PIPX_LOCAL_VENVS` contains a space**: `~/Library/Application Support/pipx/venvs`. Every
+  expansion of it in the workflow has to stay quoted.
+- **`vhsd_rust` builds fine** on Apple Silicon —
+  `vhsd_rust.cpython-314-darwin.so` lands in the venv and `_HAS_VHSD_RUST` is true, so the
+  existing post-install check needed no macOS special-casing.
+
+### Half the Linux extras cannot exist on Apple Silicon
+
+This is why a per-node baseline was needed rather than one fleet-wide `DEFAULT_EXTRAS`: the
+old global default would have handed `air0` the Linux spec and hard-failed the deploy.
+
+| extra | packages | on arm64 macOS? |
+|---|---|---|
+| `intel` | `intel-cmplr-lib-rt`, `icc_rt` | **no** — no macOS wheels at all, and no sdist to fall back on |
+| `cuda13`/`cuda12`/`cuda11` | `cupy-cuda1Nx` + nvidia rt libs | **no** — NVIDIA-only |
+| `hifi_gui_qt6` | `PyQt6` | yes — `macosx_10_14_universal2` |
+| `hifi_gui_qt5` | `PyQt5` | yes — `macosx_11_0_arm64` |
+| `gnuradio`/`hifi_gnuradio` | `pyzmq` | yes — `macosx_11_0_arm64` |
+| `test` | `pytest` | yes (pure Python) |
+
+### `/Applications/decode.app` is not managed by CI
+
+`air0` also has the prebuilt `.dmg` from an upstream release installed (installed 2026-07-09;
+its `CFBundleShortVersionString` is `0.0.0`, so it does not identify its own build). It is a
+single self-contained `decode` binary and it exports **nothing** onto `PATH` — no symlink in
+`/usr/local/bin` or `~/.local/bin` points at it, and `vhs-decode` resolves to the pipx shim
+in `~/.local/bin`. So it does not shadow a CI deploy.
+
+The corollary: **CI cannot update it either.** After a deploy, `air0`'s CLIs are current with
+`main` while `decode.app` stays frozen at whatever upstream release was last installed by
+hand. If someone reports air0 behaving like an old build, check which of the two they ran.
+Should a future `.dmg` start installing CLI symlinks, it could begin shadowing the pipx
+shims — that would be silent, so re-check `command -v vhs-decode` after any `.dmg` install.
+
 ## Offline nodes queue, they do not fail
 
-`lws` is a laptop and is frequently offline; `wf1` is usually up. A job targeting an offline
-self-hosted runner does **not** fail — it queues, for up to 24 hours, until that runner
-appears.
+`lws` is a laptop and `air0` is a MacBook Air; both are frequently offline. `wf1` is usually
+up. A job targeting an offline self-hosted runner does **not** fail — it queues, for up to 24
+hours, until that runner appears.
 
 That is deliberate: a queued leg means "this node self-updates the next time it is online".
-The cost is the run showing in-progress until then. `wm` gates the run; `wf1` and `lws` are
-`continue-on-error: true`, so neither can turn a merge red.
+The cost is the run showing in-progress until then. `wm` gates the run; `wf1`, `lws` and
+`air0` are `continue-on-error: true`, so none of them can turn a merge red.
+
+### Why the macOS job tests and deploys together
+
+This is the one structural thing not to "tidy up" later. It looks like a layering violation
+— every other node has its tests in one job and its install in another — and it is not.
+
+Two requirements pull against each other:
+
+1. **`air0` must not be deployed to when the macOS tests are failing.**
+2. **A sleeping Air must not stall the Linux fleet's deploy.**
+
+The obvious implementation of (1) is a separate macOS deploy job with
+`needs: <macOS test job>`. That breaks (2): an offline self-hosted runner **queues rather
+than failing** (up to 24 hours), `needs` waits for the whole upstream job, and
+`continue-on-error` forgives failure but does nothing about queuing. One closed MacBook lid
+would then hold the run open for a day. Putting the gate on the Linux `deploy` job instead
+does not work either — `needs` cannot depend on a single matrix leg, so gating air0's leg
+would gate `wm`/`wf1`/`lws` too.
+
+**Steps within a job stop at the first failure.** So placing the pipx steps *after* the test
+steps in one `macos` job gives requirement (1) for free, with no cross-job coordination and
+no expression to get subtly wrong: if the unit tests fail, the install steps never execute
+and air0 keeps its previous install. The deploy steps carry
+`if: github.event_name == 'push' && github.ref == 'refs/heads/main'` so PRs still only test.
+
+Requirement (2) holds because `deploy` does **not** list `macos` in its `needs`. The job also
+declares `needs: verify`, so air0 still refuses to install anything `wm`'s tests rejected.
+
+This has been tried as a `verify` matrix leg and as a separate `verify-macos` job. Both were
+wrong for the reasons above; the git history has them.
 
 If you want the matrix to skip offline hosts instead, it needs a preflight job that queries
 `orgs/GDH-Technologies/actions/runners` — which requires a PAT with `admin:org` read, since

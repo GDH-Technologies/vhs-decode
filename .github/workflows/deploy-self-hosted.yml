@@ -7,8 +7,14 @@
 # invisible in the working tree, it is written down in .github/GDH_SELFHOSTED_CI.md.
 #
 # This file is the only CI that runs on the fork, and it runs entirely on the org's own
-# capture fleet. A merge to main additionally pipx-reinstalls vhs-decode on every Fedora
-# node, so the fleet's decode CLIs always match main.
+# capture fleet. A merge to main additionally pipx-reinstalls vhs-decode on every fleet
+# node -- the three Fedora boxes and the macOS one -- so the fleet's decode CLIs always
+# match main.
+#
+# Job layout (see GDH_SELFHOSTED_CI.md for the reasoning, which is not obvious):
+#   verify  -- build + unit tests on wm. Gates everything.
+#   macos   -- build + unit tests on air0, AND air0's own deploy, in ONE job.
+#   deploy  -- pipx install on the three Linux nodes.
 name: Self-hosted build and deploy (GDH fork)
 
 on:
@@ -29,11 +35,6 @@ permissions:
 concurrency:
   group: selfhosted-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  # Fleet standard, used ONLY to seed a node with no vhs-decode installed yet. An existing
-  # install's own extras always win -- see "Resolve extras" in the deploy job.
-  DEFAULT_EXTRAS: intel,hifi_gui_qt6,cuda13
 
 jobs:
   verify:
@@ -127,8 +128,211 @@ jobs:
             echo "- result: \`${{ job.status }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  macos:
+    name: Build, test and deploy (air0)
+    # Same SECURITY guard as `verify` above -- this fork is public. Do not remove.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    # air0 still does not install anything unless wm's tests passed, exactly as the Linux
+    # nodes do not. The macOS unit tests therefore also wait on wm, which is fine: wm is
+    # always up, and there is no value in burning an Air's battery on a commit wm has
+    # already rejected.
+    needs: verify
+    runs-on: [self-hosted, macOS, ARM64, air0]
+    # Best-effort, like wf1/lws: a macOS failure -- or a macOS deploy failure -- must never
+    # turn a PR or a merge red. Only wm gates.
+    continue-on-error: true
+    # Higher than wm's 45: the Air is slower, and on a merge to main it builds the package
+    # twice (once into the throwaway venv for the tests, once via pipx).
+    timeout-minutes: 90
+    steps:
+      # ---------------------------------------------------------------------------------
+      # WHY TEST AND DEPLOY ARE THE SAME JOB ON macOS, WHEN THEY ARE SEPARATE ON LINUX
+      #
+      # Requirement: air0 must not be deployed to when the macOS tests are failing.
+      # Constraint: a job targeting an offline self-hosted runner does not fail, it QUEUES
+      # (up to 24h), and `continue-on-error` forgives failure but does nothing about
+      # queuing. So a separate macOS deploy job gated with `needs: <macos tests>` would let
+      # one closed MacBook lid stall the run for a day -- and `needs` cannot depend on a
+      # single leg of the Linux deploy matrix either, so the gate cannot live there.
+      #
+      # Steps in a job stop at the first failure. Putting the install steps AFTER the test
+      # steps in one job therefore gives the required gate for free and with no cross-job
+      # coordination: if the unit tests fail, the pipx steps below simply never run. And
+      # because this job is not in the Linux `deploy` job's `needs`, a sleeping Air still
+      # cannot hold up wm/wf1/lws.
+      #
+      # DO NOT add always() / failure() to the deploy steps' `if:` below. GitHub applies an
+      # implicit success() to any step `if:` that contains no status-check function, so
+      # `if: github.event_name == 'push' && ...` really means
+      # `success() && github.event_name == 'push' && ...` -- that implicit success() IS the
+      # gate. A well-meaning always() would silently deploy a build whose tests just failed.
+      #
+      # Do not "tidy" this into a verify job plus a matrix leg. It has been both.
+      # ---------------------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Fetch unit-test fixtures
+        # ~300 MB. See the note on the same step in `verify`.
+        run: git submodule update --init --depth 1 tests/data
+
+      - name: Put the Rust toolchain and pipx on PATH
+        # air0's cargo, pipx and python3 are all Homebrew's under /opt/homebrew/bin -- there
+        # is no ~/.cargo/bin on that host, and pipx is not rustup-installed. The runner is a
+        # launchd agent whose captured ~/actions-runner/.path already contains
+        # /opt/homebrew/bin, so this is belt-and-braces against a re-registration picking up
+        # a leaner environment. ~/.local/bin holds the pipx shims.
+        run: |
+          set -euo pipefail
+          for d in "$HOME/.cargo/bin" "$HOME/.local/bin" /opt/homebrew/bin /opt/homebrew/sbin; do
+            if [ -d "$d" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+            fi
+          done
+
+      - name: Build into a throwaway venv
+        # As on wm: never the node's pipx venv. The pipx steps further down are the only
+        # thing allowed to touch air0's installed CLIs, and only after these tests pass.
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/venv"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/venv/bin/python" -m pip install ".[test]"
+
+      - name: Verify compiled extensions
+        # From /tmp, for the sys.path reason documented in `verify`.
+        run: |
+          set -euo pipefail
+          cd /tmp
+          "$RUNNER_TEMP/venv/bin/python" -c "import vhsdecode.linear_filter, vhsdecode.sync; print('Cython OK')"
+          "$RUNNER_TEMP/venv/bin/python" -c "import vhsdecode.rust_utils as r; print('vhsd_rust present:', r._HAS_VHSD_RUST); raise SystemExit(0 if r._HAS_VHSD_RUST else 'vhsd_rust missing -- sosfiltfilt would fall back to scipy for both video and hifi decodes')"
+
+      - name: Run unit tests
+        id: unit
+        # THE GATE. Every step below is a deploy step; if this fails the job stops here and
+        # air0 keeps its previous install.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source "$RUNNER_TEMP/venv/bin/activate"
+          cd /tmp
+          "$GITHUB_WORKSPACE/tests/run_unit.sh"
+
+      # --- deploy steps: merges to main only, and only if everything above passed --------
+
+      - name: Resolve extras
+        id: extras
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          # air0's baseline. The Linux baselines live in the `deploy` job's matrix -- keep
+          # the two in mind together.
+          #
+          # macOS/Apple Silicon cannot take the Linux fleet spec: intel-cmplr-lib-rt and
+          # icc_rt publish no macOS wheels at all (and no sdist to fall back on), and
+          # cupy-cuda13x is NVIDIA-only. PyQt6 ships macosx_10_14_universal2 and pyzmq ships
+          # macosx_11_0_arm64, so these two are the viable set. Verified by a manual
+          # `pipx install` on air0 before this was added.
+          BASELINE_EXTRAS: hifi_gui_qt6,hifi_gnuradio
+        # Identical logic to the `deploy` job's step of the same name -- see the long
+        # rationale there for why this is a UNION rather than either side alone. Keep the
+        # two in sync.
+        run: |
+          set -euo pipefail
+          if ! command -v pipx >/dev/null 2>&1; then
+            echo "::error::pipx not found on air0"
+            exit 1
+          fi
+          spec="$(pipx list --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_or_url") or "")' 2>/dev/null || true)"
+          recorded="$(printf '%s' "$spec" | sed -n 's/.*\[\(.*\)\]$/\1/p')"
+          extras="$(printf '%s,%s' "$recorded" "$BASELINE_EXTRAS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed '/^$/d' \
+            | awk '!seen[$0]++' \
+            | tr '\n' ',' \
+            | sed 's/,$//')"
+          echo "air0: recorded='${recorded:-none}' baseline='$BASELINE_EXTRAS' -> installing '${extras:-none}'"
+          echo "extras=$extras" >> "$GITHUB_OUTPUT"
+
+      - name: Install with pipx
+        id: install
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          EXTRAS: ${{ steps.extras.outputs.extras }}
+          # air0's venv is uv-backed (its pyvenv.cfg carries `uv = 0.12.2`), so it needs
+          # this for exactly the reason the Linux nodes do -- see the full explanation on
+          # the `deploy` job's install step.
+          UV_VENV_CLEAR: "1"
+        run: |
+          set -euo pipefail
+          if [ -n "$EXTRAS" ]; then
+            target="${GITHUB_WORKSPACE}[${EXTRAS}]"
+          else
+            target="${GITHUB_WORKSPACE}"
+          fi
+          pipx install --force "$target"
+          version="$(pipx list --json | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_version") or "unknown")')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "installed vhs_decode $version on air0"
+
+      - name: Verify install
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # PIPX_LOCAL_VENVS on air0 is "~/Library/Application Support/pipx/venvs" -- it
+        # contains a space, so every expansion of it has to stay quoted.
+        #
+        # The `command -v` check also guards against /Applications/decode.app (the upstream
+        # prebuilt .dmg, which is installed on this host) ever starting to ship CLI symlinks
+        # and shadowing the pipx shims. Today it exports nothing onto PATH.
+        run: |
+          set -euo pipefail
+          venvs="$(pipx environment --value PIPX_LOCAL_VENVS)"
+          py="$venvs/vhs-decode/bin/python"
+          test -x "$py" || { echo "::error::pipx venv interpreter missing at $py"; exit 1; }
+          cd /tmp
+          "$py" -c "import vhsdecode.linear_filter, vhsdecode.sync; print('Cython OK')"
+          "$py" -c "import vhsdecode.rust_utils as r; print('vhsd_rust present:', r._HAS_VHSD_RUST); raise SystemExit(0 if r._HAS_VHSD_RUST else 'vhsd_rust missing -- this node would silently take the scipy sosfiltfilt fallback')"
+          shim="$(command -v vhs-decode || true)"
+          test -n "$shim" || { echo "::error::vhs-decode not on PATH after install"; exit 1; }
+          echo "vhs-decode resolves to $shim"
+
+      - name: Summary
+        if: always()
+        env:
+          INSTALLED_VERSION: ${{ steps.install.outputs.version }}
+          EXTRAS: ${{ steps.extras.outputs.extras }}
+          UNIT_OUTCOME: ${{ steps.unit.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### \`air0\` (macOS, non-gating)"
+            echo
+            echo "- commit: \`${GITHUB_SHA:0:12}\`"
+            echo "- unit tests: \`${UNIT_OUTCOME:-not reached}\`"
+            if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              if [ -n "${INSTALLED_VERSION:-}" ]; then
+                echo "- deployed: \`${INSTALLED_VERSION}\` with extras \`${EXTRAS:-none}\`"
+              elif [ "${UNIT_OUTCOME:-}" != "success" ]; then
+                echo "- deployed: **no** -- the macOS build/tests did not pass, so air0 keeps its previous install"
+              else
+                echo "- deployed: **no** -- tests passed but the install did not complete; air0 keeps its previous install"
+              fi
+            else
+              echo "- deployed: n/a (deploys happen only on a merge to \`main\`)"
+            fi
+            echo "- result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
     name: Deploy to ${{ matrix.host }}
+    # Deliberately does NOT depend on the `macos` job. air0 deploys itself, inside that job,
+    # gated on its own tests -- see the long comment there. Depending on it here would let a
+    # sleeping Air (whose job queues rather than failing) stall the Linux fleet for 24h.
     needs: verify
     # Only a real merge to main installs. PRs and manual dispatches build and test but
     # never touch a fleet node's installed CLIs.
@@ -136,7 +340,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        host: [wm, wf1, lws]
+        # `include` rather than a bare host list so each node can carry its own
+        # baseline_extras. air0's baseline lives in the `macos` job instead, since that node
+        # deploys from there.
+        include:
+          - host: wm
+            baseline_extras: intel,hifi_gui_qt6,cuda13,gnuradio,hifi_gnuradio,test
+          - host: wf1
+            baseline_extras: intel,hifi_gui_qt6,cuda13
+          - host: lws
+            baseline_extras: intel,hifi_gui_qt6,cuda13
     runs-on: [self-hosted, Linux, X64, "${{ matrix.host }}"]
     # wm is the machine that must always be current, so its leg gates the run. wf1 and lws
     # are best-effort: lws is a laptop and is frequently offline, and a job targeting an
@@ -156,6 +369,8 @@ jobs:
           submodules: false
 
       - name: Put the Rust toolchain and pipx on PATH
+        # The runner is a systemd service with a minimal PATH, rustup puts cargo in
+        # ~/.cargo/bin and pipx's shims live in ~/.local/bin.
         run: |
           set -euo pipefail
           for d in "$HOME/.cargo/bin" "$HOME/.local/bin"; do
@@ -166,12 +381,29 @@ jobs:
 
       - name: Resolve extras
         id: extras
-        # Reuse whatever extras this node already has installed rather than imposing a
-        # single spec on the fleet. CLAUDE.md records that extras drift between hosts and
-        # that the notes should not be trusted over the live metadata -- so read the live
-        # metadata. A node with no vhs-decode yet gets DEFAULT_EXTRAS.
+        env:
+          BASELINE_EXTRAS: ${{ matrix.baseline_extras }}
+        # The installed spec is the UNION of what the node already records and the node's
+        # baseline_extras above. Union, specifically, rather than either one alone:
+        #
+        # - Not "baseline wins": CLAUDE.md records that extras drift between hosts and that
+        #   its own notes must not be trusted over live metadata. Imposing one spec would
+        #   silently strip an extra someone added by hand on a node.
+        # - Not "recorded wins" (the original behaviour): a node that already has extras
+        #   recorded could then never be given a new one from CI. That is exactly what
+        #   blocked adding gnuradio/hifi_gnuradio/test to wm, which already had
+        #   intel,hifi_gui_qt6,cuda13 recorded.
+        #
+        # So CI can ADD an extra to the fleet and can never REMOVE one. Dropping an extra is
+        # therefore a deliberate manual `pipx install` on that node -- CI will not do it.
         #
         # package_or_url looks like: /home/rdodge/Repos/vhs-decode[intel,hifi_gui_qt6,cuda13]
+        #
+        # The dedupe is a plain pipeline rather than a python heredoc so it stays readable.
+        # Every stage is POSIX and behaves identically under the BSD userland on air0, which
+        # runs the same logic in the `macos` job -- note the rejoin is `tr` + `sed` rather
+        # than `paste -s`, deliberately, to avoid depending on how a given paste(1) handles
+        # the `-` stdin operand.
         run: |
           set -euo pipefail
           if ! command -v pipx >/dev/null 2>&1; then
@@ -179,13 +411,15 @@ jobs:
             exit 1
           fi
           spec="$(pipx list --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_or_url") or "")' 2>/dev/null || true)"
-          extras="$(printf '%s' "$spec" | sed -n 's/.*\[\(.*\)\]$/\1/p')"
-          if [ -z "$extras" ]; then
-            extras="$DEFAULT_EXTRAS"
-            echo "no existing vhs-decode extras on ${{ matrix.host }}; seeding with '$extras'"
-          else
-            echo "preserving existing extras on ${{ matrix.host }}: '$extras'"
-          fi
+          recorded="$(printf '%s' "$spec" | sed -n 's/.*\[\(.*\)\]$/\1/p')"
+          extras="$(printf '%s,%s' "$recorded" "$BASELINE_EXTRAS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed '/^$/d' \
+            | awk '!seen[$0]++' \
+            | tr '\n' ',' \
+            | sed 's/,$//')"
+          echo "${{ matrix.host }}: recorded='${recorded:-none}' baseline='$BASELINE_EXTRAS' -> installing '${extras:-none}'"
           echo "extras=$extras" >> "$GITHUB_OUTPUT"
 
       - name: Install with pipx
@@ -200,8 +434,9 @@ jobs:
         # sosfiltfilt fallback. See CLAUDE.md.
         env:
           EXTRAS: ${{ steps.extras.outputs.extras }}
-          # Required, and only on uv-backed nodes -- this is what broke the first fleet
-          # deploy on wf1 and lws while wm succeeded.
+          # Required on uv-backed nodes -- this is what broke the first fleet deploy on wf1
+          # and lws while wm succeeded. air0 is uv-backed too, so the `macos` job sets it as
+          # well.
           #
           # `pipx install --force` does NOT delete an existing venv. On an existing install
           # it prints "Installing to existing venv", prepends --force-reinstall to the pip
@@ -217,17 +452,24 @@ jobs:
           # Which backend is used is NOT a per-run choice: resolve_backend_name()'s
           # precedence is cli > metadata > env > auto, and `metadata` is the backend
           # recorded in the venv already on disk. wm's venv was pip-backed so it kept
-          # working; wf1's and lws's were uv-backed so they failed. Passing --backend pip
-          # does not help -- pipx will not retarget an existing venv (verified).
+          # working; wf1's, lws's and air0's are uv-backed. Passing --backend pip does not
+          # help -- pipx will not retarget an existing venv (verified).
           #
           # UV_VENV_CLEAR is uv's own documented remedy (it is the hint uv prints on this
           # exact error) and passes through, since pipx only overrides VIRTUAL_ENV and
           # UV_NO_PROGRESS. It is inert on pip-backed nodes, and unlike uninstall-then-
           # install it leaves each node's recorded backend alone.
           UV_VENV_CLEAR: "1"
+        # The bracket suffix is built conditionally: with no extras resolved the spec must
+        # be a bare path, since `pipx install "/path[]"` is not a valid requirement.
         run: |
           set -euo pipefail
-          pipx install --force "${GITHUB_WORKSPACE}[${EXTRAS}]"
+          if [ -n "$EXTRAS" ]; then
+            target="${GITHUB_WORKSPACE}[${EXTRAS}]"
+          else
+            target="${GITHUB_WORKSPACE}"
+          fi
+          pipx install --force "$target"
           version="$(pipx list --json | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_version") or "unknown")')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "installed vhs_decode $version on ${{ matrix.host }}"
