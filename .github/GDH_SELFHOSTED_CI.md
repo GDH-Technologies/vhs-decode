@@ -7,16 +7,26 @@ Fork-local notes for `GDH-Technologies/vhs-decode`. None of this exists upstream
 All CI for this fork runs on the org's own capture fleet, via
 `.github/workflows/deploy-self-hosted.yml`:
 
-Three jobs: `verify` (build + unit tests on `wm`), `macos` (build + unit tests **and**
-deploy on `air0`, in one job — see below for why), and `deploy` (pipx install on the three
-Linux nodes).
+Four stages, one pair per platform, plus a small availability gate:
 
-| Event | `verify` — tests on `wm` | `macos` — tests on `air0` | `macos` — install on `air0` | `deploy` — install on `wm`, `wf1`, `lws` |
+| job | what it does | where | depends on |
+|---|---|---|---|
+| `preflight` | asks GitHub whether `air0` is online | `wm` | — |
+| `verify-fedora` | build + unit tests | `wm` | — |
+| `verify-macos` | build + unit tests | `air0` | `preflight` (skipped if offline) |
+| `deploy-fedora` | pipx install | `wm`, `wf1`, `lws` | `verify-fedora` |
+| `deploy-macos` | pipx install | `air0` | `verify-macos` |
+
+**The two platforms are independent.** Each deploys on the strength of its own build and
+tests; neither can block, gate or stall the other. A red `wm` does not stop a macOS deploy,
+and an absent `air0` does not delay the Fedora fleet by so much as a second.
+
+| Event | `verify-fedora` | `verify-macos` | `deploy-fedora` | `deploy-macos` |
 |---|---|---|---|---|
-| Pull request (same-repo) | yes | yes | no | no |
+| Pull request (same-repo) | yes | yes, if `air0` is online | no | no |
 | Pull request (from a fork) | **skipped — see Security** | **skipped — see Security** | no | no |
-| Push to `main` | yes | yes | **yes, only if the macOS tests passed** | **yes** |
-| `workflow_dispatch` | yes | yes | no | no |
+| Push to `main` | yes | yes, if `air0` is online | **yes**, if Fedora tests passed | **yes**, if macOS tests passed |
+| `workflow_dispatch` | yes | yes, if `air0` is online | no | no |
 
 On the Fedora nodes the runner service runs as `rdodge`, the same user as the desktop
 session, so the install step reaches that user's pipx venvs without sudo. On `air0` the
@@ -73,7 +83,7 @@ Windows and the AppImage are no longer built on this fork at all, and neither Py
 can fire. A fork-local change can break them without CI noticing. Before sending work
 upstream, re-enable the relevant workflow and run it once via `workflow_dispatch`.
 
-macOS is the exception: the `macos` job builds and unit-tests on `air0` (Apple Silicon) for
+macOS is the exception: the `verify-macos` job builds and unit-tests on `air0` (Apple Silicon) for
 every same-repo PR, so a Cython or `setuptools-rust` break that only shows on macOS is
 caught here. It is **non-gating** and it is not a substitute for upstream's `Build macOS
 decode` workflow — it proves the source builds and the unit tests pass on macOS, not that
@@ -95,7 +105,8 @@ on `wm`, `wf1` and `lws` — machines that hold client capture data.
 
 Two mitigations, both in place:
 
-1. The `verify` job carries a same-repo guard:
+1. The `preflight` and `verify-fedora` jobs each carry a same-repo guard (every other job
+   descends from one of them via `needs`, and `verify-macos` repeats it explicitly):
 
    ```yaml
    if: >-
@@ -181,9 +192,9 @@ The current baselines:
 
 | host | `baseline_extras` | declared in |
 |---|---|---|
-| `wm` | `intel,hifi_gui_qt6,cuda13,gnuradio,hifi_gnuradio,test` | `deploy` matrix |
-| `wf1`, `lws` | `intel,hifi_gui_qt6,cuda13` | `deploy` matrix |
-| `air0` | `hifi_gui_qt6,hifi_gnuradio` | `macos` job env (it deploys from there) |
+| `wm` | `intel,hifi_gui_qt6,cuda13,gnuradio,hifi_gnuradio,test` | `deploy-fedora` matrix |
+| `wf1`, `lws` | `intel,hifi_gui_qt6,cuda13` | `deploy-fedora` matrix |
+| `air0` | `hifi_gui_qt6,hifi_gnuradio` | `deploy-macos` matrix |
 
 The union is computed with a plain `tr`/`sed`/`awk` pipeline that dedupes while preserving
 order. The rejoin is `tr '\n' ','` + `sed 's/,$//'` rather than `paste -s`, deliberately, so
@@ -233,8 +244,8 @@ how their venv had originally been created:
 | `wf1`, `lws` | `uv = 0.12.2` | uv | failed |
 | `air0` | `uv = 0.12.2` | uv | would have failed the same way |
 
-`air0` joined the fleet deploy later (2026-08-31) and is **uv-backed too**, so the `macos`
-job sets `UV_VENV_CLEAR=1` for exactly the same reason — verified by running the real
+`air0` joined the fleet deploy later (2026-08-31) and is **uv-backed too**, so `deploy-macos`
+sets `UV_VENV_CLEAR=1` for exactly the same reason — verified by running the real
 `UV_VENV_CLEAR=1 pipx install --force "$HOME/Repos/vhs-decode[hifi_gui_qt6,hifi_gnuradio]"`
 on it by hand first, which succeeded (`vhs-decode 0.4.1.dev88`). Its pipx is Homebrew's
 1.16.6 on Python 3.14.6, not the Fedora nodes' 1.15.0/3.14.7, so the versions in the table
@@ -277,9 +288,9 @@ them. Identify both remotes by URL, never by name: remote names differ per machi
 
 ## `air0` — the macOS node
 
-Added 2026-08-31. `air0` is not in the `deploy` matrix — it builds, tests **and** installs
-itself in the single `macos` job, for the reason in "Why the macOS job tests and deploys
-together" below.
+Added 2026-08-31. `air0` has its own verify→deploy pair (`verify-macos`, `deploy-macos`),
+independent of the Fedora pair, plus a `preflight` job that skips both when the Air is
+offline.
 
 Runner labels are `self-hosted, macOS, ARM64, air0` (runner name `air-0`, in the `Default`
 pool). What differs from a Fedora node:
@@ -326,49 +337,68 @@ hand. If someone reports air0 behaving like an old build, check which of the two
 Should a future `.dmg` start installing CLI symlinks, it could begin shadowing the pipx
 shims — that would be silent, so re-check `command -v vhs-decode` after any `.dmg` install.
 
-## Offline nodes queue, they do not fail
+## Offline nodes: `lws` and `wf1` queue, `air0` is skipped
 
-`lws` is a laptop and `air0` is a MacBook Air; both are frequently offline. `wf1` is usually
-up. A job targeting an offline self-hosted runner does **not** fail — it queues, for up to 24
-hours, until that runner appears.
+A job targeting an offline self-hosted runner does **not** fail — it queues, for up to 24
+hours, until that runner appears. The fleet uses both behaviours, on purpose:
 
-That is deliberate: a queued leg means "this node self-updates the next time it is online".
-The cost is the run showing in-progress until then. `wm` gates the run; `wf1`, `lws` and
-`air0` are `continue-on-error: true`, so none of them can turn a merge red.
+- **`wf1` and `lws` queue.** They are legs of the `deploy-fedora` matrix, and a queued leg
+  means "this node self-updates the next time it is online" — which for a laptop is exactly
+  what we want. The cost is the run showing in-progress until then. Both are
+  `continue-on-error: true`; only `wm` can turn a merge red.
+- **`air0` is skipped instead**, by the `preflight` job. It is on its own stage, so it can
+  be skipped cleanly without leaving a run half-open for a day.
 
-### Why the macOS job tests and deploys together
+### The `preflight` job, and why it needs a GitHub App
 
-This is the one structural thing not to "tidy up" later. It looks like a layering violation
-— every other node has its tests in one job and its install in another — and it is not.
+There is no native way to skip a job whose runner is offline — the scheduler queues it. So
+`preflight` asks GitHub directly, and `verify-macos` carries
+`if: needs.preflight.outputs.air0_online == 'true'`.
 
-Two requirements pull against each other:
+`GITHUB_TOKEN` **cannot** answer that question. These runners are registered at the **org**
+level (the `Default` group); the repo-level runners endpoint lists only runners registered to
+the repository and returns an empty list here. Reading org runners needs
+`organization_self_hosted_runners: read`.
 
-1. **`air0` must not be deployed to when the macOS tests are failing.**
-2. **A sleeping Air must not stall the Linux fleet's deploy.**
+The **`gdh-ci-cd`** GitHub App holds exactly that permission. Both halves are org-level:
+`vars.GDH_APP_ID` (= 4105774) and `secrets.GDH_APP_PRIVATE_KEY`.
 
-The obvious implementation of (1) is a separate macOS deploy job with
-`needs: <macOS test job>`. That breaks (2): an offline self-hosted runner **queues rather
-than failing** (up to 24 hours), `needs` waits for the whole upstream job, and
-`continue-on-error` forgives failure but does nothing about queuing. One closed MacBook lid
-would then hold the run open for a day. Putting the gate on the Linux `deploy` job instead
-does not work either — `needs` cannot depend on a single matrix leg, so gating air0's leg
-would gate `wm`/`wf1`/`lws` too.
+> **Gotcha that cost a debugging round:** `GDH_APP_PRIVATE_KEY`'s org visibility was
+> `private`, meaning *private repos only* — and **this fork is public**, so
+> `secrets.GDH_APP_PRIVATE_KEY` silently resolved to an empty string here. It was changed to
+> `selected` with `vhs-decode` included on 2026-08-31. If the token step ever fails on an
+> empty private key, check that visibility before anything else.
 
-**Steps within a job stop at the first failure.** So placing the pipx steps *after* the test
-steps in one `macos` job gives requirement (1) for free, with no cross-job coordination and
-no expression to get subtly wrong: if the unit tests fail, the install steps never execute
-and air0 keeps its previous install. The deploy steps carry
-`if: github.event_name == 'push' && github.ref == 'refs/heads/main'` so PRs still only test.
+The probe matches on the **`air0` label**, not the runner's name (`air-0`), because the label
+is what `runs-on` selects on — renaming the runner would otherwise break scheduling while
+leaving this check green. Any failure to get an answer (bad token, API outage) is treated as
+*offline* and emits a `::warning::`: skipping macOS is the safe failure mode, and the warning
+is there because a silently-expired credential otherwise looks identical to a sleeping Mac.
 
-Requirement (2) holds because `deploy` does **not** list `macos` in its `needs`. The job also
-declares `needs: verify`, so air0 still refuses to install anything `wm`'s tests rejected.
+### Why `deploy-macos` gates on an output, not on `needs.verify-macos.result`
 
-This has been tried as a `verify` matrix leg and as a separate `verify-macos` job. Both were
-wrong for the reasons above; the git history has them.
+`verify-macos` is `continue-on-error: true` (a macOS failure must not turn a PR red). How a
+dependent job sees a *forgiven* failure through `needs.<job>.result` is subtle enough that
+betting a deploy on it is a bad trade. So `verify-macos` publishes an explicit output:
 
-If you want the matrix to skip offline hosts instead, it needs a preflight job that queries
-`orgs/GDH-Technologies/actions/runners` — which requires a PAT with `admin:org` read, since
-`GITHUB_TOKEN` cannot read org-level runners.
+```yaml
+outputs:
+  passed: ${{ steps.done.outputs.passed }}
+```
+
+set by a `Record success` step placed after the tests, which is only reachable when every
+prior step succeeded. `deploy-macos` requires `needs.verify-macos.outputs.passed == 'true'`.
+That is `'true'` or it is absent — there is no third reading, and it behaves correctly
+whichever way `result` reports. **Do not give that step an `if:`**, and do not "simplify" the
+gate to `result == 'success'`.
+
+### History
+
+This layout replaced two earlier shapes, both wrong: `air0` as a leg of the `verify` matrix,
+and a single `macos` job that tested and deployed in one. Both were contortions to avoid a
+sleeping Air stalling the Fedora deploy — a problem that simply does not exist once each
+platform has its own verify→deploy pair, since `deploy-fedora` then depends on nothing
+macOS-related. The git history has them.
 
 ## Reproducing a CI run by hand
 

@@ -100,27 +100,37 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
 - All 14 workflows inherited from upstream are **disabled as a repo setting**
   (`gh workflow disable`), not by editing files, so upstream merges stay conflict-free.
   That state is invisible in the tree; the doc above is the only record of it.
-- `.github/workflows/deploy-self-hosted.yml` is the only CI that runs. Build + unit tests
-  on `wm` for same-repo PRs and dispatches, plus a **non-gating** macOS build + unit-test
-  job on `air0`; a merge to `main` also pipx-reinstalls vhs-decode on `wm`, `wf1`, `lws`
-  and `air0`.
-- The `macos` job **tests and deploys air0 in one job**, unlike every other node. This looks
-  like a layering violation and is not — do not split it. air0 must not be deployed to when
-  its tests fail, but gating a separate macOS deploy job with `needs` would stall the Linux
-  fleet: an offline runner *queues* (up to 24h) rather than failing, `needs` waits on the
-  whole job, and `continue-on-error` forgives failure but not queuing. Since steps in a job
-  stop at the first failure, putting the pipx steps after the test steps gives that gate for
-  free. It also carries `needs: verify`, so air0 still won't install what `wm` rejected, and
-  `deploy` does **not** list `macos` in its `needs`, so a sleeping Air can't hold up
-  `wm`/`wf1`/`lws`. Tried as a `verify` matrix leg and as a separate `verify-macos` job
-  first; both were wrong.
-- **This fork is public** and the org runner group allows public repos, so the `verify` job
-  carries a same-repo guard (`head.repo.full_name == github.repository`) — without it any
+- `.github/workflows/deploy-self-hosted.yml` is the only CI that runs. Five jobs:
+  `preflight` (is air0 online?), then an independent verify→deploy pair per platform —
+  `verify-fedora`/`deploy-fedora` (`wm`, `wf1`, `lws`) and `verify-macos`/`deploy-macos`
+  (`air0`). Verify runs on same-repo PRs and dispatches; deploy only on a merge to `main`.
+- **The two platforms are independent.** Each deploys on its own build + tests; neither can
+  block or stall the other. A red `wm` does not stop a macOS deploy and vice versa. This is
+  the point of the layout — earlier shapes (air0 as a `verify` matrix leg; one `macos` job
+  that tested and deployed together) were contortions to stop a sleeping Air stalling the
+  Fedora deploy, a problem that vanishes once `deploy-fedora` depends on nothing macOS.
+- **`preflight` exists because an offline runner queues rather than failing** (up to 24h),
+  and there is no native "skip if the runner is offline". It asks GitHub whether a runner
+  labelled `air0` is online; `verify-macos` is `if:`-gated on that output. `GITHUB_TOKEN`
+  cannot answer — the runners are org-level, so it needs
+  `organization_self_hosted_runners: read`, held by the **gdh-ci-cd** App
+  (`vars.GDH_APP_ID` + `secrets.GDH_APP_PRIVATE_KEY`). That org secret was `private`
+  visibility (private repos only) and this fork is **public**, so it resolved to an empty
+  string until it was changed to `selected` on 2026-08-31 — check that first if the token
+  step ever fails. `wf1`/`lws` still queue rather than skip; that is deliberate for laptops.
+- **`deploy-macos` gates on `needs.verify-macos.outputs.passed == 'true'`, not on
+  `.result`** — `verify-macos` is `continue-on-error`, and how a dependent job sees a
+  forgiven failure is too subtle to bet a deploy on. The output is set by a `Record success`
+  step reachable only when everything before it passed. Do not give that step an `if:`, and
+  do not "simplify" the gate to `result == 'success'`.
+- **This fork is public** and the org runner group allows public repos, so `preflight` and
+  `verify-fedora` each carry a same-repo guard (every other job descends from one of them,
+  and `verify-macos` repeats it explicitly) (`head.repo.full_name == github.repository`) — without it any
   fork PR would run arbitrary code as `rdodge` on the fleet. MISRC-GUI's equivalent
   workflow has no such guard because that fork is private; do not copy between them
   without re-checking visibility. Fork-PR approval is set to `all_external_contributors`.
 - The deploy step installs the **union** of each node's existing pipx extras and a per-node
-  `baseline_extras` in the deploy matrix (changed 2026-08-31; it used to be "recorded extras
+  `baseline_extras` in the deploy matrices (changed 2026-08-31; it used to be "recorded extras
   win, seed only if none"). So **CI can add an extra fleet-wide and can never remove one** —
   which respects the extras-drift warning above while still letting CI push a new extra to a
   node that already has some. Dropping an extra is a manual `pipx install` on that node, and
