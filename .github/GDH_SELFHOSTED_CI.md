@@ -126,7 +126,10 @@ dependency looks absent. It is not. Without the submodule, six tests in `test_sy
 
 This is the "pre-existing pytest baseline of 4 failures + 3 errors" that `CLAUDE.md`
 records. It is not a baseline to be compared against — it is an uninitialized submodule.
-With `tests/data` checked out, `tests/unit` is **66 passed, 12 skipped, 0 failed**.
+With `tests/data` checked out, `tests/unit` is green. Counts observed in CI on 2026-08-31:
+**84 passed, 12 skipped, 0 failed** — identical on `wm` (Fedora/x86-64) and `air0`
+(macOS/arm64). The count grows as tests are added, so treat it as a snapshot and gate on
+green rather than on the number.
 
 The workflow initialises it explicitly rather than using `submodules: recursive`, which
 would also clone the `testdata` laserdisc submodule that nothing here reads:

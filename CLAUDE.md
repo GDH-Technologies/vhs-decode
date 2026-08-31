@@ -159,9 +159,10 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
   uninitialized submodule looks like. `tests/unit` reaches it through the `data_dir`
   fixture in `tests/conftest.py`, not a literal path, so grepping the tests for
   `tests/data` finds nothing and the dependency looks absent. Run
-  `git submodule update --init --depth 1 tests/data` and the suite is **66 passed,
-  12 skipped, 0 failed**. There is no baseline to compare failure sets against — gate on
-  green.
+  `git submodule update --init --depth 1 tests/data` and the suite is green — **84 passed,
+  12 skipped, 0 failed** as measured in CI on 2026-08-31, identical on `wm` (Fedora/x86-64)
+  and `air0` (macOS/arm64). That count rises as tests are added, so it is a snapshot, not a
+  contract. There is no baseline to compare failure sets against — gate on green.
 - Parked follow-ups: launch batching / `cp.fuse` for thread scaling, cupyx `filtfilt`
   gate for the Betamax fsc notch, HiFi pipeline unported.
 
