@@ -592,7 +592,19 @@ def main(args=None, use_gui=False):
         sys.exit(1)
 
     if not args.overwrite:
-        conflicts_ext = [".tbc", "_chroma.tbc", ".log", ".tbc.json"]
+        # Covers both naming conventions (.tbc/_chroma.tbc and the --orc
+        # .tbcy/.tbcc) plus the --write_db sidecar: leftovers from a prior
+        # run under EITHER convention would otherwise be silently mixed
+        # with (or clobbered under) the new run's outputs.
+        conflicts_ext = [
+            ".tbc",
+            "_chroma.tbc",
+            ".tbcy",
+            ".tbcc",
+            ".log",
+            ".tbc.json",
+            ".tbc.db",
+        ]
         conflicts = []
 
         for ext in conflicts_ext:
