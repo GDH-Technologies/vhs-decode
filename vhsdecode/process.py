@@ -175,11 +175,17 @@ class VHSDecode(ldd.LDdecode):
             num_worker_threads=self.numthreads,
         )
 
-        self._db_writer = DBWriter(fname_out) if extra_options.get("write_db") else None
+        resume = bool(extra_options.get("resume"))
+        self._db_writer = (
+            DBWriter(fname_out, resume=resume)
+            if extra_options.get("write_db")
+            else None
+        )
         self.dbconn = None
         if self._db_writer:
             self.dbconn = self._db_writer.db_connection
-            self.create_db_schema()
+            if not resume:
+                self.create_db_schema()
 
         # self._io_thread_pool = ThreadPoolExecutor(2)
 
@@ -187,15 +193,25 @@ class VHSDecode(ldd.LDdecode):
 
         self.fname_out = fname_out
 
+        # --resume: fields decoded at or before this sample are warm-up for
+        # sync/AGC re-lock and must not be written again (set by main once
+        # the resume plan is known).
+        self.resume_suppress_before_sample = None
+
+        # A resumed decode reopens the existing outputs for appending; main
+        # truncates them to the reconciled field count and seeks to the end
+        # before the loop starts. "wb" would destroy them at construction.
+        out_mode = "r+b" if resume else "wb"
+
         if fname_out is not None and self.rf.options.write_chroma:
             if extra_options.get("orc"):
-                self.outfile_video = open(fname_out + ".tbcy", "wb")
-                self.outfile_chroma = open(fname_out + ".tbcc", "wb")
+                self.outfile_video = open(fname_out + ".tbcy", out_mode)
+                self.outfile_chroma = open(fname_out + ".tbcc", out_mode)
             else:
-                self.outfile_video = open(fname_out + ".tbc", "wb")
-                self.outfile_chroma = open(fname_out + "_chroma.tbc", "wb")
+                self.outfile_video = open(fname_out + ".tbc", out_mode)
+                self.outfile_chroma = open(fname_out + "_chroma.tbc", out_mode)
         elif fname_out:
-            self.outfile_video = open(fname_out + ".tbc", "wb")
+            self.outfile_video = open(fname_out + ".tbc", out_mode)
 
         self.debug_plot = debug_plot
         self.field_order_action = field_order_action
@@ -235,6 +251,20 @@ class VHSDecode(ldd.LDdecode):
         """returns field information JSON and whether to duplicate or drop the field"""
         prevfi_1 = self.fieldinfo[-1] if len(self.fieldinfo) else None
         prevfi_2 = self.fieldinfo[-2] if len(self.fieldinfo) > 1 else None
+        if (
+            self.resume_suppress_before_sample is not None
+            and f.readloc is not None
+            and int(f.readloc) < self.resume_suppress_before_sample
+        ):
+            # Resume warm-up: this field sits BEFORE the seam, but the ring
+            # holds the fields just AFTER it (the seeded seam predecessors).
+            # Parity/continuity against them is meaningless -- the
+            # skipped-field compensation would misfire on every
+            # second-parity warm-up field. Treat warm-up like a fresh start;
+            # the first field at or past the seam checks against the true
+            # predecessors again.
+            prevfi_1 = None
+            prevfi_2 = None
 
         # Not calulated and used for tapes at the moment
         # bust_median = lddu.roundfloat(np.nan_to_num(f.burstmedian)) #lddu.roundfloat(f.burstmedian if not math.isnan(f.burstmedian) else 0.0)
@@ -386,6 +416,21 @@ class VHSDecode(ldd.LDdecode):
 
     def writeout(self, dataset):
         f, fi, (picturey, picturec), audio, efm = dataset
+
+        if self.resume_suppress_before_sample is not None:
+            file_loc = fi.get("fileLoc")
+            if file_loc is not None and file_loc < self.resume_suppress_before_sample:
+                # Warm-up field from before the resume seam: decoded only so
+                # sync/AGC re-lock on real signal; its data is already on
+                # disk from the interrupted run.
+                return
+            self.resume_suppress_before_sample = None
+            if not fi.get("isFirstField"):
+                ldd.logger.warning(
+                    "resume seam landed on a second field (fileLoc %s) -- "
+                    "field pairing may be off by one at the seam",
+                    file_loc,
+                )
 
         # Remove fields that are currently not used to cut down on space usage.
         # the qt tools will load them as 0 with the current code

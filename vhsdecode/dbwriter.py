@@ -6,8 +6,10 @@ from sqlite3 import Connection
 class DBWriter:
     """Class for unifying sqlite writing between cvbs and vhs. Currently doesn't store anything."""
 
-    def __init__(self, fname_out):
-        if os.path.exists(fname_out + ".tbc.db"):
+    def __init__(self, fname_out, resume=False):
+        # A fresh decode replaces any prior db; a resumed one continues it
+        # (main has already truncated it to the reconciled field count).
+        if not resume and os.path.exists(fname_out + ".tbc.db"):
             os.unlink(fname_out + ".tbc.db")
         self._db_connection = sqlite3.connect(fname_out + ".tbc.db")
 

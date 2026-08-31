@@ -18,6 +18,7 @@ import numpy
 import pyximport; pyximport.install(language_level=3, setup_args={'include_dirs': numpy.get_include()}, reload_support=True)  # noqa: E702
 # fmt: on
 
+import lddecode.tbc_db as tbc_db
 import lddecode.utils as lddu
 from lddecode.utils_logging import init_logging
 from vhsdecode.process import VHSDecode
@@ -164,6 +165,19 @@ def main(args=None, use_gui=False):
         action="store_true",
         default=False,
         help="Use new naming tbc file convention for decode orc (command name subject to change).",
+    )
+    parser.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Continue an interrupted decode in place. Requires the existing"
+            " outputs and their --write_db metadata db beside them; the"
+            " outputs are reconciled to the last complete frame and decoding"
+            " appends from there. Not compatible with --overwrite, -s or"
+            " --start_fileloc."
+        ),
     )
     luma_group = parser.add_argument_group("Luma decoding options")
     luma_group.add_argument(
@@ -591,7 +605,25 @@ def main(args=None, use_gui=False):
         )
         sys.exit(1)
 
-    if not args.overwrite:
+    if args.resume:
+        # Resume inverts the preflight: the prior run's outputs must exist,
+        # and the flags that would fight the resume seek are refused.
+        if args.overwrite:
+            print("ERROR: --resume and --overwrite are mutually exclusive")
+            sys.exit(1)
+        if args.start_fileloc != -1 or firstframe != 0:
+            print("ERROR: --resume locates its own start point; drop -s/--start_fileloc")
+            sys.exit(1)
+        if not args.write_db:
+            print("ERROR: --resume requires --write_db (the .tbc.db is the resume journal)")
+            sys.exit(1)
+        if not os.path.isfile(outname + ".tbc.db"):
+            print(f"ERROR: --resume found no {outname + '.tbc.db'} -- nothing to resume")
+            sys.exit(1)
+        if not (os.path.isfile(outname + ".tbc") or os.path.isfile(outname + ".tbcy")):
+            print(f"ERROR: --resume found no video TBC at {outname}.tbc/.tbcy")
+            sys.exit(1)
+    elif not args.overwrite:
         # Covers both naming conventions (.tbc/_chroma.tbc and the --orc
         # .tbcy/.tbcc) plus the --write_db sidecar: leftovers from a prior
         # run under EITHER convention would otherwise be silently mixed
@@ -625,6 +657,13 @@ def main(args=None, use_gui=False):
         # Needs to be set to 0 so the loader does not try to resample.
         # TODO: Fix this properly
         loader_input_freq = None
+    # NOTE for --resume: the loader is deliberately NOT switched. Reaching
+    # the resume point through the default LoadFFmpeg path is a linear
+    # read-and-discard (minutes on a deep resume) but delivers exactly the
+    # samples an uninterrupted decode would have seen -- measured
+    # byte-identical output. LoadLDF's container seek landed a constant
+    # ~184k samples off on kHz-headered RF FLACs, skewing every recorded
+    # fileLoc; until its seek is proven sample-exact, exactness wins.
 
     if not args.no_resample:
         sample_freq = 40
@@ -689,12 +728,16 @@ def main(args=None, use_gui=False):
     extra_options = get_extra_options(args, not use_gui)
     extra_options["params_file"] = args.params_file
     extra_options["orc"] = args.orc
+    extra_options["resume"] = args.resume
 
     # Wrap the LDdecode creation so that the signal handler is not taken by sub-threads,
     # allowing SIGINT/control-C's to be handled cleanly
     original_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        signal.signal(sigterm, signal.SIG_IGN)
 
-    logger = init_logging(outname + ".log", debug=args.debug)
+    logger = init_logging(outname + ".log", debug=args.debug, append=args.resume)
 
     tape_format = args.tape_format.upper()
     if tape_format not in supported_tape_formats:
@@ -804,8 +847,89 @@ def main(args=None, use_gui=False):
         logger.warning("Rust modules are compiled in debug mode! vhs-decode will run slower.")
 
     signal.signal(signal.SIGINT, original_sigint_handler)
+    if sigterm is not None:
+        # A service manager's stop (systemd, job runners) must flush the
+        # metadata exactly like Ctrl+C instead of dying with the JSON stale
+        # and the db mid-field.
+        def _sigterm_to_interrupt(signum, frame):
+            raise KeyboardInterrupt
 
-    if args.start_fileloc != -1:
+        signal.signal(sigterm, _sigterm_to_interrupt)
+
+    if args.resume:
+        video_path = vhsd.outfile_video.name
+        chroma_path = vhsd.outfile_chroma.name if vhsd.outfile_chroma else None
+        video_field_bytes = vhsd.outwidth * vhsd.output_lines * 2
+        chroma_field_bytes = video_field_bytes if chroma_path else None
+        db_path = outname + ".tbc.db"
+        try:
+            plan = tbc_db.plan_resume(
+                db_path,
+                video_bytes=os.path.getsize(video_path),
+                chroma_bytes=os.path.getsize(chroma_path) if chroma_path else None,
+                video_field_bytes=video_field_bytes,
+                chroma_field_bytes=chroma_field_bytes,
+            )
+            if plan.system != system:
+                raise tbc_db.ResumeError(
+                    f"prior decode was {plan.system}, this run is {system}"
+                    " -- matching system flags are required to resume"
+                )
+            tbc_db.apply_resume_truncation(
+                db_path,
+                plan,
+                video_path=video_path,
+                chroma_path=chroma_path,
+                video_field_bytes=video_field_bytes,
+                chroma_field_bytes=chroma_field_bytes,
+            )
+        except tbc_db.ResumeError as err:
+            logger.error("Cannot resume: %s", err)
+            vhsd.close()
+            sys.exit(1)
+
+        recovered = tbc_db.load_json_fields(outname + ".tbc.json", plan.field_count)
+        if recovered is None:
+            logger.warning(
+                "Legacy .tbc.json is missing or short; rebuilding minimal"
+                " field metadata from the .tbc.db"
+            )
+            recovered = tbc_db.minimal_fields_from_db(
+                db_path, plan.capture_id, plan.field_count
+            )
+        # One seed restores seqNo continuity, gives the seam its true
+        # predecessor fields for parity checks, and replays every prior
+        # field into the JSON dumper so the final .tbc.json is complete.
+        vhsd.fieldinfo.seed(recovered)
+        vhsd.fields_written = plan.field_count
+        vhsd.fields_written_offset = plan.field_count
+        vhsd.capture_id = plan.capture_id
+        # Warm-up fields (decoded before the seam for sync/AGC re-lock)
+        # are recognized by their absolute position, not counted -- the
+        # midpoint threshold tolerates block-aligned readloc jitter.
+        vhsd.resume_suppress_before_sample = (
+            plan.last_kept_sample + int(vhsd.bytes_per_field) // 2
+        )
+        # Anchor the chroma rotation cycle: the first decoded (warm-up)
+        # field takes the decoder counter position reconstructed from the
+        # stored phase IDs (not the raw index -- the counter drifts from the
+        # index on "readloc didn't advance" events), so the track-phase
+        # pairing continues the interrupted run's instead of being re-rolled
+        # at the seam.
+        vhsd.rf.resume_field_number_seed = plan.field_number_seed
+        vhsd.outfile_video.seek(0, os.SEEK_END)
+        if vhsd.outfile_chroma:
+            vhsd.outfile_chroma.seek(0, os.SEEK_END)
+        vhsd.roughseek(plan.seek_sample, False)
+        logger.info(
+            "Resuming: %d fields (%d frames) already decoded; seeking to"
+            " sample %d and re-locking over %d warm-up fields",
+            plan.field_count,
+            plan.field_count // 2,
+            plan.seek_sample,
+            plan.warmup_fields,
+        )
+    elif args.start_fileloc != -1:
         vhsd.roughseek(args.start_fileloc, False)
     else:
         vhsd.roughseek(firstframe * 2)
