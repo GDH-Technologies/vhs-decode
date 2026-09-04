@@ -58,12 +58,13 @@ class DemodCacheTape(DemodCache):
                     fftdata = block["fft"]
 
                 st = time.time()
-                output["demod"] = rf.demodblock(
-                    data=block["rawinput"],
-                    fftdata=fftdata,
-                    mtf_level=0,
-                    cut=True,
-                )
+                with rf.gpu_backend.stream():
+                    output["demod"] = rf.demodblock(
+                        data=block["rawinput"],
+                        fftdata=fftdata,
+                        mtf_level=0,
+                        cut=True,
+                    )
                 blockstime += time.time() - st
                 blocksrun += 1
 

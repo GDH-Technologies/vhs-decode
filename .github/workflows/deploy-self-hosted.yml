@@ -1,0 +1,636 @@
+# Fork-only CI for GDH-Technologies/vhs-decode.
+#
+# Every workflow inherited from oyvindln/vhs-decode is left byte-identical in the tree and
+# is DISABLED on this fork as a repository setting (`gh workflow disable`), not by editing
+# the files. Upstream churns .github/workflows constantly and we merge from it regularly,
+# so an edited workflow is a guaranteed conflict on every sync. Because a disable is
+# invisible in the working tree, it is written down in .github/GDH_SELFHOSTED_CI.md.
+#
+# This file is the only CI that runs on the fork, and it runs entirely on the org's own
+# capture fleet. A merge to main additionally pipx-reinstalls vhs-decode on every fleet
+# node, so the fleet's decode CLIs always match main.
+#
+# Four stages, one per platform, plus a small availability gate:
+#
+#   preflight       -- is air0 online? (10s, on wm)
+#   verify-fedora   -- build + unit tests on wm
+#   verify-macos    -- build + unit tests on air0      [skipped when air0 is offline]
+#   deploy-fedora   -- pipx install on wm, wf1, lws    [needs verify-fedora]
+#   deploy-macos    -- pipx install on air0            [needs verify-macos]
+#
+# The two platforms are INDEPENDENT by design: each deploys on the strength of its own
+# build and tests, and neither can block or stall the other. A red wm therefore does not
+# stop a macOS deploy, and vice versa.
+name: Self-hosted build and deploy (GDH fork)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # main only. A feature branch with an open PR is already covered by the pull_request
+  # event -- triggering on '**' as well would double every run, which is the exact noise
+  # this workflow was created to stop.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref. Two quick merges could otherwise race the pipx install and leave a node
+# holding a build from the older commit.
+concurrency:
+  group: selfhosted-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Check air0 availability
+    # SECURITY -- do not remove. This fork is PUBLIC and the org's Default runner group
+    # sets allows_public_repositories: true, so without this guard a pull_request from any
+    # fork would execute attacker-controlled code as rdodge on machines holding client
+    # capture data. Only PRs whose head branch lives in this repository may run; a fork PR
+    # shows as skipped and never reaches a runner.
+    #
+    # This job also handles a GitHub App private key, which is a second reason the guard
+    # must stay: secrets are withheld from fork PRs by GitHub, but do not rely on that
+    # alone.
+    #
+    # GDH-Technologies/MISRC-GUI's equivalent workflow has no such guard because that fork
+    # is private. Do not copy this file back and forth without re-checking visibility.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    # On wm rather than a GitHub-hosted runner, to keep every job in this workflow on org
+    # hardware. Consequence: wm must be up for the macOS jobs to be scheduled at all, and
+    # because a self-hosted runner takes one job at a time, this may wait for verify-fedora
+    # to finish before it runs.
+    runs-on: [self-hosted, Linux, X64, wm]
+    timeout-minutes: 5
+    outputs:
+      air0_online: ${{ steps.probe.outputs.air0_online }}
+    steps:
+      - name: Mint a token that can read the org's runners
+        id: app-token
+        # GITHUB_TOKEN cannot see these runners: they are registered at the ORG level (the
+        # Default group), and the repo-level runners endpoint only lists runners registered
+        # to the repository -- it returns an empty list here. Reading org runners needs
+        # `organization_self_hosted_runners: read`, which the gdh-ci-cd App
+        # (vars.GDH_APP_ID) holds.
+        #
+        # secrets.GDH_APP_PRIVATE_KEY is an ORG secret whose visibility was `private`, i.e.
+        # private repos only -- and this fork is public, so it resolved to an empty string
+        # here. It was changed to `selected` with vhs-decode included on 2026-08-31. If this
+        # step ever starts failing with an empty private key, check that visibility first.
+        #
+        # `client-id`, not the deprecated `app-id` -- the action warns on every run for the
+        # latter. Note they are different VALUES, not two spellings of one: vars.GDH_APP_ID
+        # is the numeric app id (4105774), vars.GDH_APP_CLIENT_ID is the Iv23li... string.
+        # Passing the app id under the client-id input would simply fail to authenticate.
+        #
+        # A Client ID is a public identifier, not a secret (GET /apps/gdh-ci-cd returns it
+        # unauthenticated); it is a `vars` entry rather than a `secrets` one for that reason.
+        # The private key is the secret half.
+        #
+        # The token is revoked automatically in a post step.
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.GDH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GDH_APP_PRIVATE_KEY }}
+          # Targets the org installation, so the token carries the App's org-level
+          # permissions rather than being scoped to this repository alone.
+          owner: ${{ github.repository_owner }}
+
+      - name: Is air0 online?
+        id: probe
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+        # Matches on the `air0` LABEL rather than the runner's name (`air-0`), because the
+        # label is what `runs-on` below actually selects on -- renaming the runner would
+        # otherwise silently break this check while leaving it green.
+        #
+        # Any failure to answer the question is treated as "offline", so a bad token or an
+        # API outage skips the macOS jobs rather than queueing them for 24h. It warns
+        # loudly, because that is also how a silently-expired credential would look.
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o "$RUNNER_TEMP/runners.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/orgs/$OWNER/actions/runners?per_page=100" || echo 000)"
+          if [ "$code" != "200" ]; then
+            echo "::warning::could not query the org's runners (HTTP $code); treating air0 as offline and skipping the macOS jobs"
+            online=false
+          else
+            online="$(python3 -c 'import json,sys; d=json.load(sys.stdin); rs=[r for r in (d.get("runners") or []) if any((l or {}).get("name")=="air0" for l in (r.get("labels") or []))]; print("true" if any(r.get("status")=="online" for r in rs) else "false")' < "$RUNNER_TEMP/runners.json" 2>/dev/null || echo false)"
+          fi
+          echo "air0 online: $online"
+          echo "air0_online=$online" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        env:
+          AIR0_ONLINE: ${{ steps.probe.outputs.air0_online }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Preflight"
+            echo
+            if [ "${AIR0_ONLINE:-}" = "true" ]; then
+              echo "- \`air0\`: online — the macOS jobs will run"
+            else
+              echo "- \`air0\`: offline — the macOS jobs are skipped this run"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===================================================================================
+  # 1. Build and test Fedora
+  # ===================================================================================
+  verify-fedora:
+    name: Build and test Fedora (wm)
+    # SECURITY -- see preflight. Do not remove.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, wm]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # setuptools_scm derives the version from upstream tags; a shallow checkout
+          # stamps 0.1.dev1+... instead of 0.4.x.devNN.
+          fetch-depth: 0
+          # Handled explicitly below -- `recursive` would also clone the `testdata`
+          # laserdisc submodule, which no test here reads.
+          submodules: false
+
+      - name: Fetch unit-test fixtures
+        # tests/unit reaches tests/data through the `data_dir` fixture in tests/conftest.py
+        # rather than a literal path, so grepping the tests for "tests/data" finds nothing
+        # and the dependency looks absent. Without this, six tests in test_sync.py and
+        # test_rust_math.py fail with FileNotFoundError on PAL_GOOD.txt.gz / hilbert_data.npz
+        # -- which is precisely the "pre-existing baseline" this repo's CLAUDE.md records.
+        # It is not a baseline; it is an uninitialized submodule.
+        run: git submodule update --init --depth 1 tests/data
+
+      - name: Put the Rust toolchain on PATH
+        # The runner is a systemd service with a minimal PATH; rustup installs cargo into
+        # ~/.cargo/bin. The vhsd_rust ext-module in pyproject.toml is not marked optional,
+        # so a missing cargo hard-fails the wheel build rather than degrading quietly.
+        run: |
+          set -euo pipefail
+          if [ -d "$HOME/.cargo/bin" ]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Build into a throwaway venv
+        # Deliberately NOT the fleet's pipx venv. A commit must never reach the installed
+        # CLIs before its tests pass; the deploy jobs are the only thing allowed to touch
+        # pipx.
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/venv"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/venv/bin/python" -m pip install ".[test]"
+
+      - name: Verify compiled extensions
+        # Run from /tmp so Python imports the *installed* package. Inside the workspace,
+        # cwd is on sys.path and the source tree -- plus any stale vhsd_rust*.so sitting at
+        # the repo root -- masks whether the build actually produced the extensions. This
+        # is the same trap CLAUDE.md documents for checking _HAS_VHSD_RUST by hand.
+        run: |
+          set -euo pipefail
+          cd /tmp
+          "$RUNNER_TEMP/venv/bin/python" -c "import vhsdecode.linear_filter, vhsdecode.sync; print('Cython OK')"
+          "$RUNNER_TEMP/venv/bin/python" -c "import vhsdecode.rust_utils as r; print('vhsd_rust present:', r._HAS_VHSD_RUST); raise SystemExit(0 if r._HAS_VHSD_RUST else 'vhsd_rust missing -- sosfiltfilt would fall back to scipy for both video and hifi decodes')"
+
+      - name: Run unit tests
+        # Via the repo's own runner script so this workflow does not become a second,
+        # drifting definition of "the unit tests". It reads GITHUB_WORKSPACE and invokes
+        # `python3 -m pytest`, hence sourcing the venv rather than calling its python
+        # directly. Integration tests are deliberately not run here: they decode real RF
+        # samples and take up to an hour.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source "$RUNNER_TEMP/venv/bin/activate"
+          cd /tmp
+          "$GITHUB_WORKSPACE/tests/run_unit.sh"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### Build and test Fedora (\`wm\`)"
+            echo
+            echo "- commit: \`${GITHUB_SHA:0:12}\`"
+            echo "- result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===================================================================================
+  # 2. Build and test macOS -- skipped entirely when air0 is offline
+  # ===================================================================================
+  verify-macos:
+    name: Build and test macOS (air0)
+    needs: preflight
+    # Two conditions. The same-repo SECURITY guard is repeated here rather than inherited
+    # from preflight: a skipped `needs` would skip this job anyway, but this is the guard
+    # that keeps arbitrary fork code off the fleet and it should be readable in place.
+    #
+    # The preflight output is what implements "skip when air0 is offline". Without it the
+    # job would not fail on an offline runner -- it would QUEUE, for up to 24 hours.
+    if: >-
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      needs.preflight.outputs.air0_online == 'true'
+    runs-on: [self-hosted, macOS, ARM64, air0]
+    # Non-gating: a macOS failure must not turn a PR or a merge red. It still blocks the
+    # macOS deploy below, via the `passed` output rather than via job status.
+    continue-on-error: true
+    # Higher than wm's 45: the Air is slower.
+    timeout-minutes: 60
+    outputs:
+      # Set ONLY by the "Record success" step, which is reached only when every step before
+      # it succeeded. deploy-macos gates on this rather than on needs.verify-macos.result,
+      # because this job is continue-on-error and the interaction between that and a
+      # dependent job's view of `result` is exactly the kind of subtlety that silently
+      # deploys a broken build. An explicit output is true or it is absent; there is no
+      # third reading.
+      passed: ${{ steps.done.outputs.passed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Fetch unit-test fixtures
+        # ~300 MB. See the note on the same step in verify-fedora.
+        run: git submodule update --init --depth 1 tests/data
+
+      - name: Put the Rust toolchain on PATH
+        # air0's cargo is Homebrew's (/opt/homebrew/bin/cargo), not rustup's -- there is no
+        # ~/.cargo/bin on that host. The runner is a launchd agent whose captured
+        # ~/actions-runner/.path already contains /opt/homebrew/bin, so this is
+        # belt-and-braces against a re-registration picking up a leaner environment.
+        run: |
+          set -euo pipefail
+          for d in "$HOME/.cargo/bin" /opt/homebrew/bin /opt/homebrew/sbin; do
+            if [ -d "$d" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+            fi
+          done
+
+      - name: Build into a throwaway venv
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/venv"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/venv/bin/python" -m pip install ".[test]"
+
+      - name: Verify compiled extensions
+        # From /tmp, for the sys.path reason documented in verify-fedora.
+        run: |
+          set -euo pipefail
+          cd /tmp
+          "$RUNNER_TEMP/venv/bin/python" -c "import vhsdecode.linear_filter, vhsdecode.sync; print('Cython OK')"
+          "$RUNNER_TEMP/venv/bin/python" -c "import vhsdecode.rust_utils as r; print('vhsd_rust present:', r._HAS_VHSD_RUST); raise SystemExit(0 if r._HAS_VHSD_RUST else 'vhsd_rust missing -- sosfiltfilt would fall back to scipy for both video and hifi decodes')"
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source "$RUNNER_TEMP/venv/bin/activate"
+          cd /tmp
+          "$GITHUB_WORKSPACE/tests/run_unit.sh"
+
+      - name: Record success
+        id: done
+        # Unreachable unless the build, the extension check and the unit tests all passed --
+        # that is the entire point. Do not give this step an `if:`.
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### Build and test macOS (\`air0\`)"
+            echo
+            echo "- commit: \`${GITHUB_SHA:0:12}\`"
+            echo "- result: \`${{ job.status }}\` (non-gating)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===================================================================================
+  # 3. Deploy to the Fedora hosts
+  # ===================================================================================
+  deploy-fedora:
+    name: Deploy Fedora (${{ matrix.host }})
+    # Fedora deploys on the strength of the Fedora build and tests alone. It deliberately
+    # does not depend on preflight or on anything macOS, so nothing about air0 -- asleep,
+    # unreachable, or failing -- can delay or block the Fedora fleet.
+    needs: verify-fedora
+    # Only a real merge to main installs. PRs and manual dispatches build and test but
+    # never touch a fleet node's installed CLIs.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        # `include` rather than a bare host list so each node can carry its own baseline
+        # extras.
+        include:
+          - host: wm
+            baseline_extras: intel,hifi_gui_qt6,cuda13,gnuradio,hifi_gnuradio,test
+          - host: wf1
+            baseline_extras: intel,hifi_gui_qt6,cuda13
+          - host: lws
+            baseline_extras: intel,hifi_gui_qt6,cuda13
+    runs-on: [self-hosted, Linux, X64, "${{ matrix.host }}"]
+    # wm is the machine that must always be current, so its leg gates the run. wf1 and lws
+    # are best-effort: lws is a laptop and is frequently offline, and a job targeting an
+    # offline runner does not fail -- it queues (up to 24h) until that runner appears. That
+    # is deliberate here: a queued leg means "this node self-updates the next time it is
+    # online", which for a laptop is the behaviour we want. The cost is the run showing
+    # in-progress until then.
+    #
+    # (air0 gets the preflight skip instead of queueing, because unlike wf1/lws it is on a
+    # separate stage whose whole point is to be skippable.)
+    continue-on-error: ${{ matrix.host != 'wm' }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # As above: setuptools_scm needs the tags to stamp 0.4.x.devNN.
+          fetch-depth: 0
+          # Deploy only builds and installs; nothing here reads the test fixtures.
+          submodules: false
+
+      - name: Put the Rust toolchain and pipx on PATH
+        run: |
+          set -euo pipefail
+          for d in "$HOME/.cargo/bin" "$HOME/.local/bin"; do
+            if [ -d "$d" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+            fi
+          done
+
+      - name: Resolve extras
+        id: extras
+        env:
+          BASELINE_EXTRAS: ${{ matrix.baseline_extras }}
+        # The installed spec is the UNION of what the node already records and the node's
+        # baseline_extras above. Union, specifically, rather than either one alone:
+        #
+        # - Not "baseline wins": CLAUDE.md records that extras drift between hosts and that
+        #   its own notes must not be trusted over live metadata. Imposing one spec would
+        #   silently strip an extra someone added by hand on a node.
+        # - Not "recorded wins" (the original behaviour): a node that already has extras
+        #   recorded could then never be given a new one from CI. That is exactly what
+        #   blocked adding gnuradio/hifi_gnuradio/test to wm, which already had
+        #   intel,hifi_gui_qt6,cuda13 recorded.
+        #
+        # So CI can ADD an extra to the fleet and can never REMOVE one. Dropping an extra is
+        # therefore a deliberate manual `pipx install` on that node -- CI will not do it.
+        #
+        # package_or_url looks like: /home/rdodge/Repos/vhs-decode[intel,hifi_gui_qt6,cuda13]
+        #
+        # The dedupe is a plain pipeline rather than a python heredoc so it stays readable.
+        # Every stage is POSIX and behaves identically under the BSD userland on air0, which
+        # runs the same logic in deploy-macos -- note the rejoin is `tr` + `sed` rather than
+        # `paste -s`, deliberately, to avoid depending on how a given paste(1) handles the
+        # `-` stdin operand.
+        run: |
+          set -euo pipefail
+          if ! command -v pipx >/dev/null 2>&1; then
+            echo "::error::pipx not found on ${{ matrix.host }}"
+            exit 1
+          fi
+          spec="$(pipx list --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_or_url") or "")' 2>/dev/null || true)"
+          recorded="$(printf '%s' "$spec" | sed -n 's/.*\[\(.*\)\]$/\1/p')"
+          extras="$(printf '%s,%s' "$recorded" "$BASELINE_EXTRAS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed '/^$/d' \
+            | awk '!seen[$0]++' \
+            | tr '\n' ',' \
+            | sed 's/,$//')"
+          echo "${{ matrix.host }}: recorded='${recorded:-none}' baseline='$BASELINE_EXTRAS' -> installing '${extras:-none}'"
+          echo "extras=$extras" >> "$GITHUB_OUTPUT"
+
+      - name: Install with pipx
+        id: install
+        # Installed from the runner workspace, NOT ~/Repos/vhs-decode. A regular (non
+        # -editable) install copies the source into the venv, so nothing depends on this
+        # path surviving -- and CI must never hard-reset a repo directory the user edits by
+        # hand. Note this rewrites the node's pipx package_or_url to the runner workspace.
+        #
+        # Regular install is also required, not incidental: `pipx install -e` never builds
+        # vhsd_rust at all, which silently drops every decode on the node to the scipy
+        # sosfiltfilt fallback. See CLAUDE.md.
+        env:
+          EXTRAS: ${{ steps.extras.outputs.extras }}
+          # Required on uv-backed nodes -- this is what broke the first fleet deploy on wf1
+          # and lws while wm succeeded. air0 is uv-backed too, so deploy-macos sets it as
+          # well.
+          #
+          # `pipx install --force` does NOT delete an existing venv. On an existing install
+          # it prints "Installing to existing venv", prepends --force-reinstall to the pip
+          # args (pipx/commands/install.py:100) and then calls create_venv() on the
+          # directory that is already there. With the pip backend that is harmless --
+          # `python -m venv` reuses a populated directory. With the uv backend,
+          # UvBackend.create_venv runs `uv venv <root>` with no --clear, and uv refuses to
+          # write into a directory that already holds a venv. The install then raises, and
+          # the except branch's venv.remove_venv() declines to clean up because
+          # safe_to_remove() is false for a pre-existing venv -- hence the confusing
+          # "Not removing existing venv ... not created in this session".
+          #
+          # Which backend is used is NOT a per-run choice: resolve_backend_name()'s
+          # precedence is cli > metadata > env > auto, and `metadata` is the backend
+          # recorded in the venv already on disk. wm's venv was pip-backed so it kept
+          # working; wf1's, lws's and air0's are uv-backed. Passing --backend pip does not
+          # help -- pipx will not retarget an existing venv (verified).
+          #
+          # UV_VENV_CLEAR is uv's own documented remedy (it is the hint uv prints on this
+          # exact error) and passes through, since pipx only overrides VIRTUAL_ENV and
+          # UV_NO_PROGRESS. It is inert on pip-backed nodes, and unlike uninstall-then-
+          # install it leaves each node's recorded backend alone.
+          UV_VENV_CLEAR: "1"
+        # The bracket suffix is built conditionally: with no extras resolved the spec must
+        # be a bare path, since `pipx install "/path[]"` is not a valid requirement.
+        run: |
+          set -euo pipefail
+          if [ -n "$EXTRAS" ]; then
+            target="${GITHUB_WORKSPACE}[${EXTRAS}]"
+          else
+            target="${GITHUB_WORKSPACE}"
+          fi
+          pipx install --force "$target"
+          version="$(pipx list --json | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_version") or "unknown")')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "installed vhs_decode $version on ${{ matrix.host }}"
+
+      - name: Verify install
+        # From /tmp, for the sys.path reason above, and against the pipx venv's own
+        # interpreter rather than whatever `python3` resolves to.
+        run: |
+          set -euo pipefail
+          venvs="$(pipx environment --value PIPX_LOCAL_VENVS)"
+          py="$venvs/vhs-decode/bin/python"
+          test -x "$py" || { echo "::error::pipx venv interpreter missing at $py"; exit 1; }
+          cd /tmp
+          "$py" -c "import vhsdecode.linear_filter, vhsdecode.sync; print('Cython OK')"
+          "$py" -c "import vhsdecode.rust_utils as r; print('vhsd_rust present:', r._HAS_VHSD_RUST); raise SystemExit(0 if r._HAS_VHSD_RUST else 'vhsd_rust missing -- this node would silently take the scipy sosfiltfilt fallback')"
+          command -v vhs-decode >/dev/null || { echo "::error::vhs-decode not on PATH after install"; exit 1; }
+
+      - name: Summary
+        if: always()
+        env:
+          INSTALLED_VERSION: ${{ steps.install.outputs.version }}
+          EXTRAS: ${{ steps.extras.outputs.extras }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Deployed to \`${{ matrix.host }}\`"
+            echo
+            echo "- version: \`${INSTALLED_VERSION:-n/a}\`"
+            echo "- extras: \`${EXTRAS:-n/a}\`"
+            echo "- result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===================================================================================
+  # 4. Deploy to the macOS hosts
+  # ===================================================================================
+  deploy-macos:
+    name: Deploy macOS (${{ matrix.host }})
+    needs: verify-macos
+    # Gated on the explicit `passed` output, NOT on needs.verify-macos.result: verify-macos
+    # is continue-on-error, and a dependent job's view of a forgiven failure is subtle
+    # enough that relying on it risks deploying a build whose tests just failed. The output
+    # is set by a step that is only reachable when every prior step succeeded, so it is
+    # 'true' or it is absent.
+    #
+    # This also gives the offline behaviour for free: an offline air0 skips verify-macos,
+    # a skipped `needs` skips this job, and the Fedora fleet -- which depends on neither --
+    # deploys regardless.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.verify-macos.outputs.passed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # A matrix of one, kept in this shape so a second Mac is a one-line addition. Note
+        # the preflight above checks air0 specifically; another Mac would need its own
+        # availability check.
+        include:
+          - host: air0
+            # macOS/Apple Silicon cannot take the Fedora spec: intel-cmplr-lib-rt and icc_rt
+            # publish no macOS wheels at all (and no sdist to fall back on), and
+            # cupy-cuda13x is NVIDIA-only. PyQt6 ships macosx_10_14_universal2 and pyzmq
+            # ships macosx_11_0_arm64, so these two are the viable set. Verified by a manual
+            # `pipx install` on air0 before this was added.
+            baseline_extras: hifi_gui_qt6,hifi_gnuradio
+    runs-on: [self-hosted, macOS, ARM64, "${{ matrix.host }}"]
+    # Best-effort, like wf1/lws. Only wm can turn a merge red.
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Put the Rust toolchain and pipx on PATH
+        # air0's cargo, pipx and python3 are all Homebrew's under /opt/homebrew/bin -- there
+        # is no ~/.cargo/bin on that host. ~/.local/bin holds the pipx shims.
+        run: |
+          set -euo pipefail
+          for d in "$HOME/.cargo/bin" "$HOME/.local/bin" /opt/homebrew/bin /opt/homebrew/sbin; do
+            if [ -d "$d" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+            fi
+          done
+
+      - name: Resolve extras
+        id: extras
+        env:
+          BASELINE_EXTRAS: ${{ matrix.baseline_extras }}
+        # Identical logic to deploy-fedora's step of the same name -- see the long rationale
+        # there for why this is a UNION rather than either side alone. Keep the two in sync.
+        run: |
+          set -euo pipefail
+          if ! command -v pipx >/dev/null 2>&1; then
+            echo "::error::pipx not found on ${{ matrix.host }}"
+            exit 1
+          fi
+          spec="$(pipx list --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_or_url") or "")' 2>/dev/null || true)"
+          recorded="$(printf '%s' "$spec" | sed -n 's/.*\[\(.*\)\]$/\1/p')"
+          extras="$(printf '%s,%s' "$recorded" "$BASELINE_EXTRAS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed '/^$/d' \
+            | awk '!seen[$0]++' \
+            | tr '\n' ',' \
+            | sed 's/,$//')"
+          echo "${{ matrix.host }}: recorded='${recorded:-none}' baseline='$BASELINE_EXTRAS' -> installing '${extras:-none}'"
+          echo "extras=$extras" >> "$GITHUB_OUTPUT"
+
+      - name: Install with pipx
+        id: install
+        env:
+          EXTRAS: ${{ steps.extras.outputs.extras }}
+          # air0's venv is uv-backed (its pyvenv.cfg carries `uv = 0.12.2`), so it needs
+          # this for exactly the reason wf1/lws do -- see the full explanation on
+          # deploy-fedora's install step.
+          UV_VENV_CLEAR: "1"
+        run: |
+          set -euo pipefail
+          if [ -n "$EXTRAS" ]; then
+            target="${GITHUB_WORKSPACE}[${EXTRAS}]"
+          else
+            target="${GITHUB_WORKSPACE}"
+          fi
+          pipx install --force "$target"
+          version="$(pipx list --json | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("venvs") or {}).get("vhs-decode") or {}; print(((v.get("metadata") or {}).get("main_package") or {}).get("package_version") or "unknown")')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "installed vhs_decode $version on ${{ matrix.host }}"
+
+      - name: Verify install
+        # PIPX_LOCAL_VENVS on air0 is "~/Library/Application Support/pipx/venvs" -- it
+        # contains a space, so every expansion of it has to stay quoted.
+        #
+        # The PATH check also guards against /Applications/decode.app (the upstream prebuilt
+        # .dmg, installed on this host) ever starting to ship CLI symlinks and shadowing the
+        # pipx shims. Today it exports nothing onto PATH.
+        run: |
+          set -euo pipefail
+          venvs="$(pipx environment --value PIPX_LOCAL_VENVS)"
+          py="$venvs/vhs-decode/bin/python"
+          test -x "$py" || { echo "::error::pipx venv interpreter missing at $py"; exit 1; }
+          cd /tmp
+          "$py" -c "import vhsdecode.linear_filter, vhsdecode.sync; print('Cython OK')"
+          "$py" -c "import vhsdecode.rust_utils as r; print('vhsd_rust present:', r._HAS_VHSD_RUST); raise SystemExit(0 if r._HAS_VHSD_RUST else 'vhsd_rust missing -- this node would silently take the scipy sosfiltfilt fallback')"
+          shim="$(command -v vhs-decode || true)"
+          test -n "$shim" || { echo "::error::vhs-decode not on PATH after install"; exit 1; }
+          echo "vhs-decode resolves to $shim"
+
+      - name: Summary
+        if: always()
+        env:
+          INSTALLED_VERSION: ${{ steps.install.outputs.version }}
+          EXTRAS: ${{ steps.extras.outputs.extras }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Deployed to \`${{ matrix.host }}\`"
+            echo
+            echo "- version: \`${INSTALLED_VERSION:-n/a}\`"
+            echo "- extras: \`${EXTRAS:-n/a}\`"
+            echo "- result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

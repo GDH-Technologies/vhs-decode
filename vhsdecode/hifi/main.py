@@ -875,6 +875,50 @@ class AsyncSoundFileReader(sf.SoundFile):
         return values_read
 
 
+_FLAC_SUBTYPE_BYTES = {"PCM_S8": 1, "PCM_U8": 1, "PCM_16": 2, "PCM_24": 3, "PCM_32": 4, "FLOAT": 4, "DOUBLE": 8}
+
+#: STREAMINFO total_samples is a 36-bit field, so any count at or above this is
+#: not a real length -- either the writer overflowed it (and stored 0) or the
+#: reader is reporting its own "unknown" sentinel (libsndfile uses SF_COUNT_MAX).
+_FLAC_MAX_TOTAL_SAMPLES = 1 << 36
+
+
+def flac_frame_count_mismatch(reader, path):
+    """Return why the FLAC header frame count is implausible, or None if it looks sane.
+
+    Some writers corrupt STREAMINFO total_samples (misrc_tools scaled it /1000 to
+    match its kHz-stored sample rate; counts past 2^36 also wrap the 36-bit field).
+    libsndfile trusts the header and stops reading there, silently truncating the
+    decode. A valid FLAC never compresses to less than roughly half the decoded PCM
+    size, so a header count far below that is bogus; frames == 0 means "unknown
+    length" per the spec. Either way the ffmpeg reader, which reads to actual EOF,
+    is the safe path.
+
+    STREAMINFO stores total_samples in 36 bits, so a real count never reaches
+    2^36 -- at 40 MSps that caps an honest header at ~28.6 minutes, and every
+    longer RF capture is written with the "unknown length" value of 0. Do NOT
+    test that case with ``frames <= 0``: libsndfile surfaces an unknown length
+    as SF_COUNT_MAX (2^63-1), not 0, so a bare ``<= 0`` check sails past it,
+    keeps the libsndfile reader, and the decode dies near EOF with "Internal
+    psf_fseek() failed" -- which the block reader swallows as a short read,
+    truncating the tail while still exiting 0.
+    """
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        return None
+    if reader.frames <= 0 or reader.frames >= _FLAC_MAX_TOTAL_SAMPLES:
+        return f"FLAC header reports unknown length (frames={reader.frames})"
+    bytes_per_sample = _FLAC_SUBTYPE_BYTES.get(reader.subtype, 2)
+    decoded_bytes = reader.frames * reader.channels * bytes_per_sample
+    if decoded_bytes < file_size / 2:
+        return (
+            f"FLAC header claims {reader.frames} frames (~{decoded_bytes} bytes decoded) "
+            f"but the file is {file_size} bytes; the header sample count is corrupt"
+        )
+    return None
+
+
 def as_soundfile(pathR, input_format_override: np.dtype = None):
     extension = pathR.lower().rsplit(".", 1)[-1]
     extension_with_endian = extension.replace("16", "16le").replace("32", "32le")
@@ -895,22 +939,33 @@ def as_soundfile(pathR, input_format_override: np.dtype = None):
             input_format
         )
     elif "flac" == extension:
+        reader = None
+        fallback_reason = None
         try:
-            return AsyncSoundFileReader(
+            reader = AsyncSoundFileReader(
                 pathR,
                 input_format
             )
+            fallback_reason = flac_frame_count_mismatch(reader, pathR)
         except sf.LibsndfileError as e:
-            print(f"WARN: libsndfile could not open this FLAC file: {e}")
-            if test_if_ffmpeg_is_installed():
-                return AsyncReader(
-                    FFMpegFileReader(pathR),
-                    input_format
-                )
-            else:
-                print(
-                    "ERROR: ffmpeg is not installed (or not in PATH), cannot decode this FLAC bit depth."
-                )
+            fallback_reason = f"libsndfile could not open this FLAC file: {e}"
+
+        if fallback_reason is None:
+            return reader
+
+        if reader is not None:
+            reader.close()
+        print(f"WARN: {fallback_reason}")
+        if test_if_ffmpeg_is_installed():
+            print("WARN: reading this FLAC file with ffmpeg (to actual EOF) instead of libsndfile")
+            return AsyncReader(
+                FFMpegFileReader(pathR),
+                input_format
+            )
+        else:
+            print(
+                "ERROR: ffmpeg is not installed (or not in PATH), cannot decode this FLAC file."
+            )
     elif "ldf" == extension:
         try:
             for ldf_reader_tool in ("ld-ldf-reader", "ld-ldf-reader-py"):
@@ -1703,6 +1758,16 @@ async def decode_parallel(
     dt_string = elapsed_time.total_seconds()
     print(f"\nDecode finished, seconds elapsed: {round(dt_string)}")
 
+    # A peak gain of exactly zero means not one sample of audio made it through,
+    # which is never a real decode - it means the decoder workers died (their
+    # tracebacks scroll past during init) or no carrier was ever locked. Reporting
+    # success here hands downstream automation a silent file that looks valid.
+    if max(peak_gain.left, peak_gain.right) == 0:
+        raise RuntimeError(
+            "Decode produced no audio (peak gain 0%). The decoder workers most "
+            "likely failed - check above for worker tracebacks."
+        )
+
 async def normalize(input_file_post_gain, output_file, peak_gain, channels, audio_rate):
     try:
         total_frames_read = 0
@@ -1741,10 +1806,29 @@ def guess_bias(decoder, input_file, block_size, blocks_limits=10):
     blocks = list()
 
     with as_soundfile(input_file) as f:
-        while f.tell() < f.frames and len(blocks) <= blocks_limits:
+        # Some reader backends (for example AsyncReader) do not expose tell().
+        # Track consumed frames ourselves so this works uniformly across all
+        # as_soundfile() return types.
+        frames_read_total = 0
+        while len(blocks) <= blocks_limits:
+            # Guard against known-length inputs before attempting another read.
+            if f.frames and frames_read_total >= f.frames:
+                break
+
             block_buffer = np.empty(block_size, dtype=f.dtype, order="C")
-            f.buffer_read_into_sync(block_buffer)
+            frames_read = f.buffer_read_into_sync(block_buffer)
+
+            # A non-positive read indicates EOF (or failed read); stop sampling.
+            if frames_read <= 0:
+                break
+
+            # Keep only valid samples from the final short read so bias
+            # estimation never consumes uninitialized tail data.
+            if frames_read < len(block_buffer):
+                block_buffer = block_buffer[0:frames_read]
+
             blocks.append(block_buffer)
+            frames_read_total += frames_read
 
     decoder.guessBiases(blocks)
     print("\ndone!")
@@ -1755,15 +1839,12 @@ def run_decoder(args, decode_options, ui_t: Optional[AppWindow] = None):
 
     if sample_freq is not None:
         with ThreadPoolExecutor(4) as async_executor:
-            # work around for Windows not creating an event loop for the main thread
+            # Python 3.14 can raise here when no loop is set for main thread.
             try:
                 loop = asyncio.get_event_loop()
-            except RuntimeError as e:
-                if str(e).startswith('There is no current event loop in thread'):
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                else:
-                    raise
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
 
             loop.set_default_executor(async_executor)
             loop.run_until_complete(

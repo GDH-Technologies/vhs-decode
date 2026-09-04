@@ -3,7 +3,7 @@ import sys
 import os
 
 
-def init_logging(outfile_name, columns=80, append=False):
+def init_logging(outfile_name, columns=80, debug=False, append=False):
     """ Sets up a logger with a logfile, status line, and stderr output.
 
     ``append=True`` keeps an existing logfile (a resumed decode continues
@@ -13,7 +13,8 @@ def init_logging(outfile_name, columns=80, append=False):
     statusWritten = False
 
     logger = logging.getLogger("lddecode")
-    logger.setLevel(logging.DEBUG)
+    log_level = logging.DEBUG if debug else logging.INFO
+    logger.setLevel(log_level)
 
     class StreamHandlerR(logging.StreamHandler):
         def __init__(self):
@@ -31,7 +32,7 @@ def init_logging(outfile_name, columns=80, append=False):
                 super().emit(record)
 
     logger_stderr = StreamHandlerR()
-    logger_stderr.setLevel(logging.INFO)
+    logger_stderr.setLevel(log_level)
 
     logger.addHandler(logger_stderr)
 
@@ -44,7 +45,7 @@ def init_logging(outfile_name, columns=80, append=False):
                 pass
 
         logger_file = logging.FileHandler(outfile_name)
-        logger_file.setLevel(logging.DEBUG)
+        logger_file.setLevel(log_level)
 
         logger_fileformatter = logging.Formatter(
             "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

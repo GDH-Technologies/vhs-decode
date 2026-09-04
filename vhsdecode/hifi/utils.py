@@ -224,6 +224,13 @@ class NUMA:
                 os.sched_setaffinity(0, cpus)
 
             mask = cls._libnuma.numa_allocate_nodemask()
+            if not mask:
+                # NULL on allocation failure. Handing that to the bitmask
+                # helpers dereferences NULL inside libnuma -- a segfault
+                # `except Exception` cannot catch, the same class of bug the
+                # explicit restypes above exist to prevent.
+                return False
+
             try:
                 cls._libnuma.numa_bitmask_clearall(mask)
                 cls._libnuma.numa_bitmask_setbit(mask, node)

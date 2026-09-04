@@ -1,7 +1,13 @@
 from numba import njit
 import numpy as np
+import lddecode.utils as lddu
 
-import vhsd_rust
+try:
+    import vhsd_rust
+
+    _HAS_VHSD_RUST = True
+except Exception:
+    _HAS_VHSD_RUST = False
 
 
 @njit(cache=True, nogil=True)
@@ -40,4 +46,6 @@ def smooth_spikes(demod, max_value):
 
 def unwrap_hilbert(hilbert, freq_hz):
     # return hilbert_test.unwrap_hilbert(hilbert, freq_hz)
-    return vhsd_rust.unwrap_hilbert(hilbert, freq_hz)
+    if _HAS_VHSD_RUST:
+        return vhsd_rust.unwrap_hilbert(hilbert, freq_hz)
+    return lddu.unwrap_hilbert(hilbert, freq_hz)

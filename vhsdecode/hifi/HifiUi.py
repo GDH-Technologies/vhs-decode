@@ -32,6 +32,11 @@ try:
         QGridLayout,
     )
     from PyQt6 import QtGui, QtCore
+    import matplotlib
+
+    matplotlib.use("QtAgg")  # Must come before importing pyplot; QtAgg supports PyQt6
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 except ImportError:
     from PyQt5.QtGui import QIcon
     from PyQt5.QtWidgets import (
@@ -55,6 +60,13 @@ except ImportError:
         QGridLayout,
     )
     from PyQt5 import QtGui, QtCore
+    import matplotlib
+
+    matplotlib.use("Qt5Agg")  # Must come before importing pyplot
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+
+import matplotlib.pyplot as plt
 
 from vhsdecode.hifi.constants import (
     DEFAULT_8MM_AUDIO_MODE,
@@ -262,6 +274,7 @@ def decode_options_to_ui_parameters(decode_options):
 def ui_parameters_to_decode_options(values: MainUIParameters):
     decode_options = {
         "input_rate": float(values.input_sample_rate) * 1e6,
+        "input_format_override": None,
         "standard": "p" if values.standard == "PAL" else "n",
         "format": "vhs" if values.format == "VHS" else "8mm",
         "demod_type": values.demod_type.lower(),
