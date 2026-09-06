@@ -2,9 +2,11 @@ import sqlite3
 import os
 from sqlite3 import Connection
 
+import lddecode.tbc_db as tbc_db
+
 
 class DBWriter:
-    """Class for unifying sqlite writing between cvbs and vhs. Currently doesn't store anything."""
+    """Class for unifying sqlite writing between cvbs and vhs."""
 
     def __init__(self, fname_out, resume=False):
         # A fresh decode replaces any prior db; a resumed one continues it
@@ -12,6 +14,10 @@ class DBWriter:
         if not resume and os.path.exists(fname_out + ".tbc.db"):
             os.unlink(fname_out + ".tbc.db")
         self._db_connection = sqlite3.connect(fname_out + ".tbc.db")
+        if resume:
+            # The interrupted run may predate schema v2: add what is missing
+            # so the per-field inserts below have their tables.
+            tbc_db.migrate_schema(self._db_connection)
 
     @property
     def db_connection(self) -> Connection:
@@ -59,6 +65,15 @@ class DBWriter:
             (capture_id, field_id, w_snr, b_psnr),
         )
 
+        # Per-field picture metrics (schema v2); absent members are NULL,
+        # and a field without any finite metric gets no row.
+        metrics = field_data.get("pictureMetrics")
+        if metrics:
+            self._db_connection.execute(
+                tbc_db.PICTURE_METRICS_INSERT_SQL,
+                tbc_db.picture_metrics_row(capture_id, field_id, metrics),
+            )
+
         # Insert VBI data if present
         vbi_data = field_data.get("vbi", {}).get("vbiData", [])
         if vbi_data:
@@ -95,3 +110,17 @@ class DBWriter:
             )
         # Skip committing for now it's called again afterwards in build_sqlite_metadata
         # db_connection.commit()
+
+    def write_events(self, rows):
+        """Append decoder_event rows (``DecoderEventLog.to_db_rows`` tuples).
+
+        Called before the per-field commit so an event lands in the same
+        transaction as the field it precedes; the caller commits.
+        """
+        if rows:
+            self._db_connection.executemany(tbc_db.DECODER_EVENT_INSERT_SQL, rows)
+
+    def write_segments(self, capture_id, segments):
+        """Replace the capture's segment rows (used when --resume re-seeds them)."""
+        tbc_db.write_segments(self._db_connection, capture_id, segments)
+        self._db_connection.commit()

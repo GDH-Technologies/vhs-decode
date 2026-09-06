@@ -24,7 +24,14 @@ from scipy import interpolate
 # internal libraries
 
 from . import efm_pll
-from .tbc_db import DECODER_LD, SCHEMA_SQL, db_system_value
+from .tbc_db import (
+    DECODER_EVENT_INSERT_SQL,
+    DECODER_LD,
+    PICTURE_METRICS_INSERT_SQL,
+    SCHEMA_SQL,
+    db_system_value,
+    picture_metrics_row,
+)
 from .utils import ac3_pipe, ldf_pipe, traceback
 from .utils import nb_mean, nb_median, nb_round, nb_min, nb_max, nb_abs, nb_absmax, n_orgt
 from .utils import polar2z, sqsum, genwave, dsa_rescale_and_clip, scale, scale_field, rms
@@ -3870,6 +3877,12 @@ class LDdecode:
                 ) VALUES (?, ?, ?, ?)''',
                 (c_id, f_id, w_snr, b_psnr))
 
+        # Per-field picture metrics (schema v2); NULL for absent members.
+        if pictureMetrics := fi.get('pictureMetrics'):
+            self.dbconn.execute(
+                PICTURE_METRICS_INSERT_SQL,
+                picture_metrics_row(c_id, f_id, pictureMetrics))
+
         # Insert VBI data if present
         vbi_data = fi.get("vbi", {}).get("vbiData", [])
         if vbi_data:
@@ -4735,13 +4748,17 @@ class LDdecode:
             vp["numberOfSequentialFields"],
             vp["colourBurstStart"],
             vp["colourBurstEnd"],
-            vp["white16bIre"],
-            vp["black16bIre"],
-            vp["blanking16bIre"],
+            # INTEGER columns; the JSON keeps the floats (VHS scales them by
+            # level_adjust) and every reader rounds them the same way.
+            int(round(vp["white16bIre"])),
+            int(round(vp["black16bIre"])),
+            int(round(vp["blanking16bIre"])),
             # is_mapped, is_subcarrier_locked, is_widescreen
             0, vp["system"] == "NTSC", 0,
+            # The rate fileLoc counts in (schema v2).
+            vp.get("rfSourceSampleRateHz"),
         )
-        
+
 
         # Prepare PCM Audio data tuple
         pcm_values = (
@@ -4761,7 +4778,8 @@ class LDdecode:
                     field_width=?, field_height=?, number_of_sequential_fields=?, 
                     colour_burst_start=?, colour_burst_end=?, 
                     white_16b_ire=?, black_16b_ire=?, blanking_16b_ire=?,
-                    is_mapped=?, is_subcarrier_locked=?, is_widescreen=?
+                    is_mapped=?, is_subcarrier_locked=?, is_widescreen=?,
+                    rf_source_sample_rate_hz=?
                 WHERE capture_id = ?
             """, video_values + (self.capture_id,))
 
@@ -4781,8 +4799,9 @@ class LDdecode:
                     field_width, field_height, number_of_sequential_fields, 
                     colour_burst_start, colour_burst_end, 
                     white_16b_ire, black_16b_ire, blanking_16b_ire,
-                    is_mapped, is_subcarrier_locked, is_widescreen
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_mapped, is_subcarrier_locked, is_widescreen,
+                    rf_source_sample_rate_hz
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, video_values)
 
             self.capture_id = cursor.lastrowid
