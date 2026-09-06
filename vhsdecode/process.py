@@ -162,6 +162,8 @@ class VHSDecode(ldd.LDdecode):
         # Store reference to ourself in the rf decoder - needed to access data location for track
         # phase, may want to do this in a better way later.
         self.rf.decoder = self
+        # The event log's nominal samples per field follows the replaced rf.
+        self._sync_event_rate()
         self.FieldClass = field_class_from_formats(system, tape_format)
 
         # Restore init functino now that superclass constructor is finished.
@@ -197,6 +199,11 @@ class VHSDecode(ldd.LDdecode):
         # sync/AGC re-lock and must not be written again (set by main once
         # the resume plan is known).
         self.resume_suppress_before_sample = None
+        # --resume seam bookkeeping for the resume_seam event (set by
+        # seed_resume once the plan is known): the last kept field's
+        # position and the seek/warm-up the plan chose.
+        self.resume_last_kept_sample = None
+        self.resume_seam_detail = None
 
         # A resumed decode reopens the existing outputs for appending; main
         # truncates them to the reconciled field count and seeks to the end
@@ -360,6 +367,13 @@ class VHSDecode(ldd.LDdecode):
                     decode_faults |= 4
                     fi["syncConf"] = 0
                     fi["isFirstField"] = not prevfi_1["isFirstField"]
+                    self._record_field_order_event(
+                        "skipped_field",
+                        fi,
+                        prevfi_1,
+                        distance_from_previous_field,
+                        {"action": "flip"},
+                    )
                 elif self.duplicate_prev_field:
                     ldd.logger.error(
                         "Possibly skipped field (Two fields with same isFirstField in a row), duplicating the last field to compensate..."
@@ -367,6 +381,11 @@ class VHSDecode(ldd.LDdecode):
                     decode_faults |= 4
                     fi["syncConf"] = 0
                     fi["isDuplicateField"] = True
+                    # The caller writes the previous field again first: the
+                    # event names that duplicated copy.
+                    self._record_field_order_event(
+                        "duplicate_field", fi, prevfi_1, distance_from_previous_field
+                    )
                 else:
                     ldd.logger.error(
                         "Possibly skipped field (Two fields with same isFirstField in a row), dropping the last field to compensate..."
@@ -374,6 +393,11 @@ class VHSDecode(ldd.LDdecode):
                     decode_faults |= 4
                     write_field = False
                     fi["syncConf"] = 0
+                    # This field is not written: the event names the next
+                    # written one and carries the dropped field's location.
+                    self._record_field_order_event(
+                        "dropped_field", fi, prevfi_1, distance_from_previous_field
+                    )
 
             if decode_faults != 0:
                 # Only write this if it's anything else than 0, to save a little space in the json,
@@ -431,6 +455,18 @@ class VHSDecode(ldd.LDdecode):
                     "field pairing may be off by one at the seam",
                     file_loc,
                 )
+            # The first field appended past the seam: record where the
+            # resumed run rejoined the input relative to the last kept field.
+            delta = None
+            if file_loc is not None and self.resume_last_kept_sample is not None:
+                delta = file_loc - self.resume_last_kept_sample
+            self.events.append(
+                "resume_seam",
+                len(self.fieldinfo),
+                file_loc=file_loc,
+                rf_delta_samples=delta,
+                detail=self.resume_seam_detail,
+            )
 
         # Remove fields that are currently not used to cut down on space usage.
         # the qt tools will load them as 0 with the current code
@@ -438,22 +474,52 @@ class VHSDecode(ldd.LDdecode):
         if "audioSamples" in fi:
             del fi["audioSamples"]
 
+        # Output order is definitive only here (the caller has resolved
+        # duplicates and drops), so the per-field record is finalised here:
+        # a copy per written field (a duplicated field gets its own seqNo
+        # and metrics) with the picture metrics set before the dict reaches
+        # fieldinfo (the JSON dumper serialises each field dict once).
+        fi_out = fi.copy()
+        fi_out["seqNo"] = len(self.fieldinfo) + 1
+        metrics = self.measure_picture(picturey, picturec)
+        if metrics:
+            fi_out["pictureMetrics"] = metrics
+
         if self._db_writer:
-            fi_out = fi.copy()
-            fi_out["seqNo"] = len(self.fieldinfo) + 1
             if not self.capture_id:
                 self.build_sqlite_metadata()
             self.fieldinfo.append(fi_out)
             self._db_writer.write_field(fi_out, self.capture_id, self.doDOD)
+            # Events logged since the last field ride in this field's commit.
+            self._db_writer.write_events(
+                self.events.to_db_rows(self.capture_id, self.events.unsent())
+            )
             # NOTE: this calls commit so we don't call it in dbwriter.write_field.
             self.build_sqlite_metadata()
         else:
-            self.fieldinfo.append(fi)
+            self.fieldinfo.append(fi_out)
 
         self.outfile_video.write(picturey)
         if self.rf.options.write_chroma:
             self.outfile_chroma.write(picturec)
         self.fields_written += 1
+
+    def seed_resume(self, plan, events, segments):
+        """Carry the interrupted run's events and segments into this one.
+
+        ``events`` / ``segments`` are the JSON-shaped dicts tbc_db loaded
+        from the truncated db (they count as already written); the plan
+        supplies the seam bookkeeping the resume_seam event reports.
+        """
+        self.events.seed(events)
+        self.segments = list(segments)
+        if self._db_writer and self.segments:
+            self._db_writer.write_segments(plan.capture_id, self.segments)
+        self.resume_last_kept_sample = int(plan.last_kept_sample)
+        self.resume_seam_detail = {
+            "seekSample": int(plan.seek_sample),
+            "warmupFields": int(plan.warmup_fields),
+        }
 
     def close(self):
         if self.decodethread and self.decodethread.is_alive():
@@ -555,6 +621,11 @@ class VHSDecode(ldd.LDdecode):
                 if offset:
                     toffset += offset
 
+                if f is not None:
+                    # An invalid field never reaches buildmetadata; record
+                    # why it was skipped and how far we jump.
+                    self._record_invalid_field(f, offset)
+
             df_args = (
                 toffset,
                 self.mtf_level,
@@ -594,8 +665,10 @@ class VHSDecode(ldd.LDdecode):
                 #    self.bw_ratios.append(metrics["blackToWhiteRFRatio"])
                 #    self.bw_ratios = self.bw_ratios[-keep:]
 
+                redo_reason = None
                 redo = f.needrerun
                 if redo:
+                    redo_reason = "needrerun"
                     redo = self.fdoffset - offset
 
                 # Perform AGC changes on first fields only to prevent luma mismatch intra-field
@@ -625,6 +698,7 @@ class VHSDecode(ldd.LDdecode):
                             )
                         else:
                             redo = self.fdoffset - offset
+                            redo_reason = redo_reason or "agc"
 
                             self.rf.DecoderParams["ire0"] = ire0_hz
                             # Note that vsync_ire is a negative number, so (sync_hz - ire0_hz) is correct
@@ -632,6 +706,7 @@ class VHSDecode(ldd.LDdecode):
                             self.rf.DecoderParams["vsync_ire"] = vsync_ire
 
                 if adjusted is False and redo:
+                    self._record_redo(redo, offset, redo_reason)
                     self.demodcache.flush_demod()
                     adjusted = True
                     self.fdoffset = redo

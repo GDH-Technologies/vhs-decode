@@ -1,4 +1,4 @@
-"""Pure helpers for the .tbc.db SQLite metadata sidecar (schema user_version 1).
+"""Pure helpers for the .tbc.db SQLite metadata sidecar (schema user_version 2).
 
 Import-light on purpose (stdlib only): these are shared by the ld-decode,
 vhs-decode and cvbs-decode writers, by --resume, and by their tests.
@@ -17,10 +17,47 @@ from dataclasses import dataclass
 DECODER_LD = "ld-decode"
 DECODER_VHS = "vhs-decode"
 
+# PRAGMA user_version written by a fresh schema and reached by migrate_schema.
+#   1: the original field_record + child tables
+#   2: capture.rf_source_sample_rate_hz, picture_metrics, decoder_event, segment
+SCHEMA_USER_VERSION = 2
+
+# Schema v2 additions, shared verbatim with tbc-tools (its sqliteio.cpp
+# carries the same text) so both writers create identical tables. Every
+# statement is IF NOT EXISTS so the block doubles as the migration.
+SEGMENTATION_DDL = """\
+CREATE TABLE IF NOT EXISTS picture_metrics (                      -- one row per written field, when any metric is finite
+    capture_id INTEGER NOT NULL, field_id INTEGER NOT NULL,
+    luma_mean_ire REAL, field_diff_ire REAL, blanking_dev_ire REAL,
+    sync_tip_dev_ire REAL, noise_ire REAL, burst_amp_ire REAL,      -- IRE, 2 dp; NULL = unmeasurable
+    FOREIGN KEY (capture_id, field_id) REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
+    PRIMARY KEY (capture_id, field_id));
+
+CREATE TABLE IF NOT EXISTS decoder_event (                        -- immutable facts the decoder knew; append-only
+    event_id INTEGER PRIMARY KEY,
+    capture_id INTEGER NOT NULL REFERENCES capture(capture_id) ON DELETE CASCADE,
+    field_id INTEGER NOT NULL,                                     -- first written field at/after the event (0-based)
+    kind TEXT NOT NULL,                                            -- vocabulary below; no CHECK (two writers)
+    file_loc INTEGER, rf_delta_samples INTEGER, rf_delta_fields REAL,
+    source TEXT NOT NULL,                                          -- 'decoder' | 'tbc-segments'
+    detail_json TEXT);
+CREATE INDEX IF NOT EXISTS decoder_event_field ON decoder_event(capture_id, field_id);
+
+CREATE TABLE IF NOT EXISTS segment (                              -- the editable layer (decision 2)
+    segment_id INTEGER PRIMARY KEY,                                -- stable; never renumbered; new = max + 1
+    capture_id INTEGER NOT NULL REFERENCES capture(capture_id) ON DELETE CASCADE,
+    start_field INTEGER NOT NULL, end_field_exclusive INTEGER NOT NULL,   -- 0-based, half-open
+    kind TEXT NOT NULL,                                            -- 'clip' | 'blank' | 'noise' | 'unknown'
+    source TEXT NOT NULL,                                          -- 'derived' | 'user'
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    title TEXT, comment TEXT, created_by TEXT, updated_at TEXT, derived_from TEXT);
+CREATE INDEX IF NOT EXISTS segment_start ON segment(capture_id, start_field);
+"""
+
 # The canonical DDL (decode-orc mirrors it column-for-column). One home for
 # the schema so the writers, --resume and the tests never drift apart.
-SCHEMA_SQL = """\
-PRAGMA user_version = 1;
+SCHEMA_SQL = f"""\
+PRAGMA user_version = {SCHEMA_USER_VERSION};
 
 CREATE TABLE capture (
     capture_id INTEGER PRIMARY KEY,
@@ -42,7 +79,8 @@ CREATE TABLE capture (
     white_16b_ire INTEGER,
     black_16b_ire INTEGER,
     blanking_16b_ire INTEGER,
-    capture_notes TEXT
+    capture_notes TEXT,
+    rf_source_sample_rate_hz REAL
 );
 
 CREATE TABLE pcm_audio_parameters (
@@ -132,12 +170,137 @@ CREATE TABLE closed_caption (
         REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
     PRIMARY KEY (capture_id, field_id)
 );
-"""
+
+""" + SEGMENTATION_DDL
 
 # Tables keyed (capture_id, field_id) hanging off field_record. Truncation
 # deletes from them explicitly: the writers never enable PRAGMA
 # foreign_keys, so ON DELETE CASCADE cannot be relied on.
-_FIELD_CHILD_TABLES = ("vits_metrics", "vbi", "drop_outs", "vitc", "closed_caption")
+_FIELD_CHILD_TABLES = (
+    "vits_metrics",
+    "vbi",
+    "drop_outs",
+    "vitc",
+    "closed_caption",
+    "picture_metrics",
+)
+
+# picture_metrics columns in the order the JSON keys sort, so one tuple
+# serves the INSERT, the SELECT and the JSON projection.
+PICTURE_METRIC_COLUMNS = (
+    ("blankingDevIre", "blanking_dev_ire"),
+    ("burstAmpIre", "burst_amp_ire"),
+    ("fieldDiffIre", "field_diff_ire"),
+    ("lumaMeanIre", "luma_mean_ire"),
+    ("noiseIre", "noise_ire"),
+    ("syncTipDevIre", "sync_tip_dev_ire"),
+)
+
+# decoder_event columns as vhs-decode writes them (JSON key, column). The
+# event_id is the insertion order and is never carried in the JSON.
+DECODER_EVENT_COLUMNS = (
+    ("field", "field_id"),
+    ("kind", "kind"),
+    ("fileLoc", "file_loc"),
+    ("rfDeltaSamples", "rf_delta_samples"),
+    ("rfDeltaFields", "rf_delta_fields"),
+    ("source", "source"),
+    ("detailJson", "detail_json"),
+)
+
+# segment columns (JSON key, column); ``id``/``enabled`` need casts.
+SEGMENT_COLUMNS = (
+    ("id", "segment_id"),
+    ("startField", "start_field"),
+    ("endFieldExclusive", "end_field_exclusive"),
+    ("kind", "kind"),
+    ("source", "source"),
+    ("enabled", "enabled"),
+    ("title", "title"),
+    ("comment", "comment"),
+    ("createdBy", "created_by"),
+    ("updatedAt", "updated_at"),
+    ("derivedFrom", "derived_from"),
+)
+
+
+def _existing_tables(conn):
+    return {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+
+
+def migrate_schema(conn):
+    """Bring an open .tbc.db up to :data:`SCHEMA_USER_VERSION` in place.
+
+    Idempotent: a v1 db gains the ``capture.rf_source_sample_rate_hz``
+    column and the segmentation tables; a v2 db is left untouched. Rows
+    are never rewritten. Run by the vhs-decode writer on ``--resume`` so a
+    decode interrupted under the old schema continues under the new one.
+    """
+    tables = _existing_tables(conn)
+    if "capture" in tables:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(capture)")}
+        if "rf_source_sample_rate_hz" not in columns:
+            conn.execute("ALTER TABLE capture ADD COLUMN rf_source_sample_rate_hz REAL")
+    conn.executescript(SEGMENTATION_DDL)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < SCHEMA_USER_VERSION:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
+    conn.commit()
+
+
+def picture_metrics_row(capture_id, field_id, metrics):
+    """The picture_metrics INSERT tuple for one field (NULL for absent keys)."""
+    return (capture_id, field_id) + tuple(
+        metrics.get(key) for key, _column in PICTURE_METRIC_COLUMNS
+    )
+
+
+PICTURE_METRICS_INSERT_SQL = (
+    "INSERT INTO picture_metrics (capture_id, field_id, "
+    + ", ".join(column for _key, column in PICTURE_METRIC_COLUMNS)
+    + ") VALUES (?, ?, " + ", ".join("?" for _ in PICTURE_METRIC_COLUMNS) + ")"
+)
+
+DECODER_EVENT_INSERT_SQL = (
+    "INSERT INTO decoder_event (capture_id, "
+    + ", ".join(column for _key, column in DECODER_EVENT_COLUMNS)
+    + ") VALUES (?, " + ", ".join("?" for _ in DECODER_EVENT_COLUMNS) + ")"
+)
+
+SEGMENT_INSERT_SQL = (
+    "INSERT INTO segment (capture_id, "
+    + ", ".join(column for _key, column in SEGMENT_COLUMNS)
+    + ") VALUES (?, " + ", ".join("?" for _ in SEGMENT_COLUMNS) + ")"
+)
+
+
+def segment_row(capture_id, segment):
+    """The segment INSERT tuple for one JSON-shaped segment dict."""
+    values = []
+    for key, _column in SEGMENT_COLUMNS:
+        value = segment.get(key)
+        if key == "enabled":
+            value = 1 if (value is None or value) else 0
+        elif key in ("id", "startField", "endFieldExclusive") and value is not None:
+            value = int(value)
+        values.append(value)
+    return (capture_id,) + tuple(values)
+
+
+def write_segments(conn, capture_id, segments):
+    """Replace the capture's segment rows with ``segments`` (JSON-shaped dicts).
+
+    Delete-then-insert inside one transaction, ids preserved verbatim; the
+    caller commits.
+    """
+    conn.execute("DELETE FROM segment WHERE capture_id = ?", (capture_id,))
+    if segments:
+        conn.executemany(
+            SEGMENT_INSERT_SQL, [segment_row(capture_id, s) for s in segments]
+        )
 
 # Decoded-but-not-written lead-in before the resume point, so sync/AGC
 # re-lock on real signal instead of the seam landing on the first appended
@@ -337,12 +500,18 @@ def apply_resume_truncation(
 
     Idempotent: running it again with a fresh plan is a no-op. Child rows
     are deleted explicitly (the writers never enable PRAGMA foreign_keys,
-    so the schema's cascades do not fire).
+    so the schema's cascades do not fire). Schema v2 tables are handled
+    when present (a v1 db has none): decoder events at or after the seam
+    go, derived segments go (the library re-derives them), user segments
+    starting at or after the seam go and one spanning it is clamped to it.
     """
     try:
         conn = sqlite3.connect(str(db_path))
         try:
+            tables = _existing_tables(conn)
             for table in _FIELD_CHILD_TABLES:
+                if table not in tables:
+                    continue
                 conn.execute(
                     f"DELETE FROM {table} WHERE capture_id = ? AND field_id >= ?",
                     (plan.capture_id, plan.field_count),
@@ -351,6 +520,25 @@ def apply_resume_truncation(
                 "DELETE FROM field_record WHERE capture_id = ? AND field_id >= ?",
                 (plan.capture_id, plan.field_count),
             )
+            if "decoder_event" in tables:
+                conn.execute(
+                    "DELETE FROM decoder_event WHERE capture_id = ? AND field_id >= ?",
+                    (plan.capture_id, plan.field_count),
+                )
+            if "segment" in tables:
+                conn.execute(
+                    "DELETE FROM segment WHERE capture_id = ? AND source = 'derived'",
+                    (plan.capture_id,),
+                )
+                conn.execute(
+                    "DELETE FROM segment WHERE capture_id = ? AND start_field >= ?",
+                    (plan.capture_id, plan.field_count),
+                )
+                conn.execute(
+                    "UPDATE segment SET end_field_exclusive = ?"
+                    " WHERE capture_id = ? AND end_field_exclusive > ?",
+                    (plan.field_count, plan.capture_id, plan.field_count),
+                )
             conn.execute(
                 "UPDATE capture SET number_of_sequential_fields = ?"
                 " WHERE capture_id = ?",
@@ -371,18 +559,31 @@ def minimal_fields_from_db(db_path, capture_id, field_count):
     """Rebuild minimal per-field dicts from ``field_record``.
 
     Fallback for a resumed decode whose legacy .tbc.json is missing or
-    short: covers the core keys the decoder writes per field. VITS/VBI/
-    dropout details are not reconstructed -- the db stays the canonical
-    record for those.
+    short: covers the core keys the decoder writes per field plus the
+    picture metrics (schema v2). VITS/VBI/dropout details are not
+    reconstructed -- the db stays the canonical record for those.
     """
+    metric_columns = ", ".join(
+        f"pm.{column}" for _key, column in PICTURE_METRIC_COLUMNS
+    )
     try:
         conn = sqlite3.connect(str(db_path))
         try:
+            has_metrics = "picture_metrics" in _existing_tables(conn)
+            join = (
+                " LEFT JOIN picture_metrics pm ON pm.capture_id = fr.capture_id"
+                " AND pm.field_id = fr.field_id"
+                if has_metrics
+                else ""
+            )
+            select_metrics = f", {metric_columns}" if has_metrics else ""
             rows = conn.execute(
-                "SELECT field_id, is_first_field, sync_conf, disk_loc,"
-                " file_loc, field_phase_id, decode_faults, audio_samples"
-                " FROM field_record WHERE capture_id = ? AND field_id < ?"
-                " ORDER BY field_id",
+                "SELECT fr.field_id, fr.is_first_field, fr.sync_conf, fr.disk_loc,"
+                " fr.file_loc, fr.field_phase_id, fr.decode_faults, fr.audio_samples"
+                f"{select_metrics}"
+                f" FROM field_record fr{join}"
+                " WHERE fr.capture_id = ? AND fr.field_id < ?"
+                " ORDER BY fr.field_id",
                 (capture_id, field_count),
             ).fetchall()
         finally:
@@ -391,16 +592,17 @@ def minimal_fields_from_db(db_path, capture_id, field_count):
         raise ResumeError(f"not a readable .tbc.db: {exc}") from exc
 
     fields = []
-    for (
-        field_id,
-        is_first_field,
-        sync_conf,
-        disk_loc,
-        file_loc,
-        field_phase_id,
-        decode_faults,
-        audio_samples,
-    ) in rows:
+    for row in rows:
+        (
+            field_id,
+            is_first_field,
+            sync_conf,
+            disk_loc,
+            file_loc,
+            field_phase_id,
+            decode_faults,
+            audio_samples,
+        ) = row[:8]
         field = {
             "seqNo": field_id + 1,
             "isFirstField": bool(is_first_field),
@@ -417,8 +619,90 @@ def minimal_fields_from_db(db_path, capture_id, field_count):
             field["fieldPhaseID"] = field_phase_id
         if audio_samples is not None:
             field["audioSamples"] = audio_samples
+        if has_metrics:
+            metrics = {
+                key: value
+                for (key, _column), value in zip(PICTURE_METRIC_COLUMNS, row[8:])
+                if value is not None
+            }
+            if metrics:
+                field["pictureMetrics"] = metrics
         fields.append(field)
     return fields
+
+
+def load_events_from_db(db_path, capture_id):
+    """Return the capture's decoder events as JSON-shaped dicts.
+
+    Ordered by field then insertion (event_id); keys as the ``.tbc.json``
+    ``decoderEvents`` projection spells them, NULL columns omitted. An empty
+    list for a v1 db (no ``decoder_event`` table).
+    """
+    columns = ", ".join(column for _key, column in DECODER_EVENT_COLUMNS)
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            if "decoder_event" not in _existing_tables(conn):
+                return []
+            rows = conn.execute(
+                f"SELECT {columns} FROM decoder_event WHERE capture_id = ?"
+                " ORDER BY field_id, event_id",
+                (capture_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise ResumeError(f"not a readable .tbc.db: {exc}") from exc
+
+    events = []
+    for row in rows:
+        event = {}
+        for (key, _column), value in zip(DECODER_EVENT_COLUMNS, row):
+            if value is None:
+                continue
+            if key in ("field", "fileLoc", "rfDeltaSamples"):
+                value = int(value)
+            event[key] = value
+        events.append(dict(sorted(event.items())))
+    return events
+
+
+def load_segments_from_db(db_path, capture_id):
+    """Return the capture's segments as JSON-shaped dicts, in field order.
+
+    Keys as the ``.tbc.json`` ``segments`` projection spells them (``id``,
+    ``startField``, ``endFieldExclusive``, ``kind``, ``source``, ``enabled``
+    plus the optional text fields when set). An empty list for a v1 db.
+    """
+    columns = ", ".join(column for _key, column in SEGMENT_COLUMNS)
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            if "segment" not in _existing_tables(conn):
+                return []
+            rows = conn.execute(
+                f"SELECT {columns} FROM segment WHERE capture_id = ?"
+                " ORDER BY start_field, segment_id",
+                (capture_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise ResumeError(f"not a readable .tbc.db: {exc}") from exc
+
+    segments = []
+    for row in rows:
+        segment = {}
+        for (key, _column), value in zip(SEGMENT_COLUMNS, row):
+            if key == "enabled":
+                value = bool(value)
+            elif value is None:
+                continue
+            elif key in ("id", "startField", "endFieldExclusive"):
+                value = int(value)
+            segment[key] = value
+        segments.append(dict(sorted(segment.items())))
+    return segments
 
 
 def load_json_fields(json_path, field_count):

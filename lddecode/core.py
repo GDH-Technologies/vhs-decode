@@ -8,6 +8,7 @@ import threading
 import time
 import types
 
+from collections import deque
 from queue import Queue
 from importlib.resources import files
 
@@ -24,7 +25,16 @@ from scipy import interpolate
 # internal libraries
 
 from . import efm_pll
-from .tbc_db import DECODER_LD, SCHEMA_SQL, db_system_value
+from .decoder_events import DecoderEventLog
+from .picture_metrics import geometry_from_video_parameters, measure_field
+from .tbc_db import (
+    DECODER_EVENT_INSERT_SQL,
+    DECODER_LD,
+    PICTURE_METRICS_INSERT_SQL,
+    SCHEMA_SQL,
+    db_system_value,
+    picture_metrics_row,
+)
 from .utils import ac3_pipe, ldf_pipe, traceback
 from .utils import nb_mean, nb_median, nb_round, nb_min, nb_max, nb_abs, nb_absmax, n_orgt
 from .utils import polar2z, sqsum, genwave, dsa_rescale_and_clip, scale, scale_field, rms
@@ -1634,6 +1644,10 @@ class Field:
 
         self.needrerun = False
         self.valid = False
+        # Why compute_linelocs gave up on this field (a decoder event kind:
+        # "no_sync_pulses" / "no_field_start"); None while valid or when the
+        # retry is only a buffer-alignment re-read.
+        self.invalid_reason = None
         self.sync_confidence = 100
 
         self.dspicture = None
@@ -2345,6 +2359,7 @@ class Field:
 
         self.rawpulses = self.getpulses()
         if self.rawpulses is None or len(self.rawpulses) == 0:
+            self.invalid_reason = "no_sync_pulses"
             if self.fields_written:
                 logger.error("Unable to find any sync pulses, skipping one field")
                 return None, None, None
@@ -2378,6 +2393,7 @@ class Field:
             if self.initphase is False:
                 logger.error("Unable to determine start of field - dropping field")
 
+            self.invalid_reason = "no_field_start"
             return None, None, self.inlinelen * 200
 
         # If we don't have enough data at the end, move onto the next field
@@ -3675,6 +3691,26 @@ class LDdecode:
 
         self.fieldinfo = FieldInfo()
 
+        # Per-field picture metrics (lddecode.picture_metrics), measured in
+        # writeout on the field as written. The geometry is built lazily
+        # from build_json() on the first written field; the ring holds the
+        # last two written luma fields so field n is compared with n-2
+        # (same parity by output index).
+        self.picture_metrics_enabled = bool(extra_options.get("picture_metrics", True))
+        self._picture_geometry = None
+        self._picture_geometry_disabled = False
+        self._written_luma_ring = deque(maxlen=2)
+
+        # Decoder events (lddecode.decoder_events): immutable facts recorded
+        # while decoding, written to decoder_event with each field's commit
+        # and re-emitted as "decoderEvents" in the JSON. The nominal RF
+        # samples per field is synced from self.rf (subclasses replace it).
+        self.events = DecoderEventLog()
+        self._sync_event_rate()
+        # Segments are tbc-tools' editable layer; the decoder never derives
+        # them and only carries the stored ones through a --resume.
+        self.segments = []
+
         self.leadIn = False
         self.leadOut = False
         self.isCLV = False
@@ -3719,6 +3755,8 @@ class LDdecode:
             "outfile_ac3",
         ]:
             setattr(self, outfiles, None)
+
+        self.flush_events()
 
         self.demodcache.end()
 
@@ -3826,6 +3864,116 @@ class LDdecode:
 
             blk = self.AC3Collector.get_block()
 
+    def _sync_event_rate(self):
+        """Point the event log at self.rf's nominal RF samples per field."""
+        self.events.set_rate(self.rf.freq_hz, self.rf.SysParams["FPS"])
+
+    def _record_invalid_field(self, f, offset):
+        """A decoder event for a field readfield discarded, if it had a reason.
+
+        ``offset`` is the jump readfield takes past it (the field's
+        nextfieldoffset); the event names the first field written after it.
+        """
+        reason = getattr(f, "invalid_reason", None)
+        if not reason:
+            return
+        detail = None if offset is None else {"jumpSamples": int(round(float(offset)))}
+        self.events.append(
+            reason,
+            len(self.fieldinfo),
+            file_loc=f.readloc,
+            rf_delta_samples=offset,
+            detail=detail,
+        )
+
+    def _record_field_order_event(self, kind, fi, prevfi, distance_fields, detail=None):
+        """A decoder event for a same-parity field-order action in buildmetadata."""
+        detail = dict(detail or {})
+        detail["distanceFields"] = round(float(distance_fields), 3)
+        file_loc = fi.get("fileLoc")
+        prev_loc = prevfi.get("fileLoc") if prevfi else None
+        delta = None if file_loc is None or prev_loc is None else file_loc - prev_loc
+        self.events.append(
+            kind,
+            len(self.fieldinfo),
+            file_loc=file_loc,
+            rf_delta_samples=delta,
+            detail=detail,
+        )
+
+    def _record_redo(self, target, offset, reason):
+        """A decoder event for readfield rewinding to ``target`` to re-decode."""
+        self.events.append(
+            "redo",
+            len(self.fieldinfo),
+            file_loc=target,
+            rf_delta_samples=None if offset is None else -offset,
+            detail={"reason": reason},
+        )
+
+    def flush_events(self):
+        """Persist events logged after the last written field (the EOF tail).
+
+        The per-field writers insert events with each field's commit; an
+        event with no field after it (a sync loss at the end of the input)
+        would otherwise only reach the JSON.
+        """
+        rows = self.events.unsent()
+        conn = getattr(self, "dbconn", None)
+        if not rows or conn is None or not self.capture_id:
+            return
+        try:
+            conn.executemany(
+                DECODER_EVENT_INSERT_SQL, self.events.to_db_rows(self.capture_id, rows)
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.warning("could not write trailing decoder events: %s", exc)
+
+    def measure_picture(self, luma, chroma=None):
+        """Per-field picture metrics for the field about to be written.
+
+        Runs in output order (the caller has resolved duplicates and drops)
+        so the same-parity difference is against the field written two
+        before this one, which is what tbc-segments' walk compares. Empty
+        when disabled (--no_picture_metrics), when no measurable geometry
+        can be built for the system, or when nothing is measurable.
+        """
+        if not self.picture_metrics_enabled or self._picture_geometry_disabled:
+            return {}
+        if self._picture_geometry is None:
+            try:
+                js = self.build_json()
+            except Exception:
+                js = None
+            vp = js.get("videoParameters") if js else None
+            if not vp:
+                # Nothing to build from yet; try again on the next field.
+                return {}
+            system = getattr(self.rf, "color_system", None) or vp.get("system")
+            geometry = geometry_from_video_parameters(vp, system)
+            if geometry is None or not geometry.valid():
+                self._picture_geometry_disabled = True
+                logger.info(
+                    "Picture metrics disabled: no measurable field geometry for %s",
+                    system,
+                )
+                return {}
+            self._picture_geometry = geometry
+
+        if isinstance(luma, (bytes, bytearray, memoryview)):
+            luma = np.frombuffer(luma, dtype=np.uint16)
+        luma = np.asarray(luma)
+        ring = self._written_luma_ring
+        previous = ring[0] if len(ring) == ring.maxlen else None
+        try:
+            metrics = measure_field(luma, chroma, previous, self._picture_geometry)
+        except Exception:
+            logger.debug("picture metrics failed for this field", exc_info=True)
+            metrics = {}
+        ring.append(luma)
+        return metrics
+
     def writeout(self, dataset):
         f, fi, picture, audio, efm = dataset
         if self.digital_audio is True:
@@ -3838,12 +3986,22 @@ class LDdecode:
         fi["audioSamples"] = 0 if audio is None else int(len(audio) / 2)
         fi["efmTValues"] = len(efm_out) if self.digital_audio else 0
 
+        # Output order is definitive only here, so the per-field record is
+        # finalised here: a copy per written field (a filler duplicate gets
+        # its own seqNo and metrics) with the picture metrics set before the
+        # dict reaches fieldinfo (the JSON dumper serialises it once).
+        fi = fi.copy()
+        fi["seqNo"] = len(self.fieldinfo) + 1
+        pictureMetrics = self.measure_picture(picture)
+        if pictureMetrics:
+            fi["pictureMetrics"] = pictureMetrics
+
         self.fieldinfo.append(fi)
 
         if not self.capture_id:
             self.build_sqlite_metadata()
 
-        c_id = self.capture_id 
+        c_id = self.capture_id
         f_id = self.fields_written
 
         decodeFaults = None if fi.get('decodeFaults') == 0 else fi.get('decodeFaults')
@@ -3869,6 +4027,12 @@ class LDdecode:
                     capture_id, field_id, w_snr, b_psnr
                 ) VALUES (?, ?, ?, ?)''',
                 (c_id, f_id, w_snr, b_psnr))
+
+        # Per-field picture metrics (schema v2); NULL for absent members.
+        if pictureMetrics := fi.get('pictureMetrics'):
+            self.dbconn.execute(
+                PICTURE_METRICS_INSERT_SQL,
+                picture_metrics_row(c_id, f_id, pictureMetrics))
 
         # Insert VBI data if present
         vbi_data = fi.get("vbi", {}).get("vbiData", [])
@@ -3898,9 +4062,14 @@ class LDdecode:
             self.dbconn.executemany('''
                 INSERT INTO drop_outs (
                     capture_id, field_id, field_line, startx, endx
-                ) VALUES (?, ?, ?, ?, ?)''', 
+                ) VALUES (?, ?, ?, ?, ?)''',
                 dropout_data)
-            
+
+        # Decoder events logged since the last field, in this field's commit.
+        eventRows = self.events.to_db_rows(c_id, self.events.unsent())
+        if eventRows:
+            self.dbconn.executemany(DECODER_EVENT_INSERT_SQL, eventRows)
+
         self.build_sqlite_metadata()
         self.dbconn.commit()
 
@@ -4061,6 +4230,11 @@ class LDdecode:
                 if offset:
                     toffset += offset
 
+                if f is not None:
+                    # An invalid field never reaches buildmetadata; record
+                    # why it was skipped and how far we jump.
+                    self._record_invalid_field(f, offset)
+
             df_args = (toffset, self.mtf_level, prevfield, initphase, False, self.threadreturn)
 
             if self.numthreads != 0:
@@ -4092,8 +4266,10 @@ class LDdecode:
                     self.bw_ratios.append(metrics["blackToWhiteRFRatio"])
                     self.bw_ratios = self.bw_ratios[-keep:]
 
+                redo_reason = None
                 redo = f.needrerun or not self.checkMTF(f, self.fieldstack[0])
                 if redo:
+                    redo_reason = "needrerun" if f.needrerun else "mtf"
                     redo = self.fdoffset - offset
 
                 # Perform AGC changes on first fields only to prevent luma mismatch intra-field
@@ -4119,6 +4295,7 @@ class LDdecode:
                                 ))
                         else:
                             redo = self.fdoffset - offset
+                            redo_reason = redo_reason or "agc"
 
                             self.rf.DecoderParams["ire0"] = ire0_hz
                             # Note that vsync_ire is a negative number, so (sync_hz - ire0_hz) is correct
@@ -4126,6 +4303,7 @@ class LDdecode:
                             self.rf.DecoderParams["vsync_ire"] = vsync_ire
 
                 if adjusted is False and redo:
+                    self._record_redo(redo, offset, redo_reason)
                     adjusted = True
                     self.fdoffset = redo
                 else:
@@ -4473,6 +4651,11 @@ class LDdecode:
                     logger.error("Skipped field")
                     decodeFaults |= 4
                     fi["syncConf"] = 0
+                    # The caller writes the previous field again as filler:
+                    # the event names that duplicated copy.
+                    self._record_field_order_event(
+                        "duplicate_field", fi, prevfi, fi["diskLoc"] - prevfi["diskLoc"]
+                    )
                     return fi, True
 
         fi["decodeFaults"] = decodeFaults
@@ -4681,6 +4864,10 @@ class LDdecode:
 
         vp["fieldWidth"] = f.rf.SysParams["outlinelen"]
         vp["sampleRate"] = f.rf.SysParams["outfreq"] * 1000000
+        # The rate every field's fileLoc counts in (the working RF rate,
+        # after any input resampling) -- what a Δ fileLoc must be compared
+        # against to be read in fields. sampleRate above is the TBC output.
+        vp["rfSourceSampleRateHz"] = float(self.rf.freq_hz)
 
         vp["black16bIre"]    = float(f.hz_to_output(f.rf.iretohz(self.blackIRE)))
         vp["white16bIre"]    = float(f.hz_to_output(f.rf.iretohz(100)))
@@ -4705,6 +4892,14 @@ class LDdecode:
         ))
 
         jout["videoParameters"] = vp
+
+        # Top-level keys are re-dumped on every JSON flush (per-field dicts
+        # only once), so the append-only event log and the carried segments
+        # live here. decoderEvents is always present: [] says "this decoder
+        # records events" to a reader deciding whether to reconstruct them.
+        jout["decoderEvents"] = self.events.to_json()
+        if self.segments:
+            jout["segments"] = [dict(segment) for segment in self.segments]
 
         return jout
 
@@ -4735,13 +4930,17 @@ class LDdecode:
             vp["numberOfSequentialFields"],
             vp["colourBurstStart"],
             vp["colourBurstEnd"],
-            vp["white16bIre"],
-            vp["black16bIre"],
-            vp["blanking16bIre"],
+            # INTEGER columns; the JSON keeps the floats (VHS scales them by
+            # level_adjust) and every reader rounds them the same way.
+            int(round(vp["white16bIre"])),
+            int(round(vp["black16bIre"])),
+            int(round(vp["blanking16bIre"])),
             # is_mapped, is_subcarrier_locked, is_widescreen
             0, vp["system"] == "NTSC", 0,
+            # The rate fileLoc counts in (schema v2).
+            vp.get("rfSourceSampleRateHz"),
         )
-        
+
 
         # Prepare PCM Audio data tuple
         pcm_values = (
@@ -4761,7 +4960,8 @@ class LDdecode:
                     field_width=?, field_height=?, number_of_sequential_fields=?, 
                     colour_burst_start=?, colour_burst_end=?, 
                     white_16b_ire=?, black_16b_ire=?, blanking_16b_ire=?,
-                    is_mapped=?, is_subcarrier_locked=?, is_widescreen=?
+                    is_mapped=?, is_subcarrier_locked=?, is_widescreen=?,
+                    rf_source_sample_rate_hz=?
                 WHERE capture_id = ?
             """, video_values + (self.capture_id,))
 
@@ -4781,8 +4981,9 @@ class LDdecode:
                     field_width, field_height, number_of_sequential_fields, 
                     colour_burst_start, colour_burst_end, 
                     white_16b_ire, black_16b_ire, blanking_16b_ire,
-                    is_mapped, is_subcarrier_locked, is_widescreen
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_mapped, is_subcarrier_locked, is_widescreen,
+                    rf_source_sample_rate_hz
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, video_values)
 
             self.capture_id = cursor.lastrowid

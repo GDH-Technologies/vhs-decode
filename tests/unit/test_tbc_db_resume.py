@@ -4,7 +4,9 @@ Import-light on purpose (sqlite3 + tmp files only, no numpy/compiled
 extensions) so they run on any checkout. The live seek/warm-up/append side
 is covered by the kill-and-resume decode proof.
 """
+import importlib.util
 import json
+import pathlib
 import sqlite3
 
 import pytest
@@ -13,13 +15,39 @@ from lddecode.tbc_db import (
     SCHEMA_SQL,
     ResumeError,
     apply_resume_truncation,
+    load_events_from_db,
     load_json_fields,
+    load_segments_from_db,
     minimal_fields_from_db,
     plan_resume,
 )
 
 FIELD_BYTES = 100  # tiny synthetic fields; the helpers never assume a size
 STRIDE = 1000  # file_loc delta per field
+
+# Decoder events the synthetic run "recorded" (field, kind); the one at 97
+# sits past every truncation point the tests use.
+EVENTS = ((5, "no_sync_pulses"), (50, "duplicate_field"), (97, "dropped_field"))
+
+# Segments a tbc-tools pass "stored" (start, end_exclusive, kind, source);
+# the truncation to 94 fields must drop the derived one, keep the first
+# user one, clamp the one spanning the seam and drop the one past it.
+SEGMENTS = (
+    (0, 100, "clip", "derived"),
+    (0, 50, "clip", "user"),
+    (90, 100, "blank", "user"),
+    (95, 100, "clip", "user"),
+)
+
+
+def _v1_schema_sql():
+    """The pre-v2 DDL, embedded next to the schema tests (loaded by path so
+    this works whichever way pytest imports the test package)."""
+    path = pathlib.Path(__file__).with_name("test_tbc_db_schema.py")
+    spec = importlib.util.spec_from_file_location("_tbc_db_schema_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.V1_SCHEMA_SQL
 
 
 def _phase_for(field_id, fn_offset=0):
@@ -32,9 +60,12 @@ def _phase_for(field_id, fn_offset=0):
     return {(1, 0): 1, (0, 1): 2, (1, 1): 3, (0, 0): 4}[(first, bit)]
 
 
-def _make_db(path, *, fields, system="NTSC", captures=1, stride=STRIDE, fn_offset=0):
+def _make_db(
+    path, *, fields, system="NTSC", captures=1, stride=STRIDE, fn_offset=0, schema=SCHEMA_SQL
+):
+    v2 = schema is SCHEMA_SQL
     conn = sqlite3.connect(str(path))
-    conn.executescript(SCHEMA_SQL)
+    conn.executescript(schema)
     capture_id = None
     for _ in range(captures):
         cur = conn.execute(
@@ -67,6 +98,38 @@ def _make_db(path, *, fields, system="NTSC", captures=1, stride=STRIDE, fn_offse
             " endx) VALUES (?, ?, 10, 0, 5)",
             (capture_id, field_id),
         )
+        if v2:
+            # Two finite metrics, the rest unmeasurable (NULL).
+            conn.execute(
+                "INSERT INTO picture_metrics (capture_id, field_id, luma_mean_ire,"
+                " noise_ire) VALUES (?, ?, 30.0, 2.0)",
+                (capture_id, field_id),
+            )
+    if v2:
+        for field_id, kind in EVENTS:
+            if field_id < fields:
+                conn.execute(
+                    "INSERT INTO decoder_event (capture_id, field_id, kind,"
+                    " file_loc, rf_delta_samples, rf_delta_fields, source,"
+                    " detail_json) VALUES (?, ?, ?, ?, ?, ?, 'decoder', ?)",
+                    (
+                        capture_id,
+                        field_id,
+                        kind,
+                        field_id * stride,
+                        2 * stride,
+                        2.0,
+                        '{"distanceFields":2.0}',
+                    ),
+                )
+        if fields >= 100:
+            for start, end, kind, source in SEGMENTS:
+                conn.execute(
+                    "INSERT INTO segment (capture_id, start_field,"
+                    " end_field_exclusive, kind, source, title)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (capture_id, start, end, kind, source, f"{source} {start}"),
+                )
     conn.commit()
     conn.close()
     return path
@@ -379,3 +442,182 @@ class TestLoadJsonFields:
         assert load_json_fields(short, 10) is None
         assert load_json_fields(corrupt, 3) is None
         assert load_json_fields(tmp_path / "missing.tbc.json", 3) is None
+
+
+def _truncate_to_94(tmp_path, db):
+    video, chroma = _write_outputs(tmp_path, video_fields=95, chroma_fields=100)
+    plan = plan_resume(
+        db,
+        video_bytes=video.stat().st_size,
+        chroma_bytes=chroma.stat().st_size,
+        video_field_bytes=FIELD_BYTES,
+        chroma_field_bytes=FIELD_BYTES,
+    )
+    assert plan.field_count == 94
+    apply_resume_truncation(
+        db,
+        plan,
+        video_path=video,
+        chroma_path=chroma,
+        video_field_bytes=FIELD_BYTES,
+        chroma_field_bytes=FIELD_BYTES,
+    )
+    return plan
+
+
+class TestSchemaV2Truncation:
+    def test_truncates_metrics_events_and_segments_at_the_seam(self, tmp_path):
+        db = _make_db(tmp_path / "out.tbc.db", fields=100)
+
+        _truncate_to_94(tmp_path, db)
+
+        conn = sqlite3.connect(str(db))
+        try:
+            # picture_metrics is a field child table: cut with field_record.
+            assert conn.execute("SELECT COUNT(*) FROM picture_metrics").fetchone()[0] == 94
+            assert conn.execute("SELECT MAX(field_id) FROM picture_metrics").fetchone()[0] == 93
+            # Events at/after the seam go; earlier ones stay in order.
+            assert conn.execute(
+                "SELECT field_id, kind FROM decoder_event ORDER BY field_id"
+            ).fetchall() == [(5, "no_sync_pulses"), (50, "duplicate_field")]
+            # Derived segments go (the library re-derives them); user
+            # segments starting past the seam go; one spanning it is clamped.
+            assert conn.execute(
+                "SELECT start_field, end_field_exclusive, source FROM segment"
+                " ORDER BY start_field"
+            ).fetchall() == [(0, 50, "user"), (90, 94, "user")]
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            conn.close()
+
+    def test_is_idempotent_on_the_new_tables(self, tmp_path):
+        db = _make_db(tmp_path / "out.tbc.db", fields=100)
+        _truncate_to_94(tmp_path, db)
+        _truncate_to_94(tmp_path, db)
+        conn = sqlite3.connect(str(db))
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM decoder_event").fetchone()[0] == 2
+            assert conn.execute(
+                "SELECT end_field_exclusive FROM segment WHERE start_field = 90"
+            ).fetchone()[0] == 94
+        finally:
+            conn.close()
+
+    def test_a_v1_db_still_truncates_and_loads_nothing_new(self, tmp_path):
+        # A decode interrupted under the old schema has none of the new
+        # tables; truncation must not touch them and the loaders are empty.
+        db = _make_db(tmp_path / "old.tbc.db", fields=100, schema=_v1_schema_sql())
+
+        plan = _truncate_to_94(tmp_path, db)
+
+        conn = sqlite3.connect(str(db))
+        try:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM field_record").fetchone()[0] == 94
+            assert conn.execute("SELECT COUNT(*) FROM vits_metrics").fetchone()[0] == 94
+            assert not conn.execute(
+                "SELECT name FROM sqlite_master WHERE name IN"
+                " ('picture_metrics', 'decoder_event', 'segment')"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert load_events_from_db(db, plan.capture_id) == []
+        assert load_segments_from_db(db, plan.capture_id) == []
+        fields = minimal_fields_from_db(db, plan.capture_id, plan.field_count)
+        assert len(fields) == 94
+        assert all("pictureMetrics" not in field for field in fields)
+
+
+class TestLoadEventsFromDb:
+    def test_orders_by_field_then_insertion_with_the_json_keys(self, tmp_path):
+        db = _make_db(tmp_path / "out.tbc.db", fields=100)
+        conn = sqlite3.connect(str(db))
+        # Two more events on field 50, inserted after the field-97 one:
+        # field order first, insertion order within a field.
+        conn.execute(
+            "INSERT INTO decoder_event (capture_id, field_id, kind, source)"
+            " VALUES (1, 50, 'redo', 'decoder')"
+        )
+        conn.execute(
+            "INSERT INTO decoder_event (capture_id, field_id, kind, file_loc, source)"
+            " VALUES (1, 50, 'resume_seam', 50000, 'decoder')"
+        )
+        conn.commit()
+        conn.close()
+
+        events = load_events_from_db(db, 1)
+
+        assert [(e["field"], e["kind"]) for e in events] == [
+            (5, "no_sync_pulses"),
+            (50, "duplicate_field"),
+            (50, "redo"),
+            (50, "resume_seam"),
+            (97, "dropped_field"),
+        ]
+        first = events[0]
+        assert list(first) == sorted(first)
+        assert first == {
+            "detailJson": '{"distanceFields":2.0}',
+            "field": 5,
+            "fileLoc": 5 * STRIDE,
+            "kind": "no_sync_pulses",
+            "rfDeltaFields": 2.0,
+            "rfDeltaSamples": 2 * STRIDE,
+            "source": "decoder",
+        }
+        # NULL columns are omitted, never null in the JSON.
+        assert events[2] == {"field": 50, "kind": "redo", "source": "decoder"}
+        assert all(type(e["field"]) is int for e in events)
+        json.dumps(events, allow_nan=False)
+
+    def test_unknown_capture_is_empty(self, tmp_path):
+        db = _make_db(tmp_path / "out.tbc.db", fields=10)
+        assert load_events_from_db(db, capture_id=99) == []
+
+
+class TestLoadSegmentsFromDb:
+    def test_json_shape_in_field_order(self, tmp_path):
+        db = _make_db(tmp_path / "out.tbc.db", fields=100)
+
+        segments = load_segments_from_db(db, 1)
+
+        assert [(s["startField"], s["endFieldExclusive"]) for s in segments] == [
+            (0, 100), (0, 50), (90, 100), (95, 100)
+        ]
+        derived = segments[0]
+        assert list(derived) == sorted(derived)
+        assert derived == {
+            "enabled": True,
+            "endFieldExclusive": 100,
+            "id": 1,
+            "kind": "clip",
+            "source": "derived",
+            "startField": 0,
+            "title": "derived 0",
+        }
+        # Same-start segments order by id; ids are the stored ones.
+        assert [s["id"] for s in segments] == [1, 2, 3, 4]
+        json.dumps(segments, allow_nan=False)
+
+
+class TestMinimalFieldsPictureMetrics:
+    def test_rebuilds_the_finite_metrics_only(self, tmp_path):
+        db = _make_db(tmp_path / "out.tbc.db", fields=8)
+
+        fields = minimal_fields_from_db(db, capture_id=1, field_count=6)
+
+        assert len(fields) == 6
+        assert fields[0]["pictureMetrics"] == {"lumaMeanIre": 30.0, "noiseIre": 2.0}
+        assert fields[3]["fileLoc"] == 3 * STRIDE  # the core keys are unchanged
+
+    def test_a_field_without_a_metrics_row_has_no_key(self, tmp_path):
+        db = _make_db(tmp_path / "out.tbc.db", fields=4)
+        conn = sqlite3.connect(str(db))
+        conn.execute("DELETE FROM picture_metrics WHERE field_id = 2")
+        conn.commit()
+        conn.close()
+
+        fields = minimal_fields_from_db(db, capture_id=1, field_count=4)
+
+        assert "pictureMetrics" in fields[1]
+        assert "pictureMetrics" not in fields[2]
