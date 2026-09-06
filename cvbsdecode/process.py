@@ -561,6 +561,8 @@ class CVBSDecode(ldd.LDdecode):
         # Store reference to ourself in the rf decoder - needed to access data location for track
         # phase, may want to do this in a better way later.
         self.rf.decoder = self
+        # The event log's nominal samples per field follows the replaced rf.
+        self._sync_event_rate()
         if system == "PAL":
             self.FieldClass = FieldPALCVBS
         elif system == "NTSC":
@@ -680,6 +682,10 @@ class CVBSDecode(ldd.LDdecode):
             if not self.capture_id:
                 self.build_sqlite_metadata()
             self._db_writer.write_field(fi_out, self.capture_id, self.doDOD)
+            # Events logged since the last field ride in this field's commit.
+            self._db_writer.write_events(
+                self.events.to_db_rows(self.capture_id, self.events.unsent())
+            )
             # NOTE: this calls commit so we don't call it in dbwriter.write_field.
             self.build_sqlite_metadata()
 

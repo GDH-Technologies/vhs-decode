@@ -1767,6 +1767,7 @@ class FieldShared:
 
         if res == NO_PULSES_FOUND:
             ldd.logger.error("Unable to find any sync pulses, jumping 100 ms")
+            self.invalid_reason = "no_sync_pulses"
             return None, None, int(self.rf.freq_hz / 10)
 
         line0loc, first_hsync_loc, first_hsync_loc_line, meanlinelen, vblank_pulses = res
@@ -1790,6 +1791,7 @@ class FieldShared:
         if first_hsync_loc is None:
             if self.initphase is False:
                 ldd.logger.error("Unable to determine start of field - dropping field")
+            self.invalid_reason = "no_field_start"
             return None, None, self.inlinelen * 100
 
         # If we don't have enough data at the end, move onto the next field

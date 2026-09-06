@@ -901,6 +901,15 @@ def main(args=None, use_gui=False):
         # predecessor fields for parity checks, and replays every prior
         # field into the JSON dumper so the final .tbc.json is complete.
         vhsd.fieldinfo.seed(recovered)
+        # The interrupted run's decoder events and segments continue too
+        # (the truncation already cut both back to the seam), and the seam
+        # itself is recorded as a resume_seam event on the first appended
+        # field.
+        vhsd.seed_resume(
+            plan,
+            tbc_db.load_events_from_db(db_path, plan.capture_id),
+            tbc_db.load_segments_from_db(db_path, plan.capture_id),
+        )
         vhsd.fields_written = plan.field_count
         vhsd.fields_written_offset = plan.field_count
         vhsd.capture_id = plan.capture_id

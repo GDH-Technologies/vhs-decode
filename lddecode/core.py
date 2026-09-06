@@ -25,6 +25,7 @@ from scipy import interpolate
 # internal libraries
 
 from . import efm_pll
+from .decoder_events import DecoderEventLog
 from .picture_metrics import geometry_from_video_parameters, measure_field
 from .tbc_db import (
     DECODER_EVENT_INSERT_SQL,
@@ -1643,6 +1644,10 @@ class Field:
 
         self.needrerun = False
         self.valid = False
+        # Why compute_linelocs gave up on this field (a decoder event kind:
+        # "no_sync_pulses" / "no_field_start"); None while valid or when the
+        # retry is only a buffer-alignment re-read.
+        self.invalid_reason = None
         self.sync_confidence = 100
 
         self.dspicture = None
@@ -2354,6 +2359,7 @@ class Field:
 
         self.rawpulses = self.getpulses()
         if self.rawpulses is None or len(self.rawpulses) == 0:
+            self.invalid_reason = "no_sync_pulses"
             if self.fields_written:
                 logger.error("Unable to find any sync pulses, skipping one field")
                 return None, None, None
@@ -2387,6 +2393,7 @@ class Field:
             if self.initphase is False:
                 logger.error("Unable to determine start of field - dropping field")
 
+            self.invalid_reason = "no_field_start"
             return None, None, self.inlinelen * 200
 
         # If we don't have enough data at the end, move onto the next field
@@ -3694,6 +3701,16 @@ class LDdecode:
         self._picture_geometry_disabled = False
         self._written_luma_ring = deque(maxlen=2)
 
+        # Decoder events (lddecode.decoder_events): immutable facts recorded
+        # while decoding, written to decoder_event with each field's commit
+        # and re-emitted as "decoderEvents" in the JSON. The nominal RF
+        # samples per field is synced from self.rf (subclasses replace it).
+        self.events = DecoderEventLog()
+        self._sync_event_rate()
+        # Segments are tbc-tools' editable layer; the decoder never derives
+        # them and only carries the stored ones through a --resume.
+        self.segments = []
+
         self.leadIn = False
         self.leadOut = False
         self.isCLV = False
@@ -3738,6 +3755,8 @@ class LDdecode:
             "outfile_ac3",
         ]:
             setattr(self, outfiles, None)
+
+        self.flush_events()
 
         self.demodcache.end()
 
@@ -3844,6 +3863,72 @@ class LDdecode:
             self.outfile_ac3.write(np.int8(odata))
 
             blk = self.AC3Collector.get_block()
+
+    def _sync_event_rate(self):
+        """Point the event log at self.rf's nominal RF samples per field."""
+        self.events.set_rate(self.rf.freq_hz, self.rf.SysParams["FPS"])
+
+    def _record_invalid_field(self, f, offset):
+        """A decoder event for a field readfield discarded, if it had a reason.
+
+        ``offset`` is the jump readfield takes past it (the field's
+        nextfieldoffset); the event names the first field written after it.
+        """
+        reason = getattr(f, "invalid_reason", None)
+        if not reason:
+            return
+        detail = None if offset is None else {"jumpSamples": int(round(float(offset)))}
+        self.events.append(
+            reason,
+            len(self.fieldinfo),
+            file_loc=f.readloc,
+            rf_delta_samples=offset,
+            detail=detail,
+        )
+
+    def _record_field_order_event(self, kind, fi, prevfi, distance_fields, detail=None):
+        """A decoder event for a same-parity field-order action in buildmetadata."""
+        detail = dict(detail or {})
+        detail["distanceFields"] = round(float(distance_fields), 3)
+        file_loc = fi.get("fileLoc")
+        prev_loc = prevfi.get("fileLoc") if prevfi else None
+        delta = None if file_loc is None or prev_loc is None else file_loc - prev_loc
+        self.events.append(
+            kind,
+            len(self.fieldinfo),
+            file_loc=file_loc,
+            rf_delta_samples=delta,
+            detail=detail,
+        )
+
+    def _record_redo(self, target, offset, reason):
+        """A decoder event for readfield rewinding to ``target`` to re-decode."""
+        self.events.append(
+            "redo",
+            len(self.fieldinfo),
+            file_loc=target,
+            rf_delta_samples=None if offset is None else -offset,
+            detail={"reason": reason},
+        )
+
+    def flush_events(self):
+        """Persist events logged after the last written field (the EOF tail).
+
+        The per-field writers insert events with each field's commit; an
+        event with no field after it (a sync loss at the end of the input)
+        would otherwise only reach the JSON.
+        """
+        rows = self.events.unsent()
+        conn = getattr(self, "dbconn", None)
+        if not rows or conn is None or not self.capture_id:
+            return
+        try:
+            conn.executemany(
+                DECODER_EVENT_INSERT_SQL, self.events.to_db_rows(self.capture_id, rows)
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.warning("could not write trailing decoder events: %s", exc)
 
     def measure_picture(self, luma, chroma=None):
         """Per-field picture metrics for the field about to be written.
@@ -3977,9 +4062,14 @@ class LDdecode:
             self.dbconn.executemany('''
                 INSERT INTO drop_outs (
                     capture_id, field_id, field_line, startx, endx
-                ) VALUES (?, ?, ?, ?, ?)''', 
+                ) VALUES (?, ?, ?, ?, ?)''',
                 dropout_data)
-            
+
+        # Decoder events logged since the last field, in this field's commit.
+        eventRows = self.events.to_db_rows(c_id, self.events.unsent())
+        if eventRows:
+            self.dbconn.executemany(DECODER_EVENT_INSERT_SQL, eventRows)
+
         self.build_sqlite_metadata()
         self.dbconn.commit()
 
@@ -4140,6 +4230,11 @@ class LDdecode:
                 if offset:
                     toffset += offset
 
+                if f is not None:
+                    # An invalid field never reaches buildmetadata; record
+                    # why it was skipped and how far we jump.
+                    self._record_invalid_field(f, offset)
+
             df_args = (toffset, self.mtf_level, prevfield, initphase, False, self.threadreturn)
 
             if self.numthreads != 0:
@@ -4171,8 +4266,10 @@ class LDdecode:
                     self.bw_ratios.append(metrics["blackToWhiteRFRatio"])
                     self.bw_ratios = self.bw_ratios[-keep:]
 
+                redo_reason = None
                 redo = f.needrerun or not self.checkMTF(f, self.fieldstack[0])
                 if redo:
+                    redo_reason = "needrerun" if f.needrerun else "mtf"
                     redo = self.fdoffset - offset
 
                 # Perform AGC changes on first fields only to prevent luma mismatch intra-field
@@ -4198,6 +4295,7 @@ class LDdecode:
                                 ))
                         else:
                             redo = self.fdoffset - offset
+                            redo_reason = redo_reason or "agc"
 
                             self.rf.DecoderParams["ire0"] = ire0_hz
                             # Note that vsync_ire is a negative number, so (sync_hz - ire0_hz) is correct
@@ -4205,6 +4303,7 @@ class LDdecode:
                             self.rf.DecoderParams["vsync_ire"] = vsync_ire
 
                 if adjusted is False and redo:
+                    self._record_redo(redo, offset, redo_reason)
                     adjusted = True
                     self.fdoffset = redo
                 else:
@@ -4552,6 +4651,11 @@ class LDdecode:
                     logger.error("Skipped field")
                     decodeFaults |= 4
                     fi["syncConf"] = 0
+                    # The caller writes the previous field again as filler:
+                    # the event names that duplicated copy.
+                    self._record_field_order_event(
+                        "duplicate_field", fi, prevfi, fi["diskLoc"] - prevfi["diskLoc"]
+                    )
                     return fi, True
 
         fi["decodeFaults"] = decodeFaults
@@ -4788,6 +4892,14 @@ class LDdecode:
         ))
 
         jout["videoParameters"] = vp
+
+        # Top-level keys are re-dumped on every JSON flush (per-field dicts
+        # only once), so the append-only event log and the carried segments
+        # live here. decoderEvents is always present: [] says "this decoder
+        # records events" to a reader deciding whether to reconstruct them.
+        jout["decoderEvents"] = self.events.to_json()
+        if self.segments:
+            jout["segments"] = [dict(segment) for segment in self.segments]
 
         return jout
 
