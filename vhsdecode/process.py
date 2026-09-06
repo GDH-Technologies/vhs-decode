@@ -438,9 +438,18 @@ class VHSDecode(ldd.LDdecode):
         if "audioSamples" in fi:
             del fi["audioSamples"]
 
+        # Output order is definitive only here (the caller has resolved
+        # duplicates and drops), so the per-field record is finalised here:
+        # a copy per written field (a duplicated field gets its own seqNo
+        # and metrics) with the picture metrics set before the dict reaches
+        # fieldinfo (the JSON dumper serialises each field dict once).
+        fi_out = fi.copy()
+        fi_out["seqNo"] = len(self.fieldinfo) + 1
+        metrics = self.measure_picture(picturey, picturec)
+        if metrics:
+            fi_out["pictureMetrics"] = metrics
+
         if self._db_writer:
-            fi_out = fi.copy()
-            fi_out["seqNo"] = len(self.fieldinfo) + 1
             if not self.capture_id:
                 self.build_sqlite_metadata()
             self.fieldinfo.append(fi_out)
@@ -448,7 +457,7 @@ class VHSDecode(ldd.LDdecode):
             # NOTE: this calls commit so we don't call it in dbwriter.write_field.
             self.build_sqlite_metadata()
         else:
-            self.fieldinfo.append(fi)
+            self.fieldinfo.append(fi_out)
 
         self.outfile_video.write(picturey)
         if self.rf.options.write_chroma:

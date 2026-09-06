@@ -664,12 +664,22 @@ class CVBSDecode(ldd.LDdecode):
         if "audioSamples" in fi:
             del fi["audioSamples"]
 
-        self.fieldinfo.append(fi)
+        # Output order is definitive only here (the caller has resolved
+        # duplicates), so the per-field record is finalised here: a copy per
+        # written field with the picture metrics set before the dict reaches
+        # fieldinfo (the JSON dumper serialises each field dict once).
+        fi_out = fi.copy()
+        fi_out["seqNo"] = len(self.fieldinfo) + 1
+        metrics = self.measure_picture(picture)
+        if metrics:
+            fi_out["pictureMetrics"] = metrics
+
+        self.fieldinfo.append(fi_out)
 
         if self._db_writer:
             if not self.capture_id:
                 self.build_sqlite_metadata()
-            self._db_writer.write_field(fi, self.capture_id, self.doDOD)
+            self._db_writer.write_field(fi_out, self.capture_id, self.doDOD)
             # NOTE: this calls commit so we don't call it in dbwriter.write_field.
             self.build_sqlite_metadata()
 

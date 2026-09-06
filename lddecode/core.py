@@ -8,6 +8,7 @@ import threading
 import time
 import types
 
+from collections import deque
 from queue import Queue
 from importlib.resources import files
 
@@ -24,6 +25,7 @@ from scipy import interpolate
 # internal libraries
 
 from . import efm_pll
+from .picture_metrics import geometry_from_video_parameters, measure_field
 from .tbc_db import (
     DECODER_EVENT_INSERT_SQL,
     DECODER_LD,
@@ -3682,6 +3684,16 @@ class LDdecode:
 
         self.fieldinfo = FieldInfo()
 
+        # Per-field picture metrics (lddecode.picture_metrics), measured in
+        # writeout on the field as written. The geometry is built lazily
+        # from build_json() on the first written field; the ring holds the
+        # last two written luma fields so field n is compared with n-2
+        # (same parity by output index).
+        self.picture_metrics_enabled = bool(extra_options.get("picture_metrics", True))
+        self._picture_geometry = None
+        self._picture_geometry_disabled = False
+        self._written_luma_ring = deque(maxlen=2)
+
         self.leadIn = False
         self.leadOut = False
         self.isCLV = False
@@ -3833,6 +3845,50 @@ class LDdecode:
 
             blk = self.AC3Collector.get_block()
 
+    def measure_picture(self, luma, chroma=None):
+        """Per-field picture metrics for the field about to be written.
+
+        Runs in output order (the caller has resolved duplicates and drops)
+        so the same-parity difference is against the field written two
+        before this one, which is what tbc-segments' walk compares. Empty
+        when disabled (--no_picture_metrics), when no measurable geometry
+        can be built for the system, or when nothing is measurable.
+        """
+        if not self.picture_metrics_enabled or self._picture_geometry_disabled:
+            return {}
+        if self._picture_geometry is None:
+            try:
+                js = self.build_json()
+            except Exception:
+                js = None
+            vp = js.get("videoParameters") if js else None
+            if not vp:
+                # Nothing to build from yet; try again on the next field.
+                return {}
+            system = getattr(self.rf, "color_system", None) or vp.get("system")
+            geometry = geometry_from_video_parameters(vp, system)
+            if geometry is None or not geometry.valid():
+                self._picture_geometry_disabled = True
+                logger.info(
+                    "Picture metrics disabled: no measurable field geometry for %s",
+                    system,
+                )
+                return {}
+            self._picture_geometry = geometry
+
+        if isinstance(luma, (bytes, bytearray, memoryview)):
+            luma = np.frombuffer(luma, dtype=np.uint16)
+        luma = np.asarray(luma)
+        ring = self._written_luma_ring
+        previous = ring[0] if len(ring) == ring.maxlen else None
+        try:
+            metrics = measure_field(luma, chroma, previous, self._picture_geometry)
+        except Exception:
+            logger.debug("picture metrics failed for this field", exc_info=True)
+            metrics = {}
+        ring.append(luma)
+        return metrics
+
     def writeout(self, dataset):
         f, fi, picture, audio, efm = dataset
         if self.digital_audio is True:
@@ -3845,12 +3901,22 @@ class LDdecode:
         fi["audioSamples"] = 0 if audio is None else int(len(audio) / 2)
         fi["efmTValues"] = len(efm_out) if self.digital_audio else 0
 
+        # Output order is definitive only here, so the per-field record is
+        # finalised here: a copy per written field (a filler duplicate gets
+        # its own seqNo and metrics) with the picture metrics set before the
+        # dict reaches fieldinfo (the JSON dumper serialises it once).
+        fi = fi.copy()
+        fi["seqNo"] = len(self.fieldinfo) + 1
+        pictureMetrics = self.measure_picture(picture)
+        if pictureMetrics:
+            fi["pictureMetrics"] = pictureMetrics
+
         self.fieldinfo.append(fi)
 
         if not self.capture_id:
             self.build_sqlite_metadata()
 
-        c_id = self.capture_id 
+        c_id = self.capture_id
         f_id = self.fields_written
 
         decodeFaults = None if fi.get('decodeFaults') == 0 else fi.get('decodeFaults')
@@ -4694,6 +4760,10 @@ class LDdecode:
 
         vp["fieldWidth"] = f.rf.SysParams["outlinelen"]
         vp["sampleRate"] = f.rf.SysParams["outfreq"] * 1000000
+        # The rate every field's fileLoc counts in (the working RF rate,
+        # after any input resampling) -- what a Δ fileLoc must be compared
+        # against to be read in fields. sampleRate above is the TBC output.
+        vp["rfSourceSampleRateHz"] = float(self.rf.freq_hz)
 
         vp["black16bIre"]    = float(f.hz_to_output(f.rf.iretohz(self.blackIRE)))
         vp["white16bIre"]    = float(f.hz_to_output(f.rf.iretohz(100)))

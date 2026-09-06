@@ -254,6 +254,17 @@ def common_parser_inner(parser, use_gui=False, default_threads=DEFAULT_THREADS):
         action="store_true",
         default=False,
         help="Enable sqlite output (slow on hdds), not finalized, option may change")
+    file_options_group.add_argument(
+        "--no_picture_metrics",
+        dest="picture_metrics",
+        action="store_false",
+        default=True,
+        help=(
+            "Skip the per-field picture metrics (luma mean, blanking/sync"
+            " deviation, noise, burst amplitude, same-parity difference)"
+            " written to the metadata (default: on)"
+        ),
+    )
     input_format_group = parser.add_argument_group("Input format")
     input_format_group.add_argument(
         "-f",
@@ -435,7 +446,10 @@ def get_extra_options(args, checkagc=False):
         "debug": args.debug,
         "wow_level_adjust_smoothing": args.wow_level_adjust_smoothing,
         "wow_interpolation_method": args.wow_interpolation_method,
-        "write_db": args.write_db
+        "write_db": args.write_db,
+        # Per-field picture metrics in the metadata (--no_picture_metrics
+        # turns them off); default on when a parser lacks the flag.
+        "picture_metrics": getattr(args, "picture_metrics", True),
     }
     if checkagc:
         extra_options["useAGC"]: args.AGC and not args.noAGC
