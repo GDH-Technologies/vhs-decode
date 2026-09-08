@@ -2,6 +2,7 @@ import copy
 import itertools
 import os
 import platform
+import re
 import sqlite3
 import sys
 import threading
@@ -4854,6 +4855,17 @@ class LDdecode:
                 after = self.version.split("+git.", 1)[1]
                 git_commit = after.split(".", 1)[0]
                 git_branch = "release"
+            elif "+gdh." in self.version or "+gdh-" in self.version:
+                # GDH fork version, e.g. 0.4.0+gdh.1.0.13.g143a89f8[.dirty].
+                # The node is the one segment starting with "g" followed by
+                # hex; when the build sits exactly on a tag there is none, and
+                # the sidecar records the branch without a commit.
+                after = self.version.split("+", 1)[1]
+                for segment in after.split("."):
+                    if re.fullmatch(r"g[0-9a-f]{4,40}", segment):
+                        git_commit = segment[1:]
+                        break
+                git_branch = "gdh"
 
         if git_branch:
             vp["gitBranch"] = git_branch

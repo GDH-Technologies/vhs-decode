@@ -55,6 +55,13 @@ def _fallback_version() -> str:
         from vhsdecode._version import __version__ as pkg_version
         from vhsdecode._version import __commit_id__ as commit_id
 
+        # A GDH fork version (0.4.0+gdh.1.0.13.g143a89f8) already names the
+        # release AND the commit, so it is strictly more informative than the
+        # bare commit id. This is the path the fleet takes: a pipx/pip install
+        # writes no lddecode/version file, so without this the .tbc.json
+        # sidecar would record only a sha and lose the gdh release entirely.
+        if pkg_version and "+gdh" in str(pkg_version):
+            return str(pkg_version)
         if commit_id:
             return f"vhs_decode:{commit_id}"
         if pkg_version:
