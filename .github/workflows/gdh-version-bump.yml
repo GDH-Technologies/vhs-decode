@@ -1,0 +1,112 @@
+name: "GDH version bump"
+
+# Cut a GDH fork version tag: v<upstream>-gdh-<major>.<minor>.
+#
+# The tag is the only source of truth for the GDH version -- no file is bumped
+# or committed. setuptools_scm turns the tag into the package version
+# (0.4.0+gdh.1.0), and scripts/gdh_version.py scans Conventional Commits since
+# the last gdh tag to pick the level.
+#
+# This is a GDH-owned workflow, not an inherited one: it does not exist upstream
+# and is not held byte-identical to it. See .github/GDH_SELFHOSTED_CI.md.
+#
+# NOTE: the inherited "Release" workflow triggers on `tags: ["v*"]`, which a gdh
+# tag matches. It is disabled at the repository level, so pushing one here does
+# nothing. If it is ever re-enabled, it needs a `- "!v*-gdh-*"` exclusion first.
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: "Bump level (auto scans Conventional Commits since the last gdh tag)"
+        required: false
+        default: "auto"
+        type: choice
+        options: ["auto", "minor", "major"]
+      dry_run:
+        description: "Only print the proposal; do not create or push a tag"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  bump:
+    name: Propose and tag
+    # Self-hosted: GitHub-hosted minutes are billable, and the fleet runner
+    # already has git and python3.
+    runs-on: [self-hosted, Linux, X64, wm]
+    steps:
+      - name: Refuse to tag from anywhere but main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "GDH version tags are only cut from refs/heads/main (current: $REF)." >&2
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          # Both are mandatory. The upstream base is found with `git describe`,
+          # so a shallow or tagless checkout resolves the wrong base entirely --
+          # the same trap documented for setuptools_scm in GDH_SELFHOSTED_CI.md.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Refresh tags
+        # The self-hosted workspace persists between runs, so a tag deleted or
+        # moved on the remote can linger locally and poison `git describe`.
+        run: git fetch --tags --prune --prune-tags --force origin
+
+      - name: Propose the next version
+        id: propose
+        env:
+          LEVEL: ${{ inputs.level }}
+        run: |
+          set +e
+          OUTPUT="$(python3 scripts/gdh_version.py propose --level "$LEVEL" 2>&1)"
+          STATUS=$?
+          set -e
+
+          printf '%s\n' "$OUTPUT"
+          {
+            echo "## GDH version bump"
+            echo
+            echo '```'
+            printf '%s\n' "$OUTPUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" -eq 2 ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing in range warrants a release; re-run with level=minor or level=major to force one." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$STATUS" -ne 0 ]; then
+            exit "$STATUS"
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push the tag
+        if: ${{ inputs.dry_run == false && steps.propose.outputs.proceed == 'true' }}
+        env:
+          LEVEL: ${{ inputs.level }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # In Actions, `origin` is this repository (the GDH fork). On a
+          # developer checkout it is usually oyvindln's, and the fork is `fork`
+          # -- hence the explicit --remote.
+          python3 scripts/gdh_version.py bump --level "$LEVEL" --push --remote origin \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Note that this was a dry run
+        if: ${{ inputs.dry_run == true && steps.propose.outputs.proceed == 'true' }}
+        run: |
+          echo "Dry run: no tag was created. Re-run with dry_run=false to cut it." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

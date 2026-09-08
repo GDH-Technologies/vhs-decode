@@ -17,6 +17,33 @@ from Cython.Build import cythonize
 
 import numpy
 
+
+def _load_gdh_version():
+    """Load scripts/gdh_version.py by path.
+
+    setuptools_scm takes a local_scheme callable only through setup.py, and a
+    plain `import` would not resolve: under PEP 517 the project root is not
+    guaranteed to be on sys.path. Loading by path off __file__ always works,
+    and keeps the version rule in exactly one place.
+    """
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "gdh_version.py")
+    spec = importlib.util.spec_from_file_location("gdh_version", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _gdh_local_scheme(version):
+    """PEP 440 local segment carrying the GDH fork version.
+
+    The public part is upstream's release tag (version_scheme = "only-version"
+    in pyproject.toml); this adds `+gdh.<major>.<minor>[.<n>.g<sha>][.dirty]`.
+    """
+    return _load_gdh_version().gdh_local_scheme(version)
+
+
 def _executables_on_path(name):
     """Every executable called `name` on PATH, in PATH order, de-duplicated.
 
@@ -110,6 +137,9 @@ else:
 os.environ.setdefault("SETUPTOOLS_RUST_CARGO_PROFILE", "release")
 
 setup(
+    # Merges over [tool.setuptools_scm] in pyproject.toml, per key: only the
+    # callable lives here, everything else stays in TOML.
+    use_scm_version={"local_scheme": _gdh_local_scheme},
     # name='ld-decode',
     # version='7',
     # description='Software defined LaserDisc decoder',
