@@ -23,14 +23,42 @@
 # stop a macOS deploy, and vice versa.
 name: Self-hosted build and deploy (GDH fork)
 
+# The setup-only set, repeated under both events because a paths filter is per-event.
+# A commit confined to docs, Markdown or editor config cannot change a byte of what pipx
+# installs, so it should build nothing and deploy nowhere -- and upstream syncs bring
+# Markdown by the hundred lines. NOT ignored: .flake8 and .gitmodules, which are lint
+# configuration and submodule pins respectively, and .github/**, so a change to this
+# workflow exercises itself.
+#
+# paths-ignore is safe here only because this workflow feeds no required check and this
+# `push` trigger carries no tags: a filtered-out workflow reports no check runs at all,
+# and path filtering against a freshly created tag ref is not something GitHub contracts
+# to evaluate. Add either, and this has to become an in-workflow classifier job instead
+# (see MISRC-GUI's selfhosted-deploy.yml, which needs exactly that).
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "**/*.md"
+      - ".vscode/**"
+      - "*.code-workspace"
+      - ".gitignore"
+      - ".gitattributes"
   # main only. A feature branch with an open PR is already covered by the pull_request
   # event -- triggering on '**' as well would double every run, which is the exact noise
   # this workflow was created to stop.
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "**/*.md"
+      - ".vscode/**"
+      - "*.code-workspace"
+      - ".gitignore"
+      - ".gitattributes"
   workflow_dispatch:
 
 permissions:
