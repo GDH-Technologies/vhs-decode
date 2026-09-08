@@ -62,6 +62,14 @@ and re-enable any one with `gh workflow enable`.
 a `v*` tag produces no release build, or why a PR shows no ubuntu/windows/macOS jobs,
 that's why.
 
+> **Trap — `release.yml` vs GDH version tags.** The inherited `release.yml` triggers on
+> `tags: ["v*"]`, and a GDH version tag (`v0.4.0-gdh-1.0`, see below) matches that glob. It
+> is disabled today, so cutting one does nothing. **If it is ever re-enabled, add a
+> `- "!v*-gdh-*"` exclusion to its tag filter first**, or every GDH tag will start a release
+> build and then fail its SemVer check. (`tbc-tools`, whose release workflow is not
+> disabled, already carries exactly that exclusion.) `nightly.yml` is unaffected: it
+> triggers on merged PRs, not on tags.
+
 It is a setting rather than an `if:` guard or a deleted file because upstream churns
 `.github/workflows` constantly and we merge from `oyvindln/vhs_decode` regularly. Leaving
 those files untouched keeps every upstream merge conflict-free.
@@ -285,6 +293,42 @@ git push <gdh-fork-url> --tags
 
 If a fresh clone of the fork ever stamps `0.1.devN` again, the tags are gone — re-push
 them. Identify both remotes by URL, never by name: remote names differ per machine.
+
+## The GDH fork version: `v<upstream>-gdh-<major>.<minor>`
+
+The fork carries its own version on top of upstream's, in a git tag and nowhere else — no
+file is bumped or committed:
+
+| surface | string |
+| --- | --- |
+| git tag | `v0.4.0-gdh-1.0` |
+| `vhs-decode --version` | `0.4.0-gdh-1.0` |
+| `pip show` / wheel name | `0.4.0+gdh.1.0` |
+| ahead of the tag | `0.4.0+gdh.1.0.13.g143a89f8`, `.dirty` when dirty |
+| before the first gdh tag | `0.4.0+gdh.0.0.<n>.g<sha>` — the `gdh.0.0` sentinel |
+
+`0.4.0-gdh-1.0` is not a legal PEP 440 version, so the package metadata encodes it as a
+local segment; the two are the same version and sort identically.
+`vhsdecode/cmdcommons.py:to_canonical_version` converts back for display.
+
+- **`<upstream>` is found with `git describe`, never by version-sorting the tag list.**
+  `v0.5`, `v0.6` and `v0.7` are ancient ld-decode tags (2014–2017) that are reachable from
+  HEAD and sort *above* `v0.4.0`, so `git tag --sort=-v:refname --merged HEAD` answers
+  `0.7`. `git describe` picks the nearest by distance and answers `0.4.0`.
+- Cut a tag with the **GDH version bump** workflow (`gdh-version-bump.yml`, self-hosted on
+  `wm`, dry-run by default). It scans Conventional Commits since the last gdh tag:
+  `feat!:`/`BREAKING CHANGE:` → major, `feat:` → minor, otherwise no bump.
+- When upstream moves, the counters **reset to `gdh-1.0`**.
+- `scripts/gdh_version.py` implements all of it and runs standalone:
+  `python3 scripts/gdh_version.py show|propose|bump`.
+- **A local version segment cannot be uploaded to PyPI** (Warehouse rejects it). The
+  `Push to PyPI` / `Push to TestPyPI` workflows are disabled on this fork anyway and the
+  fleet installs with pipx from a checkout, so nothing in the GDH path breaks — but if you
+  ever need a PyPI-shaped build, set `SETUPTOOLS_SCM_LOCAL_SCHEME=no-local-version` for
+  that build rather than changing `pyproject.toml`.
+- `setuptools_scm` is pinned to `>=10,<11`: the config uses the nested
+  `[tool.setuptools_scm.tag]` / `[.scm.git]` tables and the `only-version` scheme, none of
+  which exist in 8.x. A looser floor silently degrades the version.
 
 ## `air0` — the macOS node
 

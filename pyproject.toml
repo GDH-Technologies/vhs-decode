@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=61", "setuptools-rust", "setuptools_scm>=6.2", "wheel", "Cython", "numpy"]
+# setuptools_scm is pinned to 10.x: the GDH version scheme uses the nested
+# [tool.setuptools_scm.tag] / [.scm.git] tables and the "only-version" scheme,
+# none of which exist in 8.x. A looser floor silently degrades the version.
+requires = ["setuptools>=61", "setuptools-rust", "setuptools_scm>=10,<11", "wheel", "Cython", "numpy"]
 # requires = ["setuptools>=61", "wheel", "Cython", "numpy"]
 build-backend = "setuptools.build_meta"
 
@@ -84,10 +87,34 @@ Issues = "https://github.com/oyvindln/vhs-decode/issues"
 
 [tool.setuptools_scm]
 write_to = "vhsdecode/_version.py"
-local_scheme = "no-local-version"
-# Restrict git describe/version parsing to real version tags (avoid tags like "rev4.0" breaking builds)
-git_describe_command = "git describe --dirty --tags --long --match [0-9]* --match v[0-9]*"
-tag_regex = '^(?:v)?(?P<version>\d+(?:\.\d+)*(?:(?:a|b|rc)\d*)?)$'
+# Silences the pending-default DeprecationWarning; the default flips next major.
+write_to_source = true
+# The public version is upstream's release, verbatim and never bumped. The GDH
+# delta lives entirely in the local segment, supplied by gdh_local_scheme in
+# setup.py (a callable cannot be expressed in TOML). See scripts/gdh_version.py.
+version_scheme = "only-version"
+# No git (nix, or an unpacked tarball): a preformatted fallback, which makes
+# setuptools_scm skip both schemes rather than calling them without a repo.
+fallback_version = "0.0.0"
+
+[tool.setuptools_scm.tag]
+# One capture group, named `version`, as setuptools_scm requires. The trailing
+# lookahead lets a gdh tag match without swallowing its suffix into group(0) --
+# consuming it instead would trip the "tag will be stripped of its suffix"
+# warning on every build.
+regex = '^(?:v)?(?P<version>\d+(?:\.\d+)*(?:(?:a|b|rc)\d*)?)(?=$|-gdh-\d+\.\d+$)'
+
+[tool.setuptools_scm.scm.git]
+# Upstream release tags only. Two exclusions matter:
+#   nightly-*  nightly.yml is live on this fork and cuts dated tags
+#   *-gdh-*    a gdh tag must never become the public version
+# Restricted to real version tags for the original reason too: tags like
+# "rev4.0" would otherwise break parsing.
+describe_command = [
+    "git", "describe", "--dirty", "--tags", "--long", "--abbrev=8",
+    "--match", "v[0-9]*", "--match", "[0-9]*",
+    "--exclude", "nightly-*", "--exclude", "*-gdh-*",
+]
 
 [tool.setuptools.package-data]
 vhs_decode = ["*.txt"]

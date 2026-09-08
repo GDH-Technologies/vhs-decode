@@ -1,6 +1,7 @@
 import argparse
 import importlib.metadata
 import os
+import re
 from typing import Optional
 
 import lddecode.utils as lddu
@@ -109,17 +110,46 @@ class TestOutputFile(argparse.Action):
             setattr(namespace, self.dest, values)
 
 
+def to_canonical_version(version: str) -> str:
+    """Rewrite a PEP 440 GDH version into the canonical form its tag carries.
+
+    `0.4.0+gdh.1.0.13.g143a89f8` -> `0.4.0-gdh-1.0+13.g143a89f8`.
+
+    PEP 440 has no room for `-gdh-` in a package version, so the build encodes
+    it as a local segment; this puts it back for display. `-` is accepted
+    between the counters as well as `.`, because the literal written to
+    _version.py keeps the pre-normalisation form (see scm_local_segment in
+    scripts/gdh_version.py). Non-GDH versions pass through untouched.
+
+    Mirrors scripts/gdh_version.py:to_canonical, which is not importable at
+    runtime -- scripts/ is not part of the installed package.
+    """
+    match = re.match(
+        r"^(?P<upstream>[^+]+)\+gdh[.-](?P<major>\d+)[.-](?P<minor>\d+)(?P<rest>.*)$",
+        version,
+    )
+    if not match:
+        return version
+    out = f"{match.group('upstream')}-gdh-{match.group('major')}.{match.group('minor')}"
+    rest = match.group("rest").lstrip(".")
+    return f"{out}+{rest}" if rest else out
+
+
 def get_version_string() -> str:
     """Version of vhs-decode, from the build-time version file or, failing
-    that, the installed package metadata."""
+    that, the installed package metadata.
+
+    Reported in the canonical `<upstream>-gdh-<major>.<minor>` form; the
+    package metadata carries the PEP 440 encoding of the same thing.
+    """
     try:
         from vhsdecode._version import __version__
 
-        return __version__
+        return to_canonical_version(__version__)
     except ImportError:
         pass
     try:
-        return importlib.metadata.version("vhs_decode")
+        return to_canonical_version(importlib.metadata.version("vhs_decode"))
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
 
