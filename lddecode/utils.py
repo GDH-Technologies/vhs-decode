@@ -1589,6 +1589,15 @@ class JSONDumper:
             except (InterruptedError, KeyboardInterrupt):
                 break
 
+            if jsondict is None:
+                # build_json returns None when the decode never produced a
+                # usable field. There is no metadata to write, and opening
+                # the temp file anyway used to leave a one-byte .tbc.json.tmp
+                # behind and kill this thread on the first .items() call --
+                # the decoder has already reported the failure itself.
+                ready.clear()
+                continue
+
             # json serialize each field info object to a string
             serialized_field_info = []
             for field in next_field_info:

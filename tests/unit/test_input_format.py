@@ -160,3 +160,40 @@ class TestReadersNumpyRemoved:
             data = utils.load_unpacked_data_float32(infile, 0, len(samples))
 
         assert data.tolist() == [v * 32768 for v in samples]
+
+
+class TestDumperWithoutMetadata:
+    """A decode that produced no usable field still has to shut down cleanly."""
+
+    def _drain(self, tmp_path, item):
+        import queue as _queue
+        import threading
+
+        q = _queue.Queue()
+        ready = threading.Event()
+        q.put(item)
+        q.put(None)
+        utils.JSONDumper._consume(q, ready, str(tmp_path / "out"), False)
+        return ready
+
+    def test_no_metadata_writes_nothing_and_leaves_no_temp_file(self, tmp_path):
+        self._drain(tmp_path, (None, [{"seqNo": 1}]))
+
+        assert not (tmp_path / "out.tbc.json.tmp").exists()
+        assert not (tmp_path / "out.tbc.json").exists()
+
+    def test_it_releases_the_writing_flag_so_a_later_write_can_queue(self, tmp_path):
+        ready = self._drain(tmp_path, (None, [{"seqNo": 1}]))
+
+        assert not ready.is_set()
+
+    def test_metadata_that_is_present_is_still_written(self, tmp_path):
+        import json
+
+        self._drain(
+            tmp_path, ({"videoParameters": {"system": "NTSC"}}, [{"seqNo": 1}])
+        )
+
+        out = json.loads((tmp_path / "out.tbc.json").read_text())
+        assert out["videoParameters"]["system"] == "NTSC"
+        assert out["fields"] == [{"seqNo": 1}]
