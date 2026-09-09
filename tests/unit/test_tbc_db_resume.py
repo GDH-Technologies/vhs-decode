@@ -325,6 +325,29 @@ class TestPlanResume:
                 chroma_field_bytes=None,
             )
 
+    def test_a_hole_in_the_field_ids_refuses(self, tmp_path):
+        """COUNT(*) is the resume point, but the rows are read by field_id.
+
+        With a hole the two mean different fields, so the seam would be
+        placed on the wrong one -- and every field_id past the hole names a
+        field the count does not.
+        """
+        db = _make_db(tmp_path / "out.tbc.db", fields=100)
+        conn = sqlite3.connect(str(db))
+        conn.execute("DELETE FROM field_record WHERE field_id = 60")
+        conn.commit()
+        conn.close()
+        video, chroma = _write_outputs(tmp_path, video_fields=100, chroma_fields=100)
+
+        with pytest.raises(ResumeError, match="numbered up to 99"):
+            plan_resume(
+                db,
+                video_bytes=video.stat().st_size,
+                chroma_bytes=chroma.stat().st_size,
+                video_field_bytes=FIELD_BYTES,
+                chroma_field_bytes=FIELD_BYTES,
+            )
+
     def test_two_capture_rows_refuse(self, tmp_path):
         db = _make_db(tmp_path / "out.tbc.db", fields=10, captures=2)
         video, _ = _write_outputs(tmp_path, video_fields=10)
@@ -421,6 +444,23 @@ class TestMinimalFieldsFromDb:
         # decode_faults was stored as NULL-for-zero by the writer.
         assert fields[0]["decodeFaults"] == 0
 
+    def test_a_hole_refuses_rather_than_seeding_a_short_list(self, tmp_path):
+        """Seeding fewer fields than the plan counted collides the numbering.
+
+        The caller seeds len(fieldinfo) from this list but fields_written
+        from the plan, so a short list makes the next field reuse a seqNo
+        the db already holds -- and the writers INSERT, so that surfaces as
+        an IntegrityError partway through the decode.
+        """
+        db = _make_db(tmp_path / "out.tbc.db", fields=8)
+        conn = sqlite3.connect(str(db))
+        conn.execute("DELETE FROM field_record WHERE field_id = 3")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(ResumeError, match="holds 5 of the 6 fields"):
+            minimal_fields_from_db(db, capture_id=1, field_count=6)
+
 
 class TestLoadJsonFields:
     def test_slices_a_parseable_fields_array(self, tmp_path):
@@ -442,6 +482,41 @@ class TestLoadJsonFields:
         assert load_json_fields(short, 10) is None
         assert load_json_fields(corrupt, 3) is None
         assert load_json_fields(tmp_path / "missing.tbc.json", 3) is None
+
+    def test_a_sound_prefix_is_not_reported_as_repaired(self, tmp_path):
+        js = tmp_path / "out.tbc.json"
+        js.write_text(json.dumps({"fields": [{"seqNo": i + 1} for i in range(8)]}))
+        reports = []
+
+        fields = load_json_fields(js, 6, on_repair=reports.append)
+
+        assert [f["seqNo"] for f in fields] == [1, 2, 3, 4, 5, 6]
+        assert reports == []
+
+    def test_a_damaged_prefix_is_renumbered_and_reported(self, tmp_path):
+        """A pre-fix .tbc.json seeded as-is would carry its break forward.
+
+        Recital's shape: entry 60 repeats 59 and 62 is never written. The
+        records are one per written field, so restamping from position is
+        the whole mend.
+        """
+        fields = [{"seqNo": i + 1} for i in range(60)]
+        fields += [{"seqNo": 59}, {"seqNo": 61}, {"seqNo": 63}]
+        js = tmp_path / "damaged.tbc.json"
+        js.write_text(json.dumps({"fields": fields}))
+        reports = []
+
+        recovered = load_json_fields(js, 63, on_repair=reports.append)
+
+        assert [f["seqNo"] for f in recovered] == list(range(1, 64))
+        assert len(reports) == 1
+        assert "first break at entry 60" in reports[0].summary()
+
+    def test_a_damaged_prefix_is_mended_without_a_listener(self, tmp_path):
+        js = tmp_path / "damaged.tbc.json"
+        js.write_text(json.dumps({"fields": [{"seqNo": 1}, {"seqNo": 1}]}))
+
+        assert [f["seqNo"] for f in load_json_fields(js, 2)] == [1, 2]
 
 
 def _truncate_to_94(tmp_path, db):

@@ -33,6 +33,9 @@ from .tbc_db import (
     DECODER_LD,
     PICTURE_METRICS_INSERT_SQL,
     SCHEMA_SQL,
+    OutputCounts,
+    count_db_fields,
+    count_output_fields,
     db_system_value,
     picture_metrics_row,
 )
@@ -3736,8 +3739,69 @@ class LDdecode:
     def __del__(self):
         del self.demodcache
 
+    def output_counts(self):
+        """Reconcile what each side of this decode thinks it wrote.
+
+        The metadata numbers the output, so a record per written field is the
+        whole contract: the payload sizes are the only witness that catches
+        records going missing while their field images were written. Call
+        before close() unlinks the handles.
+        """
+        video = getattr(self, "outfile_video", None)
+        chroma = getattr(self, "outfile_chroma", None)
+        for handle in (video, chroma):
+            # Measured from the file, so anything still buffered would read
+            # as a short payload.
+            if handle is not None:
+                try:
+                    handle.flush()
+                except (OSError, ValueError):
+                    pass
+
+        field_bytes = self.outwidth * self.output_lines * 2
+        db_rows = db_span = None
+        if self.capture_id:
+            db_path = self.fname_out + ".tbc.db" if self.fname_out else None
+            if db_path:
+                db_rows, db_span = count_db_fields(db_path, self.capture_id)
+
+        return OutputCounts(
+            fields_written=self.fields_written,
+            records=len(self.fieldinfo),
+            video_fields=count_output_fields(
+                getattr(video, "name", None), field_bytes
+            ),
+            chroma_fields=count_output_fields(
+                getattr(chroma, "name", None), field_bytes
+            ),
+            db_rows=db_rows,
+            db_span=db_span,
+        )
+
+    def check_output_counts(self):
+        """Warn when the sides disagree; never fail the decode.
+
+        A long decode that produced good video must not die at the finish
+        line -- the warning is for the operator and for the tooling that
+        audits the .tbc.db afterwards.
+        """
+        if self.fname_out is None or not self.fields_written:
+            return None
+        counts = self.output_counts()
+        if not counts.is_valid:
+            logger.warning(
+                "Field count mismatch in %s: %s -- the metadata and the"
+                " payload disagree, so tools that index fields by number"
+                " will read the wrong field",
+                self.fname_out,
+                counts.summary(),
+            )
+        return counts
+
     def close(self):
         """ deletes all open files, so it's possible to pickle an LDDecode object """
+
+        self.check_output_counts()
 
         if self.ffmpeg_rftbc is not None:
             try:
@@ -3991,8 +4055,7 @@ class LDdecode:
         # finalised here: a copy per written field (a filler duplicate gets
         # its own seqNo and metrics) with the picture metrics set before the
         # dict reaches fieldinfo (the JSON dumper serialises it once).
-        fi = fi.copy()
-        fi["seqNo"] = len(self.fieldinfo) + 1
+        fi = self.fieldinfo.finalise(fi)
         pictureMetrics = self.measure_picture(picture)
         if pictureMetrics:
             fi["pictureMetrics"] = pictureMetrics

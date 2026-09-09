@@ -670,8 +670,7 @@ class CVBSDecode(ldd.LDdecode):
         # duplicates), so the per-field record is finalised here: a copy per
         # written field with the picture metrics set before the dict reaches
         # fieldinfo (the JSON dumper serialises each field dict once).
-        fi_out = fi.copy()
-        fi_out["seqNo"] = len(self.fieldinfo) + 1
+        fi_out = self.fieldinfo.finalise(fi)
         metrics = self.measure_picture(picture)
         if metrics:
             fi_out["pictureMetrics"] = metrics

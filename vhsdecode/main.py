@@ -888,15 +888,31 @@ def main(args=None, use_gui=False):
             vhsd.close()
             sys.exit(1)
 
-        recovered = tbc_db.load_json_fields(outname + ".tbc.json", plan.field_count)
+        def _warn_repaired_numbering(numbering):
+            logger.warning(
+                "The prior run's .tbc.json numbers its fields wrongly (%s);"
+                " renumbering the recovered %d fields from their position so"
+                " the resumed decode continues a consistent sequence",
+                numbering.summary(),
+                plan.field_count,
+            )
+
+        recovered = tbc_db.load_json_fields(
+            outname + ".tbc.json", plan.field_count, on_repair=_warn_repaired_numbering
+        )
         if recovered is None:
             logger.warning(
                 "Legacy .tbc.json is missing or short; rebuilding minimal"
                 " field metadata from the .tbc.db"
             )
-            recovered = tbc_db.minimal_fields_from_db(
-                db_path, plan.capture_id, plan.field_count
-            )
+            try:
+                recovered = tbc_db.minimal_fields_from_db(
+                    db_path, plan.capture_id, plan.field_count
+                )
+            except tbc_db.ResumeError as err:
+                logger.error("Cannot resume: %s", err)
+                vhsd.close()
+                sys.exit(1)
         # One seed restores seqNo continuity, gives the seam its true
         # predecessor fields for parity checks, and replays every prior
         # field into the JSON dumper so the final .tbc.json is complete.

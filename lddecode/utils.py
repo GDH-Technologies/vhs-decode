@@ -1465,6 +1465,19 @@ class FieldInfo:
         self._fieldinfo_unsent.append(value)
         self._len += 1
 
+    def finalise(self, fi):
+        """Return the record to append for the field being written out now.
+
+        ``seqNo`` numbers the *output*, so it can only be stamped here: the
+        caller resolves duplicates and drops after buildmetadata has run, and
+        a filler duplicate re-writes a dict that already carries the earlier
+        field's number. Copying per written field is what keeps the two
+        writeouts of a duplicate from sharing one record (and one seqNo).
+        """
+        fi_out = fi.copy()
+        fi_out["seqNo"] = self._len + 1
+        return fi_out
+
     def seed(self, fields):
         """Replay recovered field dicts at the start of a resumed decode.
 

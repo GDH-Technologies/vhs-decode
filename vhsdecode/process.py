@@ -479,8 +479,7 @@ class VHSDecode(ldd.LDdecode):
         # a copy per written field (a duplicated field gets its own seqNo
         # and metrics) with the picture metrics set before the dict reaches
         # fieldinfo (the JSON dumper serialises each field dict once).
-        fi_out = fi.copy()
-        fi_out["seqNo"] = len(self.fieldinfo) + 1
+        fi_out = self.fieldinfo.finalise(fi)
         metrics = self.measure_picture(picturey, picturec)
         if metrics:
             fi_out["pictureMetrics"] = metrics
@@ -525,12 +524,15 @@ class VHSDecode(ldd.LDdecode):
         if self.decodethread and self.decodethread.is_alive():
             self.decodethread.join()
             self.decodethread = None
-        if self.rf.options.write_chroma:
-            setattr(self, "outfile_chroma", None)
 
         if self._processing_thread_pool is not None:
             self._processing_thread_pool.shutdown(wait=True)
+        # super().close() reconciles the field counts first, and the chroma
+        # payload is one of the sides it weighs -- so unlink that handle
+        # after it, not before.
         super(VHSDecode, self).close()
+        if self.rf.options.write_chroma:
+            setattr(self, "outfile_chroma", None)
 
     def computeMetricsPAL(self, metrics, f, fp=None):
         return None
