@@ -20,6 +20,7 @@ from lddecode.tbc_db import (
     renumber_fields,
 )
 from lddecode.utils import FieldInfo
+from vhsdecode.process import VHSDecode
 
 
 def _seq_nos(info):
@@ -101,6 +102,18 @@ class TestDuplicateFiller:
         info.append({"seqNo": len(info) + 1})  # built at len 62 -> 63
 
         assert _seq_nos(info)[58:] == [59, 60, 59, 61, 63]
+
+    def test_the_copy_carries_the_duplicate_flag_not_the_trigger(self):
+        original = {"seqNo": 59, "isDuplicateField": False, "fileLoc": 495575040}
+        dataset = ("field", original, "picture", "audio", "efm")
+
+        f, fi, picture, audio, efm = VHSDecode.duplicate_of(dataset)
+
+        assert fi["isDuplicateField"] is True
+        assert fi["fileLoc"] == original["fileLoc"]
+        # The field's own record, already written, is not retro-flagged.
+        assert original["isDuplicateField"] is False
+        assert (f, picture, audio, efm) == ("field", "picture", "audio", "efm")
 
 
 class TestCheckFieldNumbering:

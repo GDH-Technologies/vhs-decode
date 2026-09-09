@@ -303,6 +303,10 @@ class VHSDecode(ldd.LDdecode):
             fi["fieldPhaseID"] = f.fieldPhaseID
 
         write_field = True
+        # A signal to the caller, not a metadata flag: the field that trips
+        # the compensation is a real field, and the copy the caller inserts
+        # ahead of it is the duplicate. isDuplicateField is set on that copy.
+        duplicate_field = False
 
         if self.doDOD:
             dropout_lines, dropout_starts, dropout_ends = f.dropout_detect()
@@ -380,7 +384,7 @@ class VHSDecode(ldd.LDdecode):
                     )
                     decode_faults |= 4
                     fi["syncConf"] = 0
-                    fi["isDuplicateField"] = True
+                    duplicate_field = True
                     # The caller writes the previous field again first: the
                     # event names that duplicated copy.
                     self._record_field_order_event(
@@ -404,7 +408,7 @@ class VHSDecode(ldd.LDdecode):
                 # since it's not used for anything atm anyhow.
                 fi["decodeFaults"] = decode_faults
 
-            return fi, fi["isDuplicateField"], write_field
+            return fi, duplicate_field, write_field
 
         self.frameNumber = None
         if f.isFirstField:
@@ -432,11 +436,25 @@ class VHSDecode(ldd.LDdecode):
                     ldd.logger.warning("file frame %d : VBI decoding error", rawloc)
                     traceback.print_exc()
 
-        return fi, fi["isDuplicateField"], write_field
+        return fi, duplicate_field, write_field
 
     # Again ignored for tapes
     def checkMTF(self, field, pfield=None):
         return True
+
+    @staticmethod
+    def duplicate_of(dataset):
+        """The filler copy of an already-written field, ready for writeout.
+
+        isDuplicateField belongs on this inserted copy, not on the field
+        whose parity tripped the compensation -- that one is a real field,
+        and a consumer trusting the flag to find inserted filler would
+        otherwise keep the copy and drop the original. The record is copied
+        rather than flagged in place so the field's own entry, already
+        written, stays as it was.
+        """
+        f, fi, picture, audio, efm = dataset
+        return f, dict(fi, isDuplicateField=True), picture, audio, efm
 
     def writeout(self, dataset):
         f, fi, (picturey, picturec), audio, efm = dataset
@@ -737,8 +755,9 @@ class VHSDecode(ldd.LDdecode):
                 self.lastvalidfield[f.isFirstField] = (f, fi, picture, audio, efm)
 
             if duplicateField:
-                if self.lastvalidfield[not f.isFirstField] is not None:
-                    self.writeout(self.lastvalidfield[not f.isFirstField])
+                previous = self.lastvalidfield[not f.isFirstField]
+                if previous is not None:
+                    self.writeout(self.duplicate_of(previous))
                     self.writeout(self.lastvalidfield[f.isFirstField])
 
                 # If this is the first field to be written, don't write anything
