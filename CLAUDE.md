@@ -178,6 +178,53 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
 - Parked follow-ups: launch batching / `cp.fuse` for thread scaling, cupyx `filtfilt`
   gate for the Betamax fsc notch, HiFi pipeline unported.
 
+## Field numbering in `.tbc.json` / `.tbc.db`
+
+Every consumer indexes a field by its number — tbc-tools returns `fields[n - 1]` — so the
+metadata is only readable while `fields[i]["seqNo"] == i + 1` **and** there is one record
+per field image on disk. Two distinct shapes have broken that on the fleet:
+
+- **Shape A — a repeated number and a skipped one, array length still correct.**
+  `seqNo` used to be stamped in `buildmetadata()`, before the caller resolves duplicates
+  and drops. The duplicate-field compensation (`vhsdecode/process.py`, and the same shape
+  in `lddecode/core.py`) writes an already-written field a second time, and the JSON path
+  appended that record verbatim — old number and all. For a field built at
+  `len(fieldinfo) == 60` the array comes out `…59, 60, 59, 61, 63…`: the copy carries the
+  earlier number and the next field skips one. `--write_db` decodes were never affected;
+  that branch already re-stamped.
+  **Fixed 2026-09-06 by `6b804ee2`** (incidentally — it was a picture-metrics commit), and
+  pinned since by `tests/unit/test_field_numbering.py`. The numbering now lives in one
+  place, `FieldInfo.finalise()` in `lddecode/utils.py`.
+- **Shape B — the array is short of the payload.** Older builds (pre-`isDuplicateField`
+  JSON schema: `medianBurstIRE` / `pad` / `secamFirstLineIsRed`) lost whole records while
+  their field images were written — JJ_Promo has 81641 records for 81653 images. Not
+  reproducible in today's code; the close-time check below is what would catch a return.
+
+`LDdecode.check_output_counts()` reconciles writeouts, `len(fieldinfo)`, the `.tbc`/chroma
+payload sizes and the `field_record` rows at `close()`. It **warns and never fails** — a
+multi-hour decode that produced good video must not die at the finish line.
+
+### Repairing an already-damaged asset
+
+**Shape A loses nothing, and dropping the repeat corrupts it.** The duplicated entry
+describes a real duplicated field image that is on disk: Recital's `.tbc` is
+54,484,431,820 B ÷ (910 × 263 × 2) = exactly **113827** fields, matching both the array
+length and `numberOfSequentialFields`. tbc-tools' `repairFieldNumbering()` (PR #22) drops
+the repeat and renumbers, leaving 113826 records for 113827 images — every field after the
+break then names the wrong image, for the whole tape. **The correct mend is to renumber in
+place**, which is what `tbc_db.renumber_fields()` does and what `--resume` applies to a
+damaged prefix. Shape B needs placeholders inserted instead; renumbering it is also wrong.
+
+### Scope, and what the record elsewhere gets wrong
+
+A `seqNo` scan of all 81 `.tbc.json` under `/mnt` (2026-09-09) found **45 affected files**,
+~40 distinct decodes — not the four named in digitization-toolkit#419. That issue, and
+tbc-tools PR #22, both attribute the defect to *"a resumed decode re-emitting an
+overlapping field."* **That is wrong**; resume was never involved. Recital's own decode log
+carries exactly one `duplicating the last field to compensate` line, matching its one
+duplicate number. #419 also states the lost field is unrecoverable, which is false for
+shape A.
+
 ## Interface contracts with digitization-toolkit
 
 The org's digitization-toolkit drives these CLIs on the capture fleet. Breaking any of
