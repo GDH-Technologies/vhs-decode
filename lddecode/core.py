@@ -3785,9 +3785,15 @@ class LDdecode:
         line -- the warning is for the operator and for the tooling that
         audits the .tbc.db afterwards.
         """
-        if self.fname_out is None or not self.fields_written:
+        if getattr(self, "fname_out", None) is None or not self.fields_written:
             return None
-        counts = self.output_counts()
+        try:
+            counts = self.output_counts()
+        except Exception:
+            # Reconciliation is a report, not a step of the decode: it must
+            # never be the reason close() stops short of flushing.
+            logger.warning("Could not reconcile the field counts", exc_info=True)
+            return None
         if not counts.is_valid:
             logger.warning(
                 "Field count mismatch in %s: %s -- the metadata and the"

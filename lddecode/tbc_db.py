@@ -827,8 +827,8 @@ def renumber_fields(fields):
     Lossless where the array order is the output order: the entries are
     already one per written field image, so only the numbering was wrong.
     It cannot recover an entry the writer never emitted -- that shows up as
-    ``actual_fields`` short of the images on disk, which
-    :func:`check_output_counts` reports and this does not mend.
+    fewer records than there are images on disk, which :class:`OutputCounts`
+    reports and this does not mend.
     """
     return [dict(field, seqNo=index + 1) for index, field in enumerate(fields)]
 
@@ -845,10 +845,10 @@ class OutputCounts:
 
     fields_written: int
     records: int
-    video_fields: int = None
-    chroma_fields: int = None
-    db_rows: int = None
-    db_span: int = None  # MAX(field_id) + 1
+    video_fields: int | None = None
+    chroma_fields: int | None = None
+    db_rows: int | None = None
+    db_span: int | None = None  # MAX(field_id) + 1
 
     @property
     def is_valid(self):
