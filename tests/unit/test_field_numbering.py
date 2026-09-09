@@ -9,6 +9,7 @@ are the real files those shapes were read from.
 """
 
 import sqlite3
+import types
 
 import pytest
 
@@ -207,6 +208,24 @@ class TestOutputCounts:
         counts = OutputCounts(fields_written=6, records=6)
         assert counts.is_valid
 
+    def test_the_json_the_dumper_wrote_is_weighed(self):
+        """An aborted decode leaves the .tbc.json at its last periodic flush.
+
+        VHS_04_Martin_Luther_(1953) is the fleet's specimen: 279500 records
+        written -- exactly 559 flushes of 500 -- against 279810 field images,
+        the decode having been aborted via signal. Nothing else in the
+        reconciliation sees that, because the decoder counted all 279810.
+        """
+        counts = OutputCounts(
+            fields_written=279810,
+            records=279810,
+            json_records=279500,
+            video_fields=279810,
+            chroma_fields=279810,
+        )
+        assert not counts.is_valid
+        assert "279500 json records" in counts.summary()
+
     def test_a_short_payload_is_reported(self):
         counts = OutputCounts(fields_written=6, records=6, video_fields=5)
         assert not counts.is_valid
@@ -224,11 +243,14 @@ class TestOutputCounts:
 
     def test_every_disagreeing_side_is_named(self):
         counts = OutputCounts(
-            fields_written=6, records=6, video_fields=5, chroma_fields=5,
-            db_rows=4, db_span=7,
+            fields_written=6, records=6, json_records=3, video_fields=5,
+            chroma_fields=5, db_rows=4, db_span=7,
         )
         summary = counts.summary()
-        for expected in ("5 video", "5 chroma", "4 db rows", "7 db field_id span"):
+        for expected in (
+            "3 json records", "5 video", "5 chroma", "4 db rows",
+            "7 db field_id span",
+        ):
             assert expected in summary
 
 
@@ -279,3 +301,128 @@ class TestCountDbFields:
         junk = tmp_path / "not.tbc.db"
         junk.write_text("not sqlite")
         assert count_db_fields(junk, 1) == (None, None)
+
+
+class _Recorder:
+    """Stands in for lddecode.core's module logger."""
+
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, fmt, *args):
+        self.warnings.append(fmt % args)
+
+
+class _Handle:
+    """A written .tbc, as close() sees it just before the handle is unlinked."""
+
+    def __init__(self, path):
+        self.name = str(path)
+
+    def flush(self):
+        pass
+
+
+class TestCheckOutputCountsWiring:
+    """The close-time reconciliation, driven through LDdecode's own method."""
+
+    FIELD_BYTES = 910 * 263 * 2
+
+    def _decoder(
+        self, tmp_path, *, records, video_fields, capture_id=None, json_records=None
+    ):
+        from lddecode.core import LDdecode
+
+        video = tmp_path / "out.tbc"
+        video.write_bytes(b"\x00" * (self.FIELD_BYTES * video_fields))
+
+        decoder = types.SimpleNamespace(
+            fname_out=str(tmp_path / "out"),
+            fields_written=records,
+            fieldinfo=[{}] * records,
+            outfile_video=_Handle(video),
+            outfile_chroma=None,
+            outwidth=910,
+            output_lines=263,
+            capture_id=capture_id,
+            json_records=json_records,
+            check_output_counts=None,
+            output_counts=None,
+        )
+        decoder.output_counts = LDdecode.output_counts.__get__(decoder)
+        decoder.check_output_counts = LDdecode.check_output_counts.__get__(decoder)
+        return decoder
+
+    def test_agreement_says_nothing(self, tmp_path, monkeypatch):
+        import lddecode.core as core
+
+        recorder = _Recorder()
+        monkeypatch.setattr(core, "logger", recorder)
+
+        counts = self._decoder(tmp_path, records=6, video_fields=6).check_output_counts()
+
+        assert counts.is_valid
+        assert recorder.warnings == []
+
+    def test_records_missing_for_written_images_warns(self, tmp_path, monkeypatch):
+        """Shape B caught at the source: 6 field images, 5 records."""
+        import lddecode.core as core
+
+        recorder = _Recorder()
+        monkeypatch.setattr(core, "logger", recorder)
+
+        counts = self._decoder(tmp_path, records=5, video_fields=6).check_output_counts()
+
+        assert not counts.is_valid
+        assert len(recorder.warnings) == 1
+        assert "5 field records but found 6 video" in recorder.warnings[0]
+
+    def test_a_lost_final_json_write_warns(self, tmp_path, monkeypatch):
+        """The abort shape, through the decoder's own method."""
+        import lddecode.core as core
+
+        recorder = _Recorder()
+        monkeypatch.setattr(core, "logger", recorder)
+
+        counts = self._decoder(
+            tmp_path, records=6, video_fields=6, json_records=5
+        ).check_output_counts()
+
+        assert not counts.is_valid
+        assert "5 json records" in recorder.warnings[0]
+
+    def test_a_decode_that_wrote_nothing_is_not_reconciled(self, tmp_path, monkeypatch):
+        import lddecode.core as core
+
+        recorder = _Recorder()
+        monkeypatch.setattr(core, "logger", recorder)
+        decoder = self._decoder(tmp_path, records=0, video_fields=0)
+
+        assert decoder.check_output_counts() is None
+        assert recorder.warnings == []
+
+    def test_the_db_rows_are_weighed_when_a_capture_was_written(
+        self, tmp_path, monkeypatch
+    ):
+        import lddecode.core as core
+
+        recorder = _Recorder()
+        monkeypatch.setattr(core, "logger", recorder)
+
+        conn = sqlite3.connect(tmp_path / "out.tbc.db")
+        conn.execute(
+            "CREATE TABLE field_record (capture_id INTEGER, field_id INTEGER,"
+            " PRIMARY KEY (capture_id, field_id))"
+        )
+        conn.executemany(
+            "INSERT INTO field_record VALUES (1, ?)", [(i,) for i in (0, 1, 2, 4)]
+        )
+        conn.commit()
+        conn.close()
+
+        counts = self._decoder(
+            tmp_path, records=5, video_fields=5, capture_id=1
+        ).check_output_counts()
+
+        assert not counts.is_valid
+        assert "4 db rows" in recorder.warnings[0]

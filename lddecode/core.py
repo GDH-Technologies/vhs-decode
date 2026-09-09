@@ -3654,6 +3654,9 @@ class LDdecode:
 
         self.firstfield = None  # In frame output mode, the first field goes here
         self.capture_id = None
+        # Set by the JSON dumper after each successful write: the records the
+        # .tbc.json actually holds, as against the ones this object counted.
+        self.json_records = None
 
         self.system = system
         self.rf_opts = {
@@ -3768,6 +3771,7 @@ class LDdecode:
         return OutputCounts(
             fields_written=self.fields_written,
             records=len(self.fieldinfo),
+            json_records=getattr(self, "json_records", None),
             video_fields=count_output_fields(
                 getattr(video, "name", None), field_bytes
             ),

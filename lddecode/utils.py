@@ -1,6 +1,7 @@
 # A collection of helper functions used in dev notebooks and lddecode_core.py
 
 from collections import namedtuple
+from functools import partial
 import itertools
 import json
 import math
@@ -1503,9 +1504,19 @@ class JSONDumper:
         self._get_field_info = ldd.fieldinfo.read
 
         self._outname = outname
+        # The consumer reports how many records each successful write put in
+        # the file. That is the only count that reflects the .tbc.json as it
+        # actually lands: a dropped final write leaves the metadata short of
+        # the payload, which is what the decoder reconciles at close.
         self._dumper = threading.Thread(
             target=JSONDumper._consume,
-            args=(self._queue, self._writing, self._outname, ldd.verboseVITS),
+            args=(
+                self._queue,
+                self._writing,
+                self._outname,
+                ldd.verboseVITS,
+                partial(setattr, ldd, "json_records"),
+            ),
             name="lddecode-json-dumper",
             daemon=True,
         )
@@ -1525,7 +1536,7 @@ class JSONDumper:
         self._dumper.join()
 
     @staticmethod
-    def _consume(queue, ready, outname, verboseVITS):
+    def _consume(queue, ready, outname, verboseVITS, on_written=None):
         # Signal handling is intentionally omitted here: signal handlers can
         # only be set from the main thread in Python. The main thread already
         # ignores SIGINT during LDdecode setup, so this thread is unaffected.
@@ -1582,6 +1593,9 @@ class JSONDumper:
             f.write('\n')
             f.close()
             os.replace(outname + ".tbc.json.tmp", outname + ".tbc.json")
+
+            if on_written is not None:
+                on_written(sum(len(batch) for batch in field_info))
 
             ready.clear()
 

@@ -837,14 +837,17 @@ def renumber_fields(fields):
 class OutputCounts:
     """What each side of a finished decode thinks it wrote.
 
-    ``records`` is what reaches the .tbc.json as numberOfSequentialFields;
-    the video/chroma counts come from the payload sizes and are the only
-    witness that catches metadata records going missing while their field
-    images were written.
+    ``records`` is what this decoder counted; ``json_records`` is what the
+    dumper's last successful write actually put in the .tbc.json, and the
+    video/chroma counts come from the payload sizes. Those last two are the
+    witnesses that catch records going missing while their field images were
+    written -- an interrupted decode whose final flush never landed leaves
+    exactly that.
     """
 
     fields_written: int
     records: int
+    json_records: int | None = None
     video_fields: int | None = None
     chroma_fields: int | None = None
     db_rows: int | None = None
@@ -860,6 +863,7 @@ class OutputCounts:
         if self.fields_written != expected:
             found.append(f"{self.fields_written} writeouts")
         for name, value in (
+            ("json records", self.json_records),
             ("video", self.video_fields),
             ("chroma", self.chroma_fields),
             ("db rows", self.db_rows),
