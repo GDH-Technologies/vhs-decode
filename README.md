@@ -777,13 +777,20 @@ Useful to recover decoding after a crash, or for limiting processing time by pro
 > The decoders can be RAW uncompressed data or FLAC compressed data. 
 
 > [!TIP]  
-> .RAW will need to be renamed to s16/u16 
+> A headerless `.raw` needs `--input_format` to say what is inside it, because the
+> extension does not. MISRC writes `.raw` for both its modes: `--input_format s8`
+> for an 8-bit capture, `--input_format s16` for a 16-bit one. The flag accepts
+> `s8`, `u8`, `s16`, `u16` and `f32`, and overrides the extension for any input.
 
 `.ldf`/`.lds` (40Msps Domesday Duplicator FLAC-compressed and uncompressed data).
 
 `.r8`/`.u8`   (CXADC 8-bit raw data).
 
+`.s8`         (signed 8-bit raw data, e.g. MISRC RAW in its 8-bit mode).
+
 `.r16`/`.u16` (CXADC 16-bit raw data).
+
+`.s16`        (signed 16-bit raw data).
 
 .flac/.cvbs/.vhs/.svhs/.betacam/.betamax/.video8/.hi8 (FLAC-compressed captures, can be either 8-bit or 16-bit).
 
