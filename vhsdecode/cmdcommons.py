@@ -306,6 +306,21 @@ def common_parser_inner(parser, use_gui=False, default_threads=DEFAULT_THREADS):
         help="RF sampling frequency in source file (default is 40MHz)",
     )
     input_format_group.add_argument(
+        "--input_format",
+        dest="input_format",
+        metavar="FORMAT",
+        type=str,
+        choices=sorted(lddu.SAMPLE_FORMATS),
+        default=None,
+        help=(
+            "sample layout of a headerless capture, overriding whatever the"
+            " file extension implies: "
+            + ", ".join(sorted(lddu.SAMPLE_FORMATS))
+            + ". Needed for MISRC RAW captures, which use .raw for both their"
+            " 16-bit (s16) and their 8-bit (s8) mode"
+        ),
+    )
+    input_format_group.add_argument(
         "--cxadc",
         dest="cxadc",
         action="store_true",

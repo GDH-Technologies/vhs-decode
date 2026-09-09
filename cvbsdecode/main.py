@@ -144,7 +144,9 @@ def main(args=None):
             sys.exit(1)
 
     try:
-        loader = lddu.make_loader(filename, sample_freq)
+        loader = lddu.make_loader(
+            filename, sample_freq, sample_format=args.input_format
+        )
     except ValueError as e:
         print(e)
         sys.exit(1)

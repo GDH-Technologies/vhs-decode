@@ -178,6 +178,30 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
 - Parked follow-ups: launch batching / `cp.fuse` for thread scaling, cupyx `filtfilt`
   gate for the Betamax fsc notch, HiFi pipeline unported.
 
+## Headerless capture input formats
+
+A `.raw` capture carries no header, and the extension does not say what is inside
+it. **MISRC writes `.raw` for both of its RAW modes** — signed int16 in 16-bit mode
+and **signed int8** in 8-bit mode (`convert_16to8_sse(int16_t *in, int8_t *out, …)`,
+`misrc_tools/common/extract.h`). Reading one as the other does not raise; it yields a
+scrambled waveform and a decode that drops every field with *"Unable to determine
+start of field"*, an empty `.tbc`, and **exit status 0**.
+
+- Pass **`--input_format s8`** for an 8-bit MISRC RAW capture (`s8`/`u8`/`s16`/`u16`/`f32`).
+  It overrides the extension table on both the direct and the ffmpeg-resampling path.
+  Without it, `make_loader` maps `.raw` to `s16le` — correct only for the 16-bit mode.
+  With `--no_resample` and no flag it is worse: the bare `LoadFFmpeg()` probes a
+  headerless file as **rawvideo** and dies (`Invalid pixel format`), still exiting 0.
+- Signed vs offset-unsigned does not change the decode: the RF bandpass removes DC.
+  Measured on `VHS_02_1997_Wedding` — reading the same window as `int8` and as
+  `uint8 + 128` differed in 0.067 % of `.tbc` samples, mean |diff| 0.0025 of 65535.
+- **`np.fromstring`'s binary mode was removed in numpy 1.22**, and the `.s16` and
+  `.rf` readers still called it — those formats could not be read at all on any
+  current build. Fixed 2026-09-09; pinned by `tests/unit/test_input_format.py`.
+- A decode that handles no fields **still exits 0**. Deliberate, but it means the
+  only reliable success signal for fleet tooling is a non-empty `.tbc` whose field
+  count matches the metadata — not the exit status.
+
 ## Interface contracts with digitization-toolkit
 
 The org's digitization-toolkit drives these CLIs on the capture fleet. Breaking any of

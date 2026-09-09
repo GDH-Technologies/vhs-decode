@@ -251,13 +251,49 @@ Returns data if successful, or None or an upstream exception if not (including i
 """
 
 
-def make_loader(filename, inputfreq=None):
+def _resample_output_args(inputfreq):
+    """ffmpeg filter args bringing a source at inputfreq MHz to 40 MHz."""
+
+    if inputfreq == 40:
+        return []
+
+    # Use asetrate first to override the input file's sample rate.
+    return [
+        "-filter:a",
+        "asetrate=" + str(inputfreq * 1e6) + ",aresample=" + str(40e6),
+    ]
+
+
+def make_loader(filename, inputfreq=None, sample_format=None):
     """Return an appropriate loader function object for filename.
 
     If inputfreq is specified, it gives the sample rate in MHz of the source
     file, and the loader will resample from that rate to 40 MHz. Any sample
     rate specified by the source file's metadata will be ignored, as some
-    formats can't represent typical RF sample rates accurately."""
+    formats can't represent typical RF sample rates accurately.
+
+    sample_format names the samples a headerless file holds -- one of
+    SAMPLE_FORMATS -- and wins over whatever the extension would have implied.
+    An extension is only ever a guess: MISRC writes .raw for both its 16-bit
+    (signed int16) and its 8-bit (signed int8) mode, and reading one as the
+    other yields a scrambled waveform rather than an error."""
+
+    if sample_format is not None:
+        try:
+            spec = SAMPLE_FORMATS[sample_format]
+        except KeyError:
+            raise ValueError(
+                "Unknown input sample format: %s (expected one of %s)"
+                % (sample_format, ", ".join(sorted(SAMPLE_FORMATS)))
+            )
+
+        if inputfreq is None:
+            return spec.loader
+
+        return LoadFFmpeg(
+            input_args=["-f", spec.ffmpeg_format],
+            output_args=_resample_output_args(inputfreq),
+        )
 
     if inputfreq is not None:
         # We're resampling, so we have to use ffmpeg.
@@ -278,16 +314,9 @@ def make_loader(filename, inputfreq=None):
             # Assume ffmpeg will recognise this format itself.
             input_args = []
 
-        output_args = []
-
-        if inputfreq != 40:
-            # Use asetrate first to override the input file's sample rate.
-            output_args = [
-                "-filter:a",
-                "asetrate=" + str(inputfreq * 1e6) + ",aresample=" + str(40e6),
-            ]
-
-        return LoadFFmpeg(input_args=input_args, output_args=output_args)
+        return LoadFFmpeg(
+            input_args=input_args, output_args=_resample_output_args(inputfreq)
+        )
 
     elif filename.endswith(".lds"):
         return load_packed_data_4_40
@@ -295,6 +324,8 @@ def make_loader(filename, inputfreq=None):
         return load_packed_data_3_32
     elif filename.endswith(".rf"):
         return load_unpacked_data_float32
+    elif filename.endswith(".s8"):
+        return load_unpacked_data_s8
     elif filename.endswith(".s16"):
         return load_unpacked_data_s16
     elif filename.endswith(".r16") or filename.endswith(".u16"):
@@ -316,19 +347,22 @@ def make_loader(filename, inputfreq=None):
 
 def load_unpacked_data(infile, sample, readlen, sampletype):
     # this is run for unpacked data:
-    # 1 is for 8-bit cxadc data, 2 for 16bit DD, 3 for 16bit cxadc
+    # 1 is for 8-bit cxadc data, 2 for 16bit DD, 3 for 16bit cxadc,
+    # 4 for float32, 5 for signed 8-bit (MISRC RAW in its 8-bit mode)
 
-    samplelength = 2 if sampletype == 3 else sampletype
+    samplelength = SAMPLE_BYTES[sampletype]
 
     infile.seek(sample * samplelength, 0)
     inbuf = infile.read(readlen * samplelength)
 
     if sampletype == 4:
-        indata = np.fromstring(inbuf, "float32", len(inbuf) // 4) * 32768
+        indata = np.frombuffer(inbuf, "float32", len(inbuf) // 4) * 32768
     elif sampletype == 3:
         indata = np.frombuffer(inbuf, "uint16", len(inbuf) // 2)
     elif sampletype == 2:
-        indata = np.fromstring(inbuf, "int16", len(inbuf) // 2)
+        indata = np.frombuffer(inbuf, "int16", len(inbuf) // 2)
+    elif sampletype == 5:
+        indata = np.frombuffer(inbuf, "int8", len(inbuf))
     else:
         # NOTE(oln): Can probably use frombuffer for other variants too but
         # didn't have any samples to test with.
@@ -340,8 +374,15 @@ def load_unpacked_data(infile, sample, readlen, sampletype):
     return indata
 
 
+SAMPLE_BYTES = {1: 1, 2: 2, 3: 2, 4: 4, 5: 1}
+
+
 def load_unpacked_data_u8(infile, sample, readlen):
     return load_unpacked_data(infile, sample, readlen, 1)
+
+
+def load_unpacked_data_s8(infile, sample, readlen):
+    return load_unpacked_data(infile, sample, readlen, 5)
 
 
 def load_unpacked_data_s16(infile, sample, readlen):
@@ -354,6 +395,20 @@ def load_unpacked_data_u16(infile, sample, readlen):
 
 def load_unpacked_data_float32(infile, sample, readlen):
     return load_unpacked_data(infile, sample, readlen, 4)
+
+
+SampleFormat = namedtuple("SampleFormat", ["dtype", "ffmpeg_format", "loader"])
+
+#: The sample layouts a headerless capture can hold, keyed by the name
+#: --input_format takes. Each carries the numpy dtype its direct reader uses
+#: and the ffmpeg format name the resampling path passes as -f.
+SAMPLE_FORMATS = {
+    "s8": SampleFormat("int8", "s8", load_unpacked_data_s8),
+    "u8": SampleFormat("uint8", "u8", load_unpacked_data_u8),
+    "s16": SampleFormat("int16", "s16le", load_unpacked_data_s16),
+    "u16": SampleFormat("uint16", "u16le", load_unpacked_data_u16),
+    "f32": SampleFormat("float32", "f32le", load_unpacked_data_float32),
+}
 
 
 # This is for the .r30 format I did in ddpack/unpack.c.  Deprecated but I still have samples in it.
@@ -1533,6 +1588,15 @@ class JSONDumper:
                 ready.set()
             except (InterruptedError, KeyboardInterrupt):
                 break
+
+            if jsondict is None:
+                # build_json returns None when the decode never produced a
+                # usable field. There is no metadata to write, and opening
+                # the temp file anyway used to leave a one-byte .tbc.json.tmp
+                # behind and kill this thread on the first .items() call --
+                # the decoder has already reported the failure itself.
+                ready.clear()
+                continue
 
             # json serialize each field info object to a string
             serialized_field_info = []

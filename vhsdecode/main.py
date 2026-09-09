@@ -669,7 +669,9 @@ def main(args=None, use_gui=False):
         sample_freq = 40
 
     def build_loader():
-        made_loader = lddu.make_loader(filename, loader_input_freq)
+        made_loader = lddu.make_loader(
+            filename, loader_input_freq, sample_format=args.input_format
+        )
 
         # Note: Fallback to ffmpeg, not .lds format
         # Temporary workaround until this is sorted upstream.
