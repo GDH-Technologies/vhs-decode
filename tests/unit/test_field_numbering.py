@@ -12,6 +12,7 @@ is what produced VHS-C_03_Recital's ``59, 60, 59, 61, 63``.
 import io
 import types
 
+from lddecode.tbc_db import check_field_numbering, renumber_fields
 from lddecode.utils import FieldInfo
 from vhsdecode.process import VHSDecode
 
@@ -108,3 +109,83 @@ class TestWriteoutNumbering:
         info.append({"seqNo": len(info) + 1})  # built at len 62 -> 63
 
         assert _seq_nos(info)[58:] == [59, 60, 59, 61, 63]
+
+
+class TestCheckFieldNumbering:
+    """tbc_db.check_field_numbering mirrors tbc-tools' checkFieldNumbering."""
+
+    def test_a_clean_array_is_valid_and_says_nothing(self):
+        report = check_field_numbering([{"seqNo": n + 1} for n in range(6)])
+        assert report.is_valid
+        assert report.summary() == ""
+
+    def test_shape_a_repeats_a_number_and_skips_one(self):
+        """VHS-C_03_Recital: 113827 records, one repeat, one gap.
+
+        The array is as long as the payload -- nothing was lost, only
+        misnumbered -- which is why renumbering mends it.
+        """
+        fields = [{"seqNo": n + 1} for n in range(60)]
+        fields[60:] = [{"seqNo": 59}, {"seqNo": 61}, {"seqNo": 63}]
+
+        report = check_field_numbering(fields)
+
+        assert not report.is_valid
+        assert report.duplicates == 1
+        assert report.gaps == 1
+        assert report.first_bad_index == 60
+        assert report.first_bad_seq_no == 59
+        assert (
+            "first break at entry 60, numbered 59 rather than 61"
+            in report.summary()
+        )
+
+    def test_shape_b_declares_more_than_it_holds(self):
+        """VHS-C_04_JJ_Promo: 81641 records for 81653 field images.
+
+        Records genuinely missing, so the count disagreement is the finding
+        and renumbering would only hide it.
+        """
+        fields = [{"seqNo": n + 1} for n in range(720)]
+        fields += [{"seqNo": n} for n in (722, 723, 724)]
+
+        report = check_field_numbering(fields, declared_fields=724)
+
+        assert not report.is_valid
+        assert report.declared_fields == 724
+        assert report.actual_fields == 723
+        assert report.gaps == 1
+        assert "declares 724 fields but holds 723" in report.summary()
+
+    def test_an_empty_array_is_valid(self):
+        assert check_field_numbering([]).is_valid
+
+    def test_a_record_with_no_number_is_a_break_at_its_position(self):
+        report = check_field_numbering([{"seqNo": 1}, {"fileLoc": 7}, {"seqNo": 3}])
+        assert not report.is_valid
+        assert report.first_bad_index == 1
+
+
+class TestRenumberFields:
+    def test_restamps_from_position_and_keeps_the_rest(self):
+        fields = [{"seqNo": 59, "fileLoc": 1}, {"seqNo": 59, "fileLoc": 2}]
+        mended = renumber_fields(fields)
+
+        assert [f["seqNo"] for f in mended] == [1, 2]
+        assert [f["fileLoc"] for f in mended] == [1, 2]
+        assert check_field_numbering(mended).is_valid
+
+    def test_leaves_the_source_untouched(self):
+        fields = [{"seqNo": 59}, {"seqNo": 59}]
+        renumber_fields(fields)
+        assert [f["seqNo"] for f in fields] == [59, 59]
+
+    def test_keeps_every_record_because_each_one_is_a_written_field(self):
+        """Dropping the repeat instead would shift the payload by one.
+
+        The filler copy is a field image on disk like any other, so an array
+        one record shorter would name a different image for every field after
+        the break.
+        """
+        fields = [{"seqNo": 1}, {"seqNo": 2}, {"seqNo": 1}, {"seqNo": 3}]
+        assert len(renumber_fields(fields)) == len(fields)

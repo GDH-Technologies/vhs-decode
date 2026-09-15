@@ -384,14 +384,24 @@ def plan_resume(
                 )
             capture_id, system, decoder, field_width, field_height = captures[0]
 
-            db_count = conn.execute(
-                "SELECT COUNT(*) FROM field_record WHERE capture_id = ?",
+            db_count, db_highest = conn.execute(
+                "SELECT COUNT(*), MAX(field_id) FROM field_record"
+                " WHERE capture_id = ?",
                 (capture_id,),
-            ).fetchone()[0]
+            ).fetchone()
             if db_count == 0:
                 raise ResumeError(
                     f"{db_path} holds no committed fields -- nothing to "
                     "resume; re-decode from scratch"
+                )
+            # Rows are addressed by field_id below, so a count that outruns
+            # the ids means a hole, and every field_id past it names a
+            # different field than the count implies.
+            if db_highest is not None and db_highest + 1 != db_count:
+                raise ResumeError(
+                    f"{db_path} holds {db_count} fields numbered up to "
+                    f"{db_highest} -- the field numbering has a hole; "
+                    "re-decode from scratch"
                 )
 
             field_count = min(db_count, video_bytes // video_field_bytes)
@@ -636,6 +646,18 @@ def minimal_fields_from_db(db_path, capture_id, field_count):
             if metrics:
                 field["pictureMetrics"] = metrics
         fields.append(field)
+
+    # The caller seeds len(fieldinfo) from this list but fields_written from
+    # the plan's count. A hole in field_record makes the two disagree, and
+    # the next field is then minted with a seqNo the db already holds --
+    # which the plain INSERT in the writers turns into an IntegrityError
+    # partway through the decode.
+    if len(fields) != field_count:
+        raise ResumeError(
+            f"{db_path} holds {len(fields)} of the {field_count} fields it "
+            "declares -- the field numbering has a hole; re-decode from "
+            "scratch"
+        )
     return fields
 
 
@@ -713,11 +735,124 @@ def load_segments_from_db(db_path, capture_id):
     return segments
 
 
-def load_json_fields(json_path, field_count):
+@dataclass(frozen=True)
+class FieldNumbering:
+    """How a field array's ``seqNo`` values line up with their positions.
+
+    Mirrors tbc-tools' ``TbcMetaData::FieldNumbering`` field for field, and
+    :meth:`summary` reproduces its wording, so a decode-side warning and a
+    tbc-tools refusal describe the same file the same way.
+    """
+
+    declared_fields: int  # videoParameters.numberOfSequentialFields
+    actual_fields: int  # len(fields)
+    duplicates: int  # fields whose seqNo repeats an earlier one
+    gaps: int  # seqNos absent from the 1..max run
+    first_bad_index: int  # 0-based index of the first seqNo != index + 1, else -1
+    first_bad_seq_no: int
+
+    @property
+    def is_valid(self):
+        return (
+            self.declared_fields == self.actual_fields
+            and self.duplicates == 0
+            and self.gaps == 0
+            and self.first_bad_index < 0
+        )
+
+    def summary(self):
+        """One line naming the counts and the first break; empty when valid."""
+        if self.is_valid:
+            return ""
+        parts = []
+        if self.declared_fields != self.actual_fields:
+            parts.append(
+                f"declares {self.declared_fields} fields but holds"
+                f" {self.actual_fields}"
+            )
+        if self.duplicates:
+            parts.append(f"{self.duplicates} duplicate field number(s)")
+        if self.gaps:
+            parts.append(f"{self.gaps} missing field number(s)")
+        if self.first_bad_index >= 0:
+            parts.append(
+                f"first break at entry {self.first_bad_index}, numbered"
+                f" {self.first_bad_seq_no} rather than {self.first_bad_index + 1}"
+            )
+        return "; ".join(parts)
+
+
+def check_field_numbering(fields, declared_fields=None):
+    """Report how ``fields`` numbers itself.
+
+    Every consumer indexes a field by its number -- tbc-tools returns
+    ``fields[n - 1]`` -- so the array is only readable while
+    ``fields[i]["seqNo"] == i + 1``. An array can break that and still pass
+    the length check the JSON loader has always done, which is how a decode
+    that repeated a number reached the fleet unnoticed.
+    """
+    actual = len(fields)
+    seen = set()
+    highest = 0
+    duplicates = 0
+    first_bad_index = -1
+    first_bad_seq_no = -1
+
+    for index, field in enumerate(fields):
+        seq_no = field.get("seqNo") if isinstance(field, dict) else None
+        if not isinstance(seq_no, int):
+            # A record with no usable number is a break at its own position.
+            if first_bad_index < 0:
+                first_bad_index = index
+                first_bad_seq_no = -1
+            continue
+        if first_bad_index < 0 and seq_no != index + 1:
+            first_bad_index = index
+            first_bad_seq_no = seq_no
+        if seq_no in seen:
+            duplicates += 1
+        else:
+            seen.add(seq_no)
+        highest = max(highest, seq_no)
+
+    # Numbers run 1..highest, so anything in that run no field claims is one
+    # the writer never emitted.
+    gaps = highest - len(seen) if highest > len(seen) else 0
+
+    return FieldNumbering(
+        declared_fields=actual if declared_fields is None else declared_fields,
+        actual_fields=actual,
+        duplicates=duplicates,
+        gaps=gaps,
+        first_bad_index=first_bad_index,
+        first_bad_seq_no=first_bad_seq_no,
+    )
+
+
+def renumber_fields(fields):
+    """Restamp ``seqNo`` from position, returning a new list.
+
+    Lossless where the array order is the output order: the entries are
+    already one per written field image, so only the numbering was wrong.
+    It cannot recover an entry the writer never emitted -- that shows up as
+    fewer records than there are images on disk, which this does not mend.
+    """
+    return [dict(field, seqNo=index + 1) for index, field in enumerate(fields)]
+
+
+def load_json_fields(json_path, field_count, on_repair=None):
     """Return the first ``field_count`` fields from a legacy .tbc.json.
 
     None when the file is missing, unparseable, or holds fewer fields --
     the caller falls back to rebuilding minimal field dicts from the db.
+
+    Decodes written before the seqNo stamp moved to writeout time can carry a
+    repeated number and a skipped one (a duplicate-field insertion re-wrote a
+    record that already had a number). Seeding that prefix unrepaired would
+    carry the break into the resumed run, so the numbering is checked and
+    restamped from position -- lossless, because the array order is the
+    output order. ``on_repair`` is called with the :class:`FieldNumbering`
+    report when that happens, so the caller can say so in the log.
     """
     try:
         with open(str(json_path), encoding="utf-8") as handle:
@@ -727,4 +862,11 @@ def load_json_fields(json_path, field_count):
     fields = payload.get("fields")
     if not isinstance(fields, list) or len(fields) < field_count:
         return None
-    return fields[:field_count]
+    fields = fields[:field_count]
+
+    numbering = check_field_numbering(fields)
+    if not numbering.is_valid:
+        if on_repair is not None:
+            on_repair(numbering)
+        fields = renumber_fields(fields)
+    return fields
