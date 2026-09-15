@@ -295,3 +295,32 @@ class TestMigrateSchema:
         assert conn.execute(
             "SELECT sql FROM sqlite_master ORDER BY name"
         ).fetchall() == before
+
+    def test_v2_db_without_ac3_symbols_gains_it(self):
+        # Upstream added field_record.ac3_symbols without a user_version
+        # bump, and ld-decode's INSERT names it. A v2 db written before the
+        # 2026-09-15 sync lacks it; the migration must add it, once.
+        def field_record_columns(conn):
+            return [row[1] for row in conn.execute("PRAGMA table_info(field_record)")]
+
+        fresh = sqlite3.connect(":memory:")
+        fresh.executescript(SCHEMA_SQL)
+        assert "ac3_symbols" in field_record_columns(fresh)
+
+        old_schema = SCHEMA_SQL.replace("    ac3_symbols INTEGER,\n", "")
+        assert old_schema != SCHEMA_SQL
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(old_schema)
+        conn.execute(
+            "INSERT INTO capture (capture_id, system, decoder)"
+            " VALUES (1, 'NTSC', 'ld-decode')"
+        )
+        conn.execute("INSERT INTO field_record (capture_id, field_id) VALUES (1, 0)")
+        assert "ac3_symbols" not in field_record_columns(conn)
+
+        migrate_schema(conn)
+        migrate_schema(conn)
+
+        assert field_record_columns(conn).count("ac3_symbols") == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("SELECT ac3_symbols FROM field_record").fetchone()[0] is None

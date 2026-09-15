@@ -236,7 +236,10 @@ def migrate_schema(conn):
     """Bring an open .tbc.db up to :data:`SCHEMA_USER_VERSION` in place.
 
     Idempotent: a v1 db gains the ``capture.rf_source_sample_rate_hz``
-    column and the segmentation tables; a v2 db is left untouched. Rows
+    column and the segmentation tables; a v2 db is left untouched. Either
+    also gains ``field_record.ac3_symbols`` if it lacks it: upstream's
+    nullable AC3 symbol count, added without a user_version bump, so a
+    db written before it arrived is otherwise still a valid v2 db. Rows
     are never rewritten. Run by the vhs-decode writer on ``--resume`` so a
     decode interrupted under the old schema continues under the new one.
     """
@@ -245,6 +248,10 @@ def migrate_schema(conn):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(capture)")}
         if "rf_source_sample_rate_hz" not in columns:
             conn.execute("ALTER TABLE capture ADD COLUMN rf_source_sample_rate_hz REAL")
+    if "field_record" in tables:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(field_record)")}
+        if "ac3_symbols" not in columns:
+            conn.execute("ALTER TABLE field_record ADD COLUMN ac3_symbols INTEGER")
     conn.executescript(SEGMENTATION_DDL)
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version < SCHEMA_USER_VERSION:
