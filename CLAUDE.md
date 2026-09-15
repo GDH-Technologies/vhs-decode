@@ -23,6 +23,23 @@ for general project documentation.
   (`git push fork --tags`), so `fetch-depth: 0` now resolves a real version. If a fresh
   clone of the fork ever stamps `0.1.devN` again, the tags were lost — re-push them.
 
+## Upstream syncs
+
+- Merges from oyvindln's `vhs_decode` follow the generic sync-fork procedure with this
+  repo's profile at `.claude/skills/sync-upstream/SKILL.md`. That file is local-only
+  (`.claude/` is untracked here), so it exists on wm only.
+- **The `.tbc.db` DDL lives in `lddecode/tbc_db.py` (`SCHEMA_SQL`)**, not in
+  `LDdecode.create_db_schema`. Upstream still edits its inline copy there, so each such
+  edit conflicts with the fork's deletion. Port it into `SCHEMA_SQL` *and*
+  `migrate_schema`. Upstream's INSERTs name the new columns, so a missed port breaks
+  every ld-decode run at its first field (2026-09-15: `field_record.ac3_symbols`, added
+  nullable with no `user_version` bump, as upstream did).
+- **Keep `static_ffmpeg.add_paths(weak=True)`** in `lddecode/utils.py`. Non-weak mode
+  downloads static-ffmpeg and puts it ahead of the host's ffmpeg (wm:
+  `/usr/local/bin/ffmpeg`) for every decode, FLAC RF reads included. Upstream lost `weak`
+  in its 2026-09-13 happycube merge and is restoring it on its `ffmpeg_static_weak`
+  branch. Drop the fork's one-line fix once that lands.
+
 ## Fleet deployment (pipx)
 
 - Capture-fleet hosts install this repo via pipx. `pipx install --force` **without `-e`
