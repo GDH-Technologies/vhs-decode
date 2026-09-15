@@ -110,6 +110,7 @@ CREATE TABLE field_record (
     ntsc_is_video_id_data_valid INTEGER CHECK (ntsc_is_video_id_data_valid IN (0,1)),
     ntsc_video_id_data INTEGER,
     ntsc_white_flag INTEGER CHECK (ntsc_white_flag IN (0,1)),
+    ac3_symbols INTEGER,
     PRIMARY KEY (capture_id, field_id)
 );
 
