@@ -870,3 +870,139 @@ def load_json_fields(json_path, field_count, on_repair=None):
             on_repair(numbering)
         fields = renumber_fields(fields)
     return fields
+
+
+@dataclass(frozen=True)
+class OutputCounts:
+    """What each side of a finished decode thinks it wrote.
+
+    ``records`` is what the decoder counted; ``json_records`` is what the
+    finished .tbc.json holds, and the video/chroma counts come from the
+    payload sizes. Those are the witnesses that catch records going missing
+    while their field images were written -- an interrupted decode whose
+    final flush never landed leaves exactly that. ``json_numbering`` is the
+    finished file's numbering as tbc-tools would judge it.
+    """
+
+    fields_written: int
+    records: int
+    json_records: int | None = None
+    video_fields: int | None = None
+    chroma_fields: int | None = None
+    db_rows: int | None = None
+    db_span: int | None = None  # MAX(field_id) + 1
+    json_numbering: FieldNumbering | None = None
+
+    @property
+    def is_valid(self):
+        return not self.disagreements()
+
+    def disagreements(self):
+        expected = self.records
+        found = []
+        if self.fields_written != expected:
+            found.append(f"{self.fields_written} writeouts")
+        for name, value in (
+            ("json records", self.json_records),
+            ("video", self.video_fields),
+            ("chroma", self.chroma_fields),
+            ("db rows", self.db_rows),
+            ("db field_id span", self.db_span),
+        ):
+            if value is not None and value != expected:
+                found.append(f"{value} {name}")
+        if self.json_numbering is not None and not self.json_numbering.is_valid:
+            found.append(f"json numbering broken ({self.json_numbering.summary()})")
+        return found
+
+    def summary(self):
+        """One line naming the counts; empty when they all agree."""
+        if self.is_valid:
+            return ""
+        return (
+            f"metadata holds {self.records} field records but found "
+            + ", ".join(self.disagreements())
+        )
+
+
+def count_output_fields(path, field_bytes):
+    """Whole fields in a .tbc payload, or None when that cannot be measured."""
+    if not path or not field_bytes:
+        return None
+    try:
+        return os.path.getsize(str(path)) // int(field_bytes)
+    except (OSError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def count_db_fields(db_path, capture_id):
+    """``(rows, MAX(field_id) + 1)`` for a capture, or ``(None, None)``."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), MAX(field_id) FROM field_record"
+                " WHERE capture_id = ?",
+                (capture_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None, None
+    if not row or row[0] is None:
+        return None, None
+    rows, highest = row
+    return rows, (None if highest is None else highest + 1)
+
+
+def count_json_fields(json_path):
+    """``(records, FieldNumbering)`` from a finished .tbc.json, or ``(None, None)``.
+
+    Reads the file the way a consumer will, so a final flush that never
+    landed, or a prefix that was seeded with a break in it, shows up here
+    and nowhere else: the decoder's own counters only know what it queued.
+    """
+    try:
+        with open(str(json_path), encoding="utf-8") as handle:
+            payload = json.load(handle)
+        fields = payload["fields"]
+        declared = payload.get("videoParameters", {}).get("numberOfSequentialFields")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None, None
+    if not isinstance(fields, list):
+        return None, None
+    if not isinstance(declared, int):
+        declared = None
+    return len(fields), check_field_numbering(fields, declared_fields=declared)
+
+
+def audit_outputs(
+    outname,
+    *,
+    fields_written,
+    records,
+    field_bytes,
+    video_path,
+    chroma_path=None,
+    capture_id=None,
+):
+    """Reconcile a finished decode's outputs; a report, never an exception.
+
+    Call after the JSON dumper and the decoder have closed, with the output
+    paths captured while the handles were still open. Every side that cannot
+    be measured is None and does not count against the result.
+    """
+    json_records, json_numbering = count_json_fields(outname + ".tbc.json")
+    db_rows = db_span = None
+    if capture_id:
+        db_rows, db_span = count_db_fields(outname + ".tbc.db", capture_id)
+    return OutputCounts(
+        fields_written=fields_written,
+        records=records,
+        json_records=json_records,
+        video_fields=count_output_fields(video_path, field_bytes),
+        chroma_fields=count_output_fields(chroma_path, field_bytes),
+        db_rows=db_rows,
+        db_span=db_span,
+        json_numbering=json_numbering,
+    )

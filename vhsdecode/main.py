@@ -969,8 +969,39 @@ def main(args=None, use_gui=False):
     jsondumper = lddu.JSONDumper(vhsd, outname)
 
     def cleanup():
+        # Captured before close() unlinks the handles.
+        video_path = vhsd.outfile_video.name if vhsd.outfile_video else None
+        chroma_path = vhsd.outfile_chroma.name if vhsd.outfile_chroma else None
+        field_bytes = vhsd.outwidth * vhsd.output_lines * 2
         jsondumper.close()
         vhsd.close()
+        if not vhsd.fields_written:
+            return
+        # The metadata numbers the output, so a record per written field is
+        # the whole contract. Reconcile the finished files against what the
+        # decoder counted; warn and never fail -- a multi-hour decode that
+        # produced good video must not die at the finish line.
+        try:
+            counts = tbc_db.audit_outputs(
+                outname,
+                fields_written=vhsd.fields_written,
+                records=len(vhsd.fieldinfo),
+                field_bytes=field_bytes,
+                video_path=video_path,
+                chroma_path=chroma_path,
+                capture_id=vhsd.capture_id,
+            )
+        except Exception:
+            logger.warning("Could not reconcile the field counts", exc_info=True)
+            return
+        if not counts.is_valid:
+            logger.warning(
+                "Field count mismatch in %s: %s -- the metadata and the"
+                " payload disagree, so tools that index fields by number"
+                " will read the wrong field",
+                outname,
+                counts.summary(),
+            )
 
     logger.debug("Sys Parameters: \n" + json.dumps(vhsd.rf.SysParams, sort_keys=True, indent=4))
     logger.debug("RF Parameters: \n" + json.dumps(vhsd.rf.DecoderParams, sort_keys=True, indent=4))
