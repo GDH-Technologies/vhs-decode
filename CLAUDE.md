@@ -40,6 +40,43 @@ for general project documentation.
   in its 2026-09-13 happycube merge and is restoring it on its `ffmpeg_static_weak`
   branch. Drop the fork's one-line fix once that lands.
 
+## Field numbering in `.tbc.json` / `.tbc.db`
+
+Every consumer indexes a field by its number — tbc-tools returns `fields[n - 1]`, and the
+SQLite path keys on `field_id = seqNo - 1` — so the metadata is only readable while
+`fields[i]["seqNo"] == i + 1` **and** there is one record per field image on disk.
+
+- **`seqNo` is stamped in `writeout()` on a per-write copy**, in all three decoders (fork
+  since `6b804ee2`, 2026-09-06; pinned by `tests/unit/test_field_numbering.py`). Upstream
+  still stamps it in `buildmetadata()` and appends the same dict, so its duplicate-field
+  compensation (`readfield` writes the previous field a second time) emits
+  `…59, 60, 59, 61, 63…` — VHS-C_03_Recital's shape, and the `ld-analyse` core dump once
+  that JSON was converted to a `.tbc.db`. Keep the writeout stamp through every upstream
+  merge; upstream has not fixed it (checked 2026-09-15). The defect was the filler path,
+  not `--resume` — toolkit #419 and tbc-tools #22 attribute it to resume, wrongly.
+- **Shape A** (a repeated number and a skipped one, array length still equal to the
+  payload) loses nothing: the repeat is a real duplicated field image. **Renumber in place;
+  never drop the repeat.** tbc-tools' `--repair` drops it and then names the wrong image
+  for every field after the break. **Shape B** (array short of the payload; JJ_Promo,
+  81641 records for 81653 images, older builds) needs placeholders instead — renumbering
+  is wrong there too.
+- **`isDuplicateField` keeps upstream's placement.** It sits on the field that *tripped*
+  the compensation, together with `decodeFaults` bit 4 and `syncConf = 0`, and means "the
+  action taken at this skipped field was duplicate-previous" (the other `field_order_action`
+  outcomes, drop and flip, leave no flag). The inserted copy is the record *before* the
+  flagged one. Do not move the flag: tbc-tools' `tbc-segments` reads it on the record that
+  carries the fault bit, and upstream's JSON is a de-facto contract for third-party readers.
+  The fork's own `duplicate_field` decoder event names the copy's index exactly.
+- **`--resume` guards** (`lddecode/tbc_db.py`): a holed `field_record` (`MAX(field_id)+1 !=
+  COUNT(*)`) is refused — the seam is placed by count but rows are read by id — and a
+  misnumbered `.tbc.json` prefix is renumbered from position before seeding, with a
+  warning. The fork's DB-writing decodes always stamped at writeout, so only a hand-made
+  database reaches either guard.
+- **Post-run audit** (`tbc_db.audit_outputs`, called from `cleanup()` in
+  `vhsdecode/main.py`): reconciles writeouts, records, the `.tbc`/chroma sizes, the
+  `field_record` rows and span, and the finished `.tbc.json`'s count and numbering. It
+  **warns and never fails**. `ld-decode`/`cvbs-decode` have no audit.
+
 ## Fleet deployment (pipx)
 
 - Capture-fleet hosts install this repo via pipx. `pipx install --force` **without `-e`
