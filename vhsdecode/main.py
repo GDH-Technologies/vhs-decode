@@ -890,15 +890,31 @@ def main(args=None, use_gui=False):
             vhsd.close()
             sys.exit(1)
 
-        recovered = tbc_db.load_json_fields(outname + ".tbc.json", plan.field_count)
+        def _warn_repaired_numbering(numbering):
+            logger.warning(
+                "The prior run's .tbc.json numbers its fields wrongly (%s);"
+                " renumbering the recovered %d fields from their position so"
+                " the resumed decode continues a consistent sequence",
+                numbering.summary(),
+                plan.field_count,
+            )
+
+        recovered = tbc_db.load_json_fields(
+            outname + ".tbc.json", plan.field_count, on_repair=_warn_repaired_numbering
+        )
         if recovered is None:
             logger.warning(
                 "Legacy .tbc.json is missing or short; rebuilding minimal"
                 " field metadata from the .tbc.db"
             )
-            recovered = tbc_db.minimal_fields_from_db(
-                db_path, plan.capture_id, plan.field_count
-            )
+            try:
+                recovered = tbc_db.minimal_fields_from_db(
+                    db_path, plan.capture_id, plan.field_count
+                )
+            except tbc_db.ResumeError as err:
+                logger.error("Cannot resume: %s", err)
+                vhsd.close()
+                sys.exit(1)
         # One seed restores seqNo continuity, gives the seam its true
         # predecessor fields for parity checks, and replays every prior
         # field into the JSON dumper so the final .tbc.json is complete.
@@ -953,8 +969,39 @@ def main(args=None, use_gui=False):
     jsondumper = lddu.JSONDumper(vhsd, outname)
 
     def cleanup():
+        # Captured before close() unlinks the handles.
+        video_path = vhsd.outfile_video.name if vhsd.outfile_video else None
+        chroma_path = vhsd.outfile_chroma.name if vhsd.outfile_chroma else None
+        field_bytes = vhsd.outwidth * vhsd.output_lines * 2
         jsondumper.close()
         vhsd.close()
+        if not vhsd.fields_written:
+            return
+        # The metadata numbers the output, so a record per written field is
+        # the whole contract. Reconcile the finished files against what the
+        # decoder counted; warn and never fail -- a multi-hour decode that
+        # produced good video must not die at the finish line.
+        try:
+            counts = tbc_db.audit_outputs(
+                outname,
+                fields_written=vhsd.fields_written,
+                records=len(vhsd.fieldinfo),
+                field_bytes=field_bytes,
+                video_path=video_path,
+                chroma_path=chroma_path,
+                capture_id=vhsd.capture_id,
+            )
+        except Exception:
+            logger.warning("Could not reconcile the field counts", exc_info=True)
+            return
+        if not counts.is_valid:
+            logger.warning(
+                "Field count mismatch in %s: %s -- the metadata and the"
+                " payload disagree, so tools that index fields by number"
+                " will read the wrong field",
+                outname,
+                counts.summary(),
+            )
 
     logger.debug("Sys Parameters: \n" + json.dumps(vhsd.rf.SysParams, sort_keys=True, indent=4))
     logger.debug("RF Parameters: \n" + json.dumps(vhsd.rf.DecoderParams, sort_keys=True, indent=4))
