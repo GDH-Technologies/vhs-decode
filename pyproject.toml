@@ -60,7 +60,10 @@ cuda11 = [ "cupy-cuda11x", "nvidia-cuda-nvrtc-cu11", "nvidia-cufft-cu11" ]
 # Can probably be depcretaded now since it's also an option in vhs-decode to use it.
 hifi_gnuradio = [ "pyzmq" ]
 gnuradio = [ "pyzmq" ]
-test = [ "pytest>=7.0" ]
+# setuptools is here for tests/unit/test_setup_*.py, which evaluate setup.py and
+# importorskip("setuptools"). venvs stopped bundling it in Python 3.12, and a venv
+# does not see a system-wide install, so without this both files skip silently.
+test = [ "pytest>=7.0", "setuptools>=61" ]
 
 [project.scripts]
 ld-decode = "lddecode.main:main"

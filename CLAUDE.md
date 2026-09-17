@@ -215,6 +215,13 @@ Full detail in **`.github/GDH_SELFHOSTED_CI.md`** — read it before touching CI
 - Offline nodes (usually `lws` and `air0`) **queue rather than fail** — up to 24h. `wf1`,
   `lws` and `air0` are `continue-on-error`, so only `wm` can turn a merge red.
 
+- **A skipped test file cannot turn a run red.** Both `tests/unit/test_setup_*.py` files
+  `importorskip("setuptools")`. venvs stopped bundling setuptools in Python 3.12, and CI's
+  throwaway venv does not see a system-wide install (`brew install python-setuptools` on air0
+  changed nothing), so both files skipped on every host until `setuptools` joined the `test`
+  extra on 2026-09-17: CI's 210 passed / 13 skipped became 223 / 11. The only visible symptom
+  was the skip count, so when it moves, find out why.
+
 ## GPU-resident demodblock (`feat/gpu-resident-demodblock`, fork PR #4)
 
 - Makes demodblock GPU-resident; CPU path byte-identical, 100-frame Puppy Test
