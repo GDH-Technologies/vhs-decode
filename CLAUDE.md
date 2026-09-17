@@ -129,6 +129,20 @@ SQLite path keys on `field_id = seqNo - 1` — so the metadata is only readable 
   — inside the repo it always prints True because cwd is on sys.path and a `.so` sits at
   the repo root. Remedy: build a wheel/regular install and copy the resulting
   `vhsd_rust*.so` into the pipx venv's site-packages.
+- **macOS 27's dyld rejects a stripped `vhsd_rust`** (hit on air0, fixed 2026-09-17).
+  `Cargo.toml`'s release profile sets `strip = "symbols"`; on macOS rustc runs Apple's
+  `strip` over the linked dylib, which leaves the string table wherever the symbol tables
+  end. When that offset is not a multiple of 8 the loader refuses the extension with
+  `mis-aligned LINKEDIT string pool`. It depends on the build's symbol counts, so it comes
+  and goes between Python versions rather than failing everywhere (air0's cp314 build lands
+  on 4 mod 8). The 2026-09-15 CI deploy left `vhs-decode`, `hifi-decode` and `cvbs-decode`
+  dead at import on air0; `ld-decode` kept working because it never imports
+  `vhsdecode.rust_utils`. `setup.py` (`_apply_cargo_defaults`) now sets
+  `CARGO_PROFILE_RELEASE_STRIP=none` on darwin only. An explicit value wins, so re-test a
+  future Xcode with `CARGO_PROFILE_RELEASE_STRIP=symbols`. Check any build with
+  `otool -l <so> | grep stroff` — the offset must divide by 8. Cost: ~145 KB, no speed.
+  `rust_utils` also survives an unloadable extension now: it warns and takes the scipy
+  path, where it used to catch only `ModuleNotFoundError` and let the `ImportError` escape.
 - **A shadowing toolchain on PATH breaks `-flto` builds** (hit on workflow-master via
   swiftly, verified 2026-08-07). The Swift toolchain ships `clang`, `clang++`, `lld` and
   `clangd`, but no `LLVMgold.so` — the LTO plugin `ld.bfd` needs. Its clang *compiles*
