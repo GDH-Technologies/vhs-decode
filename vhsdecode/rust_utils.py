@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import scipy.signal as sps
 
@@ -5,7 +7,19 @@ try:
     from vhsd_rust import sosfiltfilt, sosfiltfilt_f32
 
     _HAS_VHSD_RUST = True
-except ModuleNotFoundError:
+except ImportError as _vhsd_rust_error:
+    # ModuleNotFoundError is the ordinary case -- editable installs never build
+    # the extension -- and stays silent. Any other ImportError means it is on
+    # disk but the loader refused it (macOS 27 rejecting a stripped dylib, an
+    # ABI or architecture mismatch). Take the scipy path then too, rather than
+    # taking every CLI down at import time, but say so: that path is far slower.
+    if not isinstance(_vhsd_rust_error, ModuleNotFoundError):
+        warnings.warn(
+            "vhsd_rust is installed but could not be loaded, falling back to the "
+            "slower scipy filters: %s" % (_vhsd_rust_error,),
+            RuntimeWarning,
+            stacklevel=2,
+        )
     sosfiltfilt = None
     sosfiltfilt_f32 = None
     _HAS_VHSD_RUST = False
