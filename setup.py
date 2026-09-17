@@ -132,9 +132,29 @@ else:
     extra_compile_args=[]
     extra_link_args=[]
 
-# Release/performance safety: default Rust extension builds to cargo's
-# release profile unless a caller explicitly overrides it.
-os.environ.setdefault("SETUPTOOLS_RUST_CARGO_PROFILE", "release")
+def _apply_cargo_defaults(platform, environ):
+    """Defaults for the Rust extension build; anything the caller set wins."""
+    # Release/performance safety: default Rust extension builds to cargo's
+    # release profile unless a caller explicitly overrides it.
+    environ.setdefault("SETUPTOOLS_RUST_CARGO_PROFILE", "release")
+
+    if platform == "darwin":
+        # Cargo.toml's release profile sets strip = "symbols", which on macOS
+        # means rustc runs Apple's `strip` over the linked dylib. That leaves
+        # the string table wherever the symbol tables end, and when the offset
+        # is not a multiple of 8, macOS 27's dyld refuses the extension:
+        #
+        #     dlopen(...vhsd_rust...so): mis-aligned LINKEDIT string pool
+        #
+        # Whether a build trips it depends on its symbol counts, so it comes
+        # and goes between Python versions. Cargo profiles cannot be made
+        # conditional on the OS, so skip the pass here. It costs ~145 KB and no
+        # speed: strip removes symbol names, not code. Every other platform
+        # keeps Cargo.toml's setting.
+        environ.setdefault("CARGO_PROFILE_RELEASE_STRIP", "none")
+
+
+_apply_cargo_defaults(sys.platform, os.environ)
 
 setup(
     # Merges over [tool.setuptools_scm] in pyproject.toml, per key: only the
