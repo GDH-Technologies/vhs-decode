@@ -21,11 +21,14 @@ jobs:
         include:
           - os: macos-15
             arch: arm64
-            python: "3.12"
+            # CPython 3.13+ is needed on macOS for correct os.statvfs/shutil.disk_usage
+            # on volumes with >= 2**32 blocks (python/cpython#99570), e.g. large SMB shares.
+            python: "3.14"
           - os: macos-15-intel
             arch: x86_64
-            # Use a Python version with reliable wheels for llvmlite/numba on Intel macOS
-            python: "3.11"
+            # llvmlite stopped publishing x86_64 macOS wheels after 0.45.x (numba 0.62.x),
+            # which supports CPython up to 3.13. 3.13 is also the minimum for the statvfs fix.
+            python: "3.13"
 
     name: Build decode (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
@@ -62,7 +65,28 @@ jobs:
           # PyInstaller's pyi_rth_pkgres runtime hook in the bundled binary.
           python3 -m pip install --upgrade pip "setuptools<82" wheel
 
-      - uses: dtolnay/rust-toolchain@stable
+      - id: rust_toolchain
+        uses: dtolnay/rust-toolchain@stable
+        continue-on-error: true
+
+      - name: Retry Rust toolchain install when setup action fails
+        if: steps.rust_toolchain.outcome == 'failure'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install stable --profile minimal --no-self-update; then
+              rustup default stable
+              rustc --version
+              cargo --version
+              exit 0
+            fi
+            if [ "${attempt}" -lt 5 ]; then
+              sleep "$((attempt * 15))"
+            fi
+          done
+          echo "ERROR: Failed to install Rust stable toolchain after retries."
+          exit 1
 
       - name: Install dependencies
         run: brew install create-dmg libsndfile libomp
@@ -93,12 +117,20 @@ jobs:
             export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix libomp)/lib:$(brew --prefix llvm@20)/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
             # Keep Intel on a numba/llvmlite pair with published x86_64 wheels.
             # Installing this first avoids llvmlite source builds with setuptools API incompatibilities.
-            python3 -m pip install "numba==0.60.0"
+            python3 -m pip install "numba==0.62.1"
           fi
 
           python3 -m pip install -r ./requirements.txt
           python3 -m pip install "pyinstaller>=6.20"
           python3 -m pip install -e ".[hifi_gui_qt6,hifi_gnuradio]"
+          # Qt 6.12 (PyQt6 6.12.0, currently latest on PyPI) breaks PyInstaller
+          # 6.22.x on macOS: COLLECT fails with FileExistsError while creating
+          # the QtQuickControls2Macos framework symlink (Qt 6.12 ships it as a
+          # proper .framework with a Versions/Current symlink layout).
+          # Stay on the last known-good Qt 6.11 series, which is what the last
+          # passing macOS build used. PyQt6 6.11.0 requires PyQt6-Qt6<6.12.0,
+          # so this pins the Qt runtime as well.
+          python3 -m pip install "PyQt6==6.11.0"
 
       - name: Build binary
         run: |

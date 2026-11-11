@@ -34,11 +34,20 @@ for general project documentation.
   `migrate_schema`. Upstream's INSERTs name the new columns, so a missed port breaks
   every ld-decode run at its first field (2026-09-15: `field_record.ac3_symbols`, added
   nullable with no `user_version` bump, as upstream did).
-- **Keep `static_ffmpeg.add_paths(weak=True)`** in `lddecode/utils.py`. Non-weak mode
-  downloads static-ffmpeg and puts it ahead of the host's ffmpeg (wm:
-  `/usr/local/bin/ffmpeg`) for every decode, FLAC RF reads included. Upstream lost `weak`
-  in its 2026-09-13 happycube merge and is restoring it on its `ffmpeg_static_weak`
-  branch. Drop the fork's one-line fix once that lands.
+- **`static_ffmpeg.add_paths(weak=True)` must stay weak** in `lddecode/utils.py`.
+  Non-weak mode downloads static-ffmpeg and puts it ahead of the host's ffmpeg (wm:
+  `/usr/local/bin/ffmpeg`) for every decode, FLAC RF reads included. Upstream restored
+  `weak=True` itself (its `ffmpeg_static_weak`, merged here 2026-11-11), behind a
+  `_find_bundled_ffmpeg()` probe that runs first. That probe prepends
+  `dirname(sys.executable)` to PATH when an `ffmpeg` sits there, which a pipx venv's
+  `bin/` never holds. A future upstream merge that drops `weak` is a silent clash.
+- **Qt app identity** (`vhsdecode/qt_identity.py`, 2026-11-11 sync). Upstream pins every
+  GUI to `vhs-decode` to match its AppImage's desktop file. The fork's
+  `installed_identity` argument keeps a pip/pipx install on
+  `io.github.vhs-decode.decode-launcher` / `io.github.vhs-decode.hifi-decode`, the names
+  wm's `~/.local/share/applications` entries use. A bundle (APPDIR or `_MEIPASS`) still
+  gets `vhs-decode`. A new upstream GUI entry point that calls `apply_app_identity(app)`
+  bare gets `vhs-decode`; pass it the right id.
 
 ## Field numbering in `.tbc.json` / `.tbc.db`
 
@@ -270,6 +279,11 @@ start of field"*, an empty `.tbc`, and **exit status 0**.
 - Signed vs offset-unsigned does not change the decode: the RF bandpass removes DC.
   Measured on `VHS_02_1997_Wedding` — reading the same window as `int8` and as
   `uint8 + 128` differed in 0.067 % of `.tbc` samples, mean |diff| 0.0025 of 65535.
+- **The direct s8 reader returns int16 × 256**, not raw int8 (upstream's contract, taken
+  in the 2026-11-11 sync). That is what ffmpeg's s8 → pcm_s16le does, so a direct read
+  and a resampled read of one file agree. The fork's reader returned raw int8 from
+  2026-09-09 until that sync. Pinned by `tests/unit/test_input_format.py` and
+  upstream's `tests/test_s8_loader.py`.
 - **`np.fromstring`'s binary mode was removed in numpy 1.22**, and the `.s16` and
   `.rf` readers still called it — those formats could not be read at all on any
   current build. Fixed 2026-09-09; pinned by `tests/unit/test_input_format.py`.

@@ -47,8 +47,10 @@ class TestSignedEightBitLoader:
         with open(path, "rb") as infile:
             data = utils.load_unpacked_data_s8(infile, 0, len(samples))
 
-        assert data.dtype == np.int8
-        assert data.tolist() == samples
+        # Widened to the 16-bit range (x 256), as ffmpeg's s8 -> pcm_s16le
+        # does, so the direct and resampling paths decode the same file alike.
+        assert data.dtype == np.int16
+        assert data.tolist() == [v * 256 for v in samples]
 
     def test_it_seeks_by_sample_not_by_byte_pair(self, tmp_path):
         samples = list(range(-8, 8))
@@ -57,7 +59,7 @@ class TestSignedEightBitLoader:
         with open(path, "rb") as infile:
             data = utils.load_unpacked_data_s8(infile, 5, 4)
 
-        assert data.tolist() == samples[5:9]
+        assert data.tolist() == [v * 256 for v in samples[5:9]]
 
     def test_a_short_read_reports_nothing_rather_than_a_short_block(self, tmp_path):
         path = _write(tmp_path, "capture.raw", [1, 2, 3], np.int8)
@@ -76,7 +78,7 @@ class TestMakeLoaderSampleFormat:
         loader = utils.make_loader(str(path), None, sample_format="s8")
 
         with open(path, "rb") as infile:
-            assert loader(infile, 0, len(samples)).tolist() == samples
+            assert loader(infile, 0, len(samples)).tolist() == [v * 256 for v in samples]
 
     def test_it_overrides_the_extension_when_resampling(self):
         loader = utils.make_loader("capture.raw", 40, sample_format="s8")

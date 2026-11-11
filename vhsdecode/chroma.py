@@ -34,6 +34,8 @@ def chroma_automatic_gain(
     phase_sequence,
     burst_detected_line,
     sync_tip_len,
+    lineoffset,
+    outwidth,
     smoothing_window=8,
     k=2.0
 ):
@@ -82,10 +84,15 @@ def chroma_automatic_gain(
     noise_samples = 0
     for i in range(burst_count):
         current_burst = phase_sequence[i]
-        current_burst_start = current_burst.start
+        # Entries for lines above the first output line would index backwards
+        # from the end of the field (see upconvert_chroma).
+        if current_burst.line_number < lineoffset:
+            continue
+
+        current_burst_start = (current_burst.line_number - lineoffset) * outwidth
 
         if i < burst_count - 1:
-            next_burst_start = phase_sequence[i + 1].start
+            next_burst_start = (phase_sequence[i + 1].line_number - lineoffset) * outwidth
         else:
             next_burst_start = len(chroma)
 
@@ -189,6 +196,7 @@ def comb_c_ntsc(data, line_len):
     'I': numba.float64,
     'Q': numba.float64,
     'phase_rotation': numba.int8,
+    'phase_correction': numba.float64,
 })
 class BurstInfo:
     line_number: int
@@ -203,6 +211,7 @@ class BurstInfo:
     I: float
     Q: float
     phase_rotation: int
+    phase_correction: float
 
     def __init__(
         self,
@@ -230,6 +239,7 @@ class BurstInfo:
         self.I = I
         self.Q = Q
         self.phase_rotation = -1 # this is set later
+        self.phase_correction = 0.0 # radians, fine heterodyne phase shift on top of phase_rotation
 
 
 @njit(nogil=True, inline='always')
@@ -496,6 +506,155 @@ def _get_upconverted_burst(
         *burst_results
     )
 
+def _fit_head_switch_rotation(
+    phase_sequence,
+    chroma,
+    chroma_heterodyne,
+    chroma_filter,
+    chroma_rotation,
+    chroma_rotation_index,
+    burstarea,
+    burst_sin,
+    burst_cos,
+    fsc,
+    lineoffset,
+    outwidth,
+    rotation_check_start_line,
+    reference_lines=24,
+    switch_margin=0.5,
+):
+    """
+    Finds the line where the next video track starts at the bottom of a PAL field and
+    re-applies the heterodyne phase rotation of that track from there on.
+
+    The lines after the head switch belong to the track of the next field. That track
+    uses the other phase rotation, and its starting phase is not related to the phase
+    of the current track, so all 4 heterodyne phases have to be considered.
+
+    The burst phase of each line in the head switching area is compared against the phase
+    expected from the lines above it (two separate trends for the PAL V-switch line parity).
+    Every switch line and starting phase of the next track is scored over the whole area
+    at once, so a single noisy burst (common on LP) can not flip the rotation on its own.
+
+    Returns the rotation index of the track active at the end of the field.
+    """
+    line_count = len(phase_sequence)
+    lines = np.array([b.line_number for b in phase_sequence])
+    region_start = int(np.searchsorted(lines, rotation_check_start_line))
+    region_len = line_count - region_start
+    if region_len < 2 or region_start < reference_lines:
+        return chroma_rotation_index
+
+    phase = np.radians([b.phase_deg for b in phase_sequence])
+    rotation = np.array([b.phase_rotation for b in phase_sequence])
+    magnitude = np.array([b.magnitude for b in phase_sequence])
+
+    reference = np.arange(region_start - reference_lines, region_start)
+    magnitude_ref = np.median(magnitude[reference])
+    if magnitude_ref <= 0:
+        return chroma_rotation_index
+
+    region_lines = lines[region_start:]
+    expected = np.zeros(region_len)
+    for parity in (0, 1):
+        ref_parity = reference[lines[reference] % 2 == parity]
+        if len(ref_parity) < 3:
+            return chroma_rotation_index
+        trend = np.polyfit(lines[ref_parity], np.unwrap(phase[ref_parity]), 1)
+        region_parity = region_lines % 2 == parity
+        expected[region_parity] = np.polyval(trend, region_lines[region_parity])
+
+    # lines without a usable burst (vsync, dropouts) do not count
+    weight = np.clip(magnitude[region_start:] / magnitude_ref, 0, 1.5)
+    weight[weight < 0.3] = 0
+
+    # burst phase measured with heterodyne phase k is the unrotated phase - k * 90 degrees
+    unrotated = phase[region_start:] + rotation[region_start:] * (np.pi / 2)
+    candidates = (
+        np.cos(
+            unrotated[:, None]
+            - np.arange(4)[None, :] * (np.pi / 2)
+            - expected[:, None]
+        )
+        * weight[:, None]
+    )
+
+    region_idx = np.arange(region_len)
+    current_track = np.cumsum(
+        np.concatenate(([0.0], candidates[region_idx, rotation[region_start:]]))
+    )
+
+    next_rotation_index = (chroma_rotation_index + 1) % 2
+    next_track_rotation = chroma_rotation[next_rotation_index]
+
+    best_score = current_track[-1] + switch_margin
+    best = None
+    for switch in range(region_len):
+        following = region_idx[switch:]
+        steps = np.arange(region_len - switch)
+        for start_phase in range(4):
+            next_phases = (start_phase + next_track_rotation * steps) % 4
+            score = current_track[switch] + candidates[following, next_phases].sum()
+            if score > best_score:
+                best_score = score
+                best = (switch, start_phase)
+
+    if best is None:
+        return chroma_rotation_index
+
+    switch, start_phase = best
+    phases = rotation[region_start:].copy()
+    phases[switch:] = (start_phase + next_track_rotation * np.arange(region_len - switch)) % 4
+
+    # Lines right at the switch do not always follow either track (mid-line switch,
+    # transients of the new head), use their own burst there if it is clearly off.
+    def phase_error(k):
+        return np.abs((unrotated - k * (np.pi / 2) - expected + np.pi) % (2 * np.pi) - np.pi)
+
+    strong = weight >= 0.5
+    for j in range(max(0, switch - 2), region_len):
+        if strong[j] and phase_error(phases[j])[j] > np.radians(67.5):
+            errors = [phase_error(k)[j] for k in range(4)]
+            if min(errors) < np.radians(45):
+                phases[j] = int(np.argmin(errors))
+
+    # The new head often has a fixed chroma phase offset to the old one (not a multiple
+    # of 90 degrees), which shows as a hue change at the bottom of every other field.
+    following = np.arange(switch, region_len)
+    following = following[strong[following]]
+    phase_correction = 0.0
+    if len(following) >= 2:
+        residual = unrotated[following] - phases[following] * (np.pi / 2) - expected[following]
+        phase_correction = np.angle(np.sum(weight[following] * np.exp(1j * residual)))
+        if abs(phase_correction) < np.radians(3):
+            phase_correction = 0.0
+
+    for j in range(max(0, switch - 2), region_len):
+        idx = region_start + j
+        next_phase = int(phases[j])
+        if next_phase == rotation[idx] and j < switch:
+            continue
+        burst = _get_upconverted_burst(
+            chroma,
+            chroma_heterodyne,
+            chroma_filter,
+            next_phase,
+            burstarea,
+            burst_sin,
+            burst_cos,
+            lines[idx],
+            lineoffset,
+            outwidth,
+            fsc,
+        )
+        burst.phase_rotation = next_phase
+        if j >= switch:
+            burst.phase_correction = phase_correction
+        phase_sequence[idx] = burst
+
+    return next_rotation_index
+
+
 def _get_phase_sequence(
     chroma,
     chroma_heterodyne,
@@ -519,6 +678,11 @@ def _get_phase_sequence(
         and chroma_rotation is not None
         and chroma_heterodyne is not None
     )
+
+    # PAL uses a model fit over the whole head switching area instead of the line by line check below
+    fit_head_switch = do_phase_rotation_check and color_system == "PAL"
+    if fit_head_switch:
+        do_phase_rotation_check = False
 
     phase_sequence = []
 
@@ -618,6 +782,23 @@ def _get_phase_sequence(
 
         current_burst.phase_rotation = current_phase
         phase_sequence.append(current_burst)
+
+    if fit_head_switch:
+        chroma_rotation_index = _fit_head_switch_rotation(
+            phase_sequence,
+            chroma,
+            chroma_heterodyne,
+            chroma_filter,
+            chroma_rotation,
+            chroma_rotation_index,
+            burstarea,
+            burst_sin,
+            burst_cos,
+            fsc,
+            lineoffset,
+            outwidth,
+            rotation_check_start_line,
+        )
 
     if chroma_rotation and chroma_rotation_index == chroma_rotation_starting_index:
         # rotate the phase for the next field, if rotation was not detected
@@ -801,12 +982,26 @@ def upconvert_chroma(
     chroma_heterodyne,
 ):
     for burst in phase_rotation_sequence:
+        # The burst lock runs before PAL fields get their lineoffset, so the
+        # sequence starts with entries for lines above the first output line.
+        # Those would index backwards from the end of the field.
+        if burst.line_number < lineoffset:
+            continue
+
         linestart = (burst.line_number - lineoffset) * outwidth
         lineend = linestart + outwidth
 
         heterodyne = chroma_heterodyne[burst.phase_rotation][linestart:lineend]
         c = chroma[linestart:lineend]
-        uphet[linestart:lineend] = c * heterodyne
+        if burst.phase_correction != 0.0:
+            # the next heterodyne phase is 90 degrees further, mix both for the fractional step
+            quadrature = chroma_heterodyne[(burst.phase_rotation + 1) % 4][linestart:lineend]
+            uphet[linestart:lineend] = c * (
+                heterodyne * math.cos(burst.phase_correction)
+                + quadrature * math.sin(burst.phase_correction)
+            )
+        else:
+            uphet[linestart:lineend] = c * heterodyne
 
 
 @njit(nogil=True, cache=False, fastmath=False)
@@ -839,6 +1034,11 @@ def upconvert_chroma_phase_comp(
 
     for idx in range(num_bursts):
         current_burst = phase_rotation_sequence[idx]
+
+        # Entries for lines above the first output line would index backwards
+        # from the end of the field (see upconvert_chroma).
+        if current_burst.line_number < lineoffset:
+            continue
 
         # Solve for current line's active het_hz
         k_current = current_burst.frequency / fsc
@@ -927,6 +1127,17 @@ def shift_chroma_and_remove_dc(out_chroma, move):
         out_chroma[i] -= mean_acc
 
 
+def chroma_block_filter(data, fft_gain, blocklen, move):
+    """Zero-phase chroma filtering of one demod block through its |H|^2 spectrum gain."""
+    out_chroma = sps_fft.irfft(sps_fft.rfft(data[:blocklen]) * fft_gain, n=blocklen).astype(
+        np.float32
+    )
+
+    shift_chroma_and_remove_dc(out_chroma, move)
+
+    return out_chroma
+
+
 def chroma_color_under_filter(
     data, filter, blocklen, notch, do_notch=None, move=10, audio_notch=None
 ):
@@ -978,7 +1189,7 @@ def decode_chroma_phase_rotation(
     # Video8 NTSC:  Track1 0,   Track2 180
 
     chroma_heterodyne = (
-        field.rf.chroma_afc.getChromaHet()
+        field.rf.chroma_afc.getLatchedChromaHet()
         if (field.rf.do_cafc and not disable_tracking_cafc)
         else field.rf.chroma_heterodyne
     )
@@ -1835,9 +2046,12 @@ def process_chroma(
         # shift the chroma to reverse group delay caused by the color under heterodyne filter
         # this is dependent on color framing, and is disabled if color framing is disabled
         # TODO: shift amount may need tuning / needs validation
-        chroma_subcarrier_delay_cycles = field.rf.SysParams['fsc_mhz'] * 1e6 / (2.0 * np.pi * field.rf.DecoderParams["color_under_carrier"])
-        chroma_subcarrier_delay_samples = chroma_subcarrier_delay_cycles * 4
-        chroma, _, _ = ldd.Field.downscale(field, channel="demod_burst", shift=chroma_subcarrier_delay_samples * chroma_shift_direction)
+        # The delay is one radian of the colour-under carrier, as a time.
+        chroma_group_delay_s = 1.0 / (2.0 * np.pi * field.rf.DecoderParams["color_under_carrier"])
+        # downscale's shift indexes the input-rate demod data, so convert the
+        # delay to input samples.
+        chroma_group_delay_samples = chroma_group_delay_s * field.rf.freq_hz
+        chroma, _, _ = ldd.Field.downscale(field, channel="demod_burst", shift=chroma_group_delay_samples * chroma_shift_direction)
 
         # If chroma AFC is enabled
         if field.rf.do_cafc:
@@ -2005,7 +2219,9 @@ def process_chroma(
         field.rf.SysParams["burst_abs_ref"],
         field.phase_sequence,
         field.burst_detected_line,
-        math.floor(field.usectooutpx(field.rf.SysParams["hsyncPulseUS"]))
+        math.floor(field.usectooutpx(field.rf.SysParams["hsyncPulseUS"])),
+        lineoffset,
+        outwidth,
     )
 
     field.rf.field_averages.chroma_level.push(mean_rms)

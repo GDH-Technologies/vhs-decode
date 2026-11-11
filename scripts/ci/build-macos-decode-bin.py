@@ -39,6 +39,57 @@ def _ensure_lddecode_version_file() -> None:
 print("Building macOS binary version")
 _ensure_lddecode_version_file()
 
+
+def _collect_static_ffmpeg_binaries() -> list[str]:
+    """Pre-download ffmpeg/ffprobe via static_ffmpeg and return
+    PyInstaller --add-binary args to bundle them.
+
+    Without this, the bundled decode.app would try to download ffmpeg
+    at runtime (which fails in offline/sandboxed environments).
+    """
+    extra_args: list[str] = []
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+        from static_ffmpeg import run as sff_run
+        ffmpeg_path, ffprobe_path = sff_run.get_or_fetch_platform_executables_else_raise()
+        print(f"static_ffmpeg ffmpeg: {ffmpeg_path}")
+        print(f"static_ffmpeg ffprobe: {ffprobe_path}")
+        if ffmpeg_path and os.path.isfile(ffmpeg_path):
+            extra_args += ["--add-binary", f"{ffmpeg_path}:static_ffmpeg"]
+        if ffprobe_path and os.path.isfile(ffprobe_path):
+            extra_args += ["--add-binary", f"{ffprobe_path}:static_ffmpeg"]
+    except Exception as exc:
+        print(f"WARN: could not pre-download static_ffmpeg binaries: {exc}")
+    return extra_args
+
+
+# --- Workaround for PyInstaller COLLECT duplicate framework symlinks --------
+# Qt 6.12 introduced the QtQuickControls2Macos framework, and with
+# `--collect-all PyQt6` PyInstaller (6.22.x) ends up collecting the same
+# framework symlink twice. The second os.symlink() call in COLLECT.assemble()
+# then aborts the build with:
+#   FileExistsError: [Errno 17] File exists:
+#     'Versions/Current/QtQuickControls2Macos' ->
+#     '.../PyQt6/Qt6/lib/QtQuickControls2Macos.framework/QtQuickControls2Macos'
+# Recreating an identical symlink is a no-op, so make os.symlink idempotent
+# for the duration of the PyInstaller run. Conflicting symlinks (different
+# target) still raise, so genuine problems are not masked.
+_real_os_symlink = os.symlink
+
+
+def _idempotent_symlink(src, dst, target_is_directory=False, *, dir_fd=None):
+    try:
+        _real_os_symlink(src, dst, target_is_directory=target_is_directory, dir_fd=dir_fd)
+    except FileExistsError:
+        if os.path.islink(dst) and os.readlink(dst) == src:
+            return  # identical symlink already in place
+        raise
+
+
+os.symlink = _idempotent_symlink
+
+
 PyInstaller.__main__.run(
     [
         "decode.py",
@@ -50,12 +101,19 @@ PyInstaller.__main__.run(
         "numba",
         "--collect-all",
         "llvmlite",
+        "--collect-all",
+        "sounddevice",
+        "--collect-all",
+        "_sounddevice_data",
+        "--collect-all",
+        "static_ffmpeg",
         "--add-data",
         "vhsdecode/format_defs:vhsdecode/format_defs",
         "--collect-data",
         "lddecode",
         "--add-data",
         "assets:assets",
+        *_collect_static_ffmpeg_binaries(),
         "--hidden-import",
         "vhsdecode.windows_bootstrap",
         "--hidden-import",
