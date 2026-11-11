@@ -1411,9 +1411,16 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     app = QApplication(sys.argv)
     try:
-        from vhsdecode.qt_identity import apply_app_identity
+        from vhsdecode.qt_identity import (
+            DECODE_LAUNCHER_IDENTITY,
+            apply_app_identity,
+        )
 
-        apply_app_identity(app)
+        apply_app_identity(
+            app,
+            installed_identity=DECODE_LAUNCHER_IDENTITY,
+            display_name="Decode Launcher",
+        )
     except Exception:
         pass
     icon = _load_app_icon()

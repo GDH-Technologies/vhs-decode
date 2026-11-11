@@ -2115,9 +2115,9 @@ class PlotWindow(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     try:
-        from vhsdecode.qt_identity import apply_app_identity
+        from vhsdecode.qt_identity import HIFI_DECODE_IDENTITY, apply_app_identity
 
-        apply_app_identity(app)
+        apply_app_identity(app, installed_identity=HIFI_DECODE_IDENTITY)
     except Exception:
         pass
     params = MainUIParameters()

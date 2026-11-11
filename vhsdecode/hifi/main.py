@@ -1264,9 +1264,12 @@ class AppWindow:
         if app is None:
             app = QApplication(argv)
             try:
-                from vhsdecode.qt_identity import apply_app_identity
+                from vhsdecode.qt_identity import (
+                    HIFI_DECODE_IDENTITY,
+                    apply_app_identity,
+                )
 
-                apply_app_identity(app)
+                apply_app_identity(app, installed_identity=HIFI_DECODE_IDENTITY)
             except Exception:
                 pass
         print("Opening hifi-ui...")
@@ -2427,9 +2430,9 @@ def launch_hosted_ui(argv=None, app=None):
     if qt_app is None:
         qt_app = QApplication([sys.argv[0]] + launch_args)
         try:
-            from vhsdecode.qt_identity import apply_app_identity
+            from vhsdecode.qt_identity import HIFI_DECODE_IDENTITY, apply_app_identity
 
-            apply_app_identity(qt_app)
+            apply_app_identity(qt_app, installed_identity=HIFI_DECODE_IDENTITY)
         except Exception:
             pass
     return HostedHifiController(
