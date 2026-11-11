@@ -2,7 +2,8 @@
 # setuptools_scm is pinned to 10.x: the GDH version scheme uses the nested
 # [tool.setuptools_scm.tag] / [.scm.git] tables and the "only-version" scheme,
 # none of which exist in 8.x. A looser floor silently degrades the version.
-requires = ["setuptools>=61", "setuptools-rust", "setuptools_scm>=10,<11", "wheel", "Cython", "numpy"]
+# setuptools>=77 is upstream's: the SPDX `license` string needs it.
+requires = ["setuptools>=77", "setuptools-rust", "setuptools_scm>=10,<11", "wheel", "Cython", "numpy"]
 # requires = ["setuptools>=61", "wheel", "Cython", "numpy"]
 build-backend = "setuptools.build_meta"
 
@@ -12,12 +13,12 @@ description = "Software Decoder for raw rf captures of laserdisc, vhs and other 
 readme = "README_pypi.md"
 requires-python = ">=3.11"
 keywords = ["laserdisc", "vhs", "video", "tape", "decoder"]
-license = {file = "LICENSE"}
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.6",
@@ -120,7 +121,6 @@ describe_command = [
 ]
 
 [tool.setuptools.package-data]
-vhs_decode = ["*.txt"]
 lddecode = ["py.typed", "version", "sinc_lut.npz"]
 
 [tool.black]
