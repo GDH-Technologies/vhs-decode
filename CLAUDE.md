@@ -10,15 +10,17 @@ for general project documentation.
   from happycube/ld-decode). Upstream development happens on oyvindln's `vhs_decode`
   branch; our integration branch is `main`, periodically merged from upstream.
 - **Never push to oyvindln/vhs-decode or happycube/ld-decode. Push only to the
-  GDH-Technologies fork.** Remote *names* can differ per machine (workflow-master and lws:
-  `origin` = GDH, `upstream` = oyvindln, plus `happycube` = happycube on workflow-master,
-  renamed there 2026-11-26; wf1 and air0 may also carry a `fork` remote = GDH) — always
-  identify the push target by URL via `git remote -v`, never by remote name.
-- **On workflow-master, `upstream` and `happycube` have `pushurl = DISABLED`** (set
-  2026-11-26), so any push to either fails with `'DISABLED' does not appear to be a git
-  repository`. Fetch is unaffected. The guard lives in that clone's `.git/config`, so it
-  is per machine: lws, wf1 and air0 do not have it, and a fresh clone does not either.
-  To lift it: `git config --unset remote.upstream.pushurl` (and the same for `happycube`).
+  GDH-Technologies fork.** Since 2026-11-26 every clone (workflow-master, lws, wf1, air0,
+  cs0) has `origin` = GDH over SSH and `upstream` = oyvindln, plus `happycube` = happycube
+  on workflow-master only. The duplicate `fork` remote lws, wf1 and air0 used to carry was
+  removed that day. Names can still drift on a new clone — always identify the push target
+  by URL via `git remote -v`, never by remote name.
+- **`upstream` (and `happycube` on workflow-master) has `pushurl = DISABLED`** on
+  workflow-master, lws, wf1, air0 and cs0 (set 2026-11-26), so any push to it fails with
+  `'DISABLED' does not appear to be a git repository`. Fetch is unaffected. The guard lives
+  in each clone's `.git/config`, so a fresh clone or a new host does not have it: set it
+  with `git config remote.upstream.pushurl DISABLED`. To lift it:
+  `git config --unset remote.upstream.pushurl` (and the same for `happycube`).
 - Versioning is setuptools_scm from upstream tags. If builds stamp `0.3.8.x.devNNN` or
   `0.1.devNNNN` instead of `0.4.x.devNN`, the clone is missing upstream tags — fetch
   `--tags` from the oyvindln remote (cosmetic otherwise).
