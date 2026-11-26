@@ -30,7 +30,7 @@ pub fn fallback_vsync_loc_means_impl<'a>(
     let list_iter = pulses.iter().enumerate();
 
     for (i, p) in list_iter {
-        let pulse: &Bound<'a, PyTuple> = p.downcast().unwrap();
+        let pulse: &Bound<'a, PyTuple> = p.cast().unwrap();
         let pulse_start = pulse
             .get_item(PULSE_START)
             .unwrap()
