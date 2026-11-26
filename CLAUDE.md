@@ -10,17 +10,17 @@ for general project documentation.
   from happycube/ld-decode). Upstream development happens on oyvindln's `vhs_decode`
   branch; our integration branch is `main`, periodically merged from upstream.
 - **Never push to oyvindln/vhs-decode or happycube/ld-decode. Push only to the
-  GDH-Technologies fork.** Remote *names* differ per machine (workflow-master:
-  `fork` = GDH, `origin` = oyvindln, `upstream` = happycube; lws: `origin` = GDH,
-  `upstream` = oyvindln) — always identify the push target by URL via `git remote -v`,
-  never by remote name.
+  GDH-Technologies fork.** Remote *names* can differ per machine (workflow-master and lws:
+  `origin` = GDH, `upstream` = oyvindln, plus `happycube` = happycube on workflow-master,
+  renamed there 2026-11-26; wf1 and air0 may also carry a `fork` remote = GDH) — always
+  identify the push target by URL via `git remote -v`, never by remote name.
 - Versioning is setuptools_scm from upstream tags. If builds stamp `0.3.8.x.devNNN` or
   `0.1.devNNNN` instead of `0.4.x.devNN`, the clone is missing upstream tags — fetch
   `--tags` from the oyvindln remote (cosmetic otherwise).
 - **The GDH fork itself carried no tags until 2026-08-31.** Every fleet host had them
   locally (fetched by hand), so this stayed invisible until CI started cloning from the
   fork and stamped `0.1.dev5678`. The 53 upstream tags were pushed to the fork
-  (`git push fork --tags`), so `fetch-depth: 0` now resolves a real version. If a fresh
+  (`git push <GDH remote> --tags`), so `fetch-depth: 0` now resolves a real version. If a fresh
   clone of the fork ever stamps `0.1.devN` again, the tags were lost — re-push them.
 
 ## Upstream syncs
