@@ -14,6 +14,11 @@ for general project documentation.
   `origin` = GDH, `upstream` = oyvindln, plus `happycube` = happycube on workflow-master,
   renamed there 2026-11-26; wf1 and air0 may also carry a `fork` remote = GDH) — always
   identify the push target by URL via `git remote -v`, never by remote name.
+- **On workflow-master, `upstream` and `happycube` have `pushurl = DISABLED`** (set
+  2026-11-26), so any push to either fails with `'DISABLED' does not appear to be a git
+  repository`. Fetch is unaffected. The guard lives in that clone's `.git/config`, so it
+  is per machine: lws, wf1 and air0 do not have it, and a fresh clone does not either.
+  To lift it: `git config --unset remote.upstream.pushurl` (and the same for `happycube`).
 - Versioning is setuptools_scm from upstream tags. If builds stamp `0.3.8.x.devNNN` or
   `0.1.devNNNN` instead of `0.4.x.devNN`, the clone is missing upstream tags — fetch
   `--tags` from the oyvindln remote (cosmetic otherwise).
